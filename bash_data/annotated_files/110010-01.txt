@@ -1,0 +1,1431 @@
+ 17092: #!/usr/bin/env/python
+ 17092: # qsgen.py - Generate XPConnect quick stubs.
+ 17092: #
+ 98983: # This Source Code Form is subject to the terms of the Mozilla Public
+ 98983: # License, v. 2.0. If a copy of the MPL was not distributed with this
+ 98983: # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 17092: 
+ 17092: # =About quick stubs=
+ 17092: # qsgen.py generates "quick stubs", custom SpiderMonkey getters, setters, and
+ 17092: # methods for specified XPCOM interface members.  These quick stubs serve at
+ 17092: # runtime as replacements for the XPConnect functions XPC_WN_GetterSetter and
+ 17092: # XPC_WN_CallMethod, which are the extremely generic (and slow) SpiderMonkey
+ 17092: # getter/setter/methods otherwise used for all XPCOM member accesses from JS.
+ 17092: #
+ 17092: # There are two ways quick stubs win:
+ 17092: #   1. Pure, transparent optimization by partial evaluation.
+ 17092: #   2. Cutting corners.
+ 17092: #
+ 17092: # == Partial evaluation ==
+ 17092: # Partial evaluation is when you execute part of a program early (before or at
+ 17092: # compile time) so that you don't have to execute it at run time.  In this
+ 17092: # case, everything that involves interpreting xptcall data (for example, the
+ 17092: # big methodInfo loops in XPCWrappedNative::CallMethod and the switch statement
+ 17092: # in XPCConert::JSData2Native) might as well happen at build time, since all
+ 17092: # the type information for any given member is already known.  That's what this
+ 17092: # script does.  It gets the information from IDL instead of XPT files.  Apart
+ 17092: # from that, the code in this script is very similar to what you'll find in
+ 17092: # XPConnect itself.  The advantage is that it runs once, at build time, not in
+ 17092: # tight loops at run time.
+ 17092: #
+ 17092: # == Cutting corners ==
+ 17092: # The XPConnect versions have to be slow because they do tons of work that's
+ 17092: # only necessary in a few cases.  The quick stubs skip a lot of that work.  So
+ 17092: # quick stubs necessarily differ from XPConnect in potentially observable ways.
+ 17092: # For many specific interface members, the differences are not observable from
+ 17092: # scripts or don't matter enough to worry about; but you do have to be careful
+ 17092: # which members you decide to generate quick stubs for.
+ 17092: #
+ 17092: # The complete list of known differences, as of this writing, after an
+ 17092: # assiduous search:
+ 17092: #
+ 19260: # - Quick stubs affect the handling of naming conflicts--that is, which C++
+ 19260: #   method gets called when a script uses an XPCOM feature that is declared in
+ 19260: #   more than one of the interfaces the object implements.  Without quick
+ 19260: #   stubs, XPConnect just walks the interfaces in the order they're listed by
+ 19260: #   nsClassInfo.  You get the first interface that implements a feature with
+ 19260: #   that name.  With quick stubs, it's the same except that non-quick-stubbed
+ 19260: #   features are shadowed.
+ 17092: #
+ 17092: # - Quick stub methods are JSFastNative, which means that when a quick stub
+ 17092: #   method is called, no JS stack frame is created.  This doesn't affect
+ 17092: #   Mozilla security checks because they look for scripted JSStackFrames, not
+ 17092: #   native ones.
+ 17092: #
+ 17092: #   It does affect the 'stack' property of JavaScript exceptions, though: the
+ 17092: #   stubbed member will not appear.  (Note that if the stubbed member itself
+ 17092: #   fails, the member name will appear in the 'message' property.)
+ 17092: #
+ 17092: # - Many quick stubs don't create an XPCCallContext.  In those cases, no entry
+ 17092: #   is added to the XPCCallContext stack.  So native implementations of
+ 17092: #   quick-stubbed methods must avoid nsXPConnect::GetCurrentNativeCallContext.
+ 17092: #
+ 17092: #   (Even when a quick stub does have an XPCCallContext, it never pushes it all
+ 17092: #   the way to READY_TO_CALL state, so a lot of its members are garbage.  But
+ 17092: #   this doesn't endanger native implementations of non-quick-stubbed methods
+ 17092: #   that use GetCurrentNativeCallContext and are called indirectly from
+ 17092: #   quick-stubbed methods, because only the current top XPCCallContext is
+ 17092: #   exposed--nsAXPCNativeCallContext does not expose
+ 17092: #   XPCCallContext::GetPrevCallContext.)
+ 17092: #
+ 17092: # - Quick stubs never suspend the JS request.  So they are only suitable for
+ 17092: #   main-thread-only interfaces.
+ 17092: #
+ 17092: # - Quick stubs don't call XPCContext::SetLastResult.  This is visible on the
+ 17092: #   Components object.
+ 17092: #
+ 17092: # - Quick stubs skip a security check that XPConnect does in
+ 17092: #   XPCWrappedNative::CallMethod.  This means the security manager doesn't have
+ 17092: #   an opportunity to veto accesses to members for which quick stubs exist.
+ 17092: #
+ 17092: # - There are many features of IDL that XPConnect supports but qsgen does not,
+ 17092: #   including dependent types, arrays, and out parameters.
+ 24145: #
+ 24145: # - Since quick stubs are JSPropertyOps, we have to do additional work to make
+ 24145: #   __lookup[GS]etter__ work on them.
+ 17092: 
+ 17092: 
+ 17092: import xpidl
+ 17092: import header
+ 17092: import os, re
+ 17092: import sys
+ 17092: 
+ 17092: # === Preliminaries
+ 17092: 
+ 17092: # --makedepend-output support.
+ 17092: make_dependencies = []
+ 17092: make_targets = []
+ 17092: 
+ 17092: def warn(msg):
+ 17092:     sys.stderr.write(msg + '\n')
+ 17092: 
+ 17092: def unaliasType(t):
+ 17092:     while t.kind == 'typedef':
+ 17092:         t = t.realtype
+ 17092:     assert t is not None
+ 17092:     return t
+ 17092: 
+ 17092: def isVoidType(type):
+ 17092:     """ Return True if the given xpidl type is void. """
+ 17092:     return type.kind == 'builtin' and type.name == 'void'
+ 17092: 
+ 17092: def isInterfaceType(t):
+ 17092:     t = unaliasType(t)
+ 17092:     assert t.kind in ('builtin', 'native', 'interface', 'forward')
+ 17092:     return t.kind in ('interface', 'forward')
+ 17092: 
+ 17092: def isSpecificInterfaceType(t, name):
+ 17092:     """ True if `t` is an interface type with the given name, or a forward
+ 17092:     declaration or typedef aliasing it.
+ 17092: 
+ 17092:     `name` must not be the name of a typedef but the actual name of the
+ 17092:     interface.
+ 17092:     """
+ 17092:     t = unaliasType(t)
+ 17092:     return t.kind in ('interface', 'forward') and t.name == name
+ 17092: 
+ 17092: def getBuiltinOrNativeTypeName(t):
+ 17092:     t = unaliasType(t)
+ 17092:     if t.kind == 'builtin':
+ 17092:         return t.name
+ 17092:     elif t.kind == 'native':
+ 17092:         assert t.specialtype is not None
+ 17092:         return '[%s]' % t.specialtype
+ 17092:     else:
+ 17092:         return None
+ 17092: 
+ 17092: 
+ 17092: # === Reading the file
+ 17092: 
+ 17092: class UserError(Exception):
+ 17092:     pass
+ 17092: 
+ 17092: def findIDL(includePath, irregularFilenames, interfaceName):
+ 17092:     filename = irregularFilenames.get(interfaceName, interfaceName) + '.idl'
+ 17092:     for d in includePath:
+ 18544:         # Not os.path.join: we need a forward slash even on Windows because
+ 18544:         # this filename ends up in makedepend output.
+ 18544:         path = d + '/' + filename
+ 17092:         if os.path.exists(path):
+ 17092:             return path
+ 17092:     raise UserError("No IDL file found for interface %s "
+ 17092:                     "in include path %r"
+ 17092:                     % (interfaceName, includePath))
+ 17092: 
+ 17092: def loadIDL(parser, includePath, filename):
+ 17092:     make_dependencies.append(filename)
+ 17092:     text = open(filename, 'r').read()
+ 17092:     idl = parser.parse(text, filename=filename)
+ 17092:     idl.resolve(includePath, parser)
+ 17092:     return idl
+ 17092: 
+ 37045: def removeStubMember(memberId, member):
+ 37045:     if member not in member.iface.stubMembers:
+ 37045:         raise UserError("Trying to remove member %s from interface %s, but it was never added"
+ 37045:                         % (member.name, member.iface.name))
+ 37045:     member.iface.stubMembers.remove(member)
+ 37045: 
+ 82646: def addStubMember(memberId, member):
+ 51513:     if member.kind == 'method' and not member.implicit_jscontext and not isVariantType(member.realtype):
+ 37414:         for param in member.params:
+ 37414:             for attrname, value in vars(param).items():
+ 37414:                 if value is True:
+ 37414:                     if attrname == 'optional':
+ 37414:                         continue
+ 37414: 
+ 37414:                     raise UserError("Method %s, parameter %s: "
+ 37414:                                     "unrecognized property %r"
+ 37414:                                     % (memberId, param.name, attrname))
+ 37414: 
+ 37414:     # Add this member to the list.
+ 37414:     member.iface.stubMembers.append(member)
+ 37414: 
+ 38908: def checkStubMember(member, isCustom):
+ 37414:     memberId = member.iface.name + "." + member.name
+ 17092:     if member.kind not in ('method', 'attribute'):
+ 17092:         raise UserError("Member %s is %r, not a method or attribute."
+ 17092:                         % (memberId, member.kind))
+ 17092:     if member.noscript:
+ 17092:         raise UserError("%s %s is noscript."
+ 17092:                         % (member.kind.capitalize(), memberId))
+ 17092:     if member.notxpcom:
+ 17092:         raise UserError(
+ 17092:             "%s %s: notxpcom methods are not supported."
+ 17092:             % (member.kind.capitalize(), memberId))
+ 17092: 
+ 17092:     if (member.kind == 'attribute'
+ 17092:           and not member.readonly
+ 38908:           and isSpecificInterfaceType(member.realtype, 'nsIVariant')
+ 38908:           and not isCustom):
+ 17092:         raise UserError(
+ 17092:             "Attribute %s: Non-readonly attributes of type nsIVariant "
+ 17092:             "are not supported."
+ 17092:             % memberId)
+ 17092: 
+ 17092:     # Check for unknown properties.
+ 17092:     for attrname, value in vars(member).items():
+ 46381:         if value is True and attrname not in ('readonly','optional_argc',
+ 82646:                                               'implicit_jscontext',
+ 80098:                                               'getter', 'stringifier'):
+ 17092:             raise UserError("%s %s: unrecognized property %r"
+ 17092:                             % (member.kind.capitalize(), memberId,
+ 17092:                                attrname))
+ 17092: 
+ 17092: def parseMemberId(memberId):
+ 17092:     """ Split the geven member id into its parts. """
+ 17092:     pieces = memberId.split('.')
+ 17092:     if len(pieces) < 2:
+ 17092:         raise UserError("Member %r: Missing dot." % memberId)
+ 17092:     if len(pieces) > 2:
+ 17092:         raise UserError("Member %r: Dots out of control." % memberId)
+ 17092:     return tuple(pieces)
+ 17092: 
+ 17092: class Configuration:
+ 17092:     def __init__(self, filename, includePath):
+ 17092:         self.includePath = includePath
+ 17092:         config = {}
+ 17092:         execfile(filename, config)
+ 17092:         # required settings
+ 17092:         for name in ('name', 'members'):
+ 17092:             if name not in config:
+ 17092:                 raise UserError(filename + ": `%s` was not defined." % name)
+ 17092:             setattr(self, name, config[name])
+ 17092:         # optional settings
+ 17092:         self.irregularFilenames = config.get('irregularFilenames', {})
+ 23258:         self.customIncludes = config.get('customIncludes', [])
+ 37043:         self.customQuickStubs = config.get('customQuickStubs', [])
+ 37043:         self.customReturnInterfaces = config.get('customReturnInterfaces', [])
+ 23258:         self.customMethodCalls = config.get('customMethodCalls', {})
+ 17092: 
+ 82646: def readConfigFile(filename, includePath, cachedir):
+ 17092:     # Read the config file.
+ 17092:     conf = Configuration(filename, includePath)
+ 17092: 
+ 17092:     # Now read IDL files to connect the information in the config file to
+ 17092:     # actual XPCOM interfaces, methods, and attributes.
+ 17092:     interfaces = []
+ 17092:     interfacesByName = {}
+ 17092:     parser = xpidl.IDLParser(cachedir)
+ 17092: 
+ 17092:     def getInterface(interfaceName, errorLoc):
+ 17092:         iface = interfacesByName.get(interfaceName)
+ 17092:         if iface is None:
+ 17092:             idlFile = findIDL(conf.includePath, conf.irregularFilenames,
+ 17092:                               interfaceName)
+ 17092:             idl = loadIDL(parser, conf.includePath, idlFile)
+ 17092:             if not idl.hasName(interfaceName):
+ 17092:                 raise UserError("The interface %s was not found "
+ 17092:                                 "in the idl file %r."
+ 17092:                                 % (interfaceName, idlFile))
+ 17092:             iface = idl.getName(interfaceName, errorLoc)
+ 17092:             iface.stubMembers = []
+ 17092:             interfaces.append(iface)
+ 17092:             interfacesByName[interfaceName] = iface
+ 17092:         return iface
+ 17092: 
+ 37414:     stubbedInterfaces = []
+ 37414: 
+ 17092:     for memberId in conf.members:
+ 37045:         add = True
+ 17092:         interfaceName, memberName = parseMemberId(memberId)
+ 37045: 
+ 37045:         # If the interfaceName starts with -, then remove this entry from the list
+ 37045:         if interfaceName[0] == '-':
+ 37045:             add = False
+ 37045:             interfaceName = interfaceName[1:]
+ 37045: 
+ 17092:         iface = getInterface(interfaceName, errorLoc='looking for %r' % memberId)
+ 17092: 
+ 17092:         if not iface.attributes.scriptable:
+ 17092:             raise UserError("Interface %s is not scriptable. "
+ 17092:                             "IDL file: %r." % (interfaceName, idlFile))
+ 17092: 
+ 17092:         if memberName == '*':
+ 37045:             if not add:
+ 37045:                 raise UserError("Can't use negation in stub list with wildcard, in %s.*" % interfaceName)
+ 37045: 
+ 17092:             # Stub all scriptable members of this interface.
+ 17092:             for member in iface.members:
+ 17092:                 if member.kind in ('method', 'attribute') and not member.noscript:
+ 37417:                     cmc = conf.customMethodCalls.get(interfaceName + "_" + header.methodNativeName(member), None)
+ 37417: 
+ 82646:                     addStubMember(iface.name + '.' + member.name, member)
+ 37417: 
+ 37414:                     if member.iface not in stubbedInterfaces:
+ 37414:                         stubbedInterfaces.append(member.iface)
+ 17092:         else:
+ 17092:             # Look up a member by name.
+ 17092:             if memberName not in iface.namemap:
+ 17092:                 idlFile = iface.idl.parser.lexer.filename
+ 17092:                 raise UserError("Interface %s has no member %r. "
+ 17092:                                 "(See IDL file %r.)"
+ 17092:                                 % (interfaceName, memberName, idlFile))
+ 17092:             member = iface.namemap.get(memberName, None)
+ 37414:             if add:
+ 17092:                 if member in iface.stubMembers:
+ 17092:                     raise UserError("Member %s is specified more than once."
+ 17092:                                     % memberId)
+ 37417: 
+ 37043:                 cmc = conf.customMethodCalls.get(interfaceName + "_" + header.methodNativeName(member), None)
+ 37417: 
+ 82646:                 addStubMember(memberId, member)
+ 37414:                 if member.iface not in stubbedInterfaces:
+ 37414:                     stubbedInterfaces.append(member.iface)
+ 37045:             else:
+ 37045:                 removeStubMember(memberId, member)
+ 37043: 
+ 37414:     # Now go through and check all the interfaces' members
+ 37414:     for iface in stubbedInterfaces:
+ 37414:         for member in iface.stubMembers:
+ 38908:             cmc = conf.customMethodCalls.get(iface.name + "_" + header.methodNativeName(member), None)
+ 38908:             skipgen = cmc is not None and cmc.get('skipgen', False)
+ 38908:             checkStubMember(member, skipgen)
+ 37414: 
+ 37043:     for iface in conf.customReturnInterfaces:
+ 37043:         # just ensure that it exists so that we can grab it later
+ 37043:         iface = getInterface(iface, errorLoc='looking for %s' % (iface,))
+ 17092: 
+ 17092:     return conf, interfaces
+ 17092: 
+ 17092: 
+ 17092: # === Generating the header file
+ 17092: 
+ 17092: def writeHeaderFile(filename, name):
+ 17092:     print "Creating header file", filename
+ 17092: 
+ 17092:     headerMacro = '__gen_%s__' % filename.replace('.', '_')
+ 17092:     f = open(filename, 'w')
+ 17092:     try:
+ 17092:         f.write("/* THIS FILE IS AUTOGENERATED - DO NOT EDIT */\n"
+ 17092:                 "#ifndef " + headerMacro + "\n"
+ 22842:                 "#define " + headerMacro + "\n\n"
+ 17092:                 "JSBool " + name + "_DefineQuickStubs("
+ 91237:                 "JSContext *cx, JSObject *proto, unsigned flags, "
+108994:                 "uint32_t count, const nsID **iids);\n\n"
+ 22842:                 "void " + name + "_MarkInterfaces();\n\n"
+ 22842:                 "void " + name + "_ClearInterfaces();\n\n"
+ 22842:                 "inline void " + name + "_InitInterfaces()\n"
+ 22842:                 "{\n"
+ 22842:                 "  " + name + "_ClearInterfaces();\n"
+ 22842:                 "}\n\n"
+ 17092:                 "#endif\n")
+ 17092:     finally:
+ 17092:         f.close()
+ 17092: 
+ 17092: # === Generating the source file
+ 17092: 
+ 87397: class StringTable:
+ 87397:     def __init__(self):
+ 87397:         self.current_index = 0;
+ 87397:         self.table = {}
+ 87397:         self.reverse_table = {}
+ 87397: 
+ 87397:     def c_strlen(self, string):
+ 87397:         return len(string) + 1
+ 87397: 
+ 87397:     def stringIndex(self, string):
+ 87397:         if string in self.table:
+ 87397:             return self.table[string]
+ 87397:         else:
+ 87397:             result = self.current_index
+ 87397:             self.table[string] = result
+ 87397:             self.current_index += self.c_strlen(string)
+ 87397:             return result
+ 87397: 
+ 87397:     def writeDefinition(self, f, name):
+ 87397:         entries = self.table.items()
+ 87397:         entries.sort(key=lambda x:x[1])
+ 87397:         # Avoid null-in-string warnings with GCC and potentially
+ 87397:         # overlong string constants; write everything out the long way.
+ 87397:         def explodeToCharArray(string):
+ 87397:             return ", ".join(map(lambda x:"'%s'" % x, string))
+ 87397:         f.write("static const char %s[] = {\n" % name)
+ 87397:         for (string, offset) in entries[:-1]:
+ 87397:             f.write("  /* %5d */ %s, '\\0',\n"
+ 87397:                     % (offset, explodeToCharArray(string)))
+ 87397:         f.write("  /* %5d */ %s, '\\0' };\n\n"
+ 87397:                 % (entries[-1][1], explodeToCharArray(entries[-1][0])))
+ 87397: 
+ 17092: def substitute(template, vals):
+ 17092:     """ Simple replacement for string.Template, which isn't in Python 2.3. """
+ 17092:     def replacement(match):
+ 17092:         return vals[match.group(1)]
+ 17092:     return re.sub(r'\${(\w+)}', replacement, template)
+ 17092: 
+ 17092: # From JSData2Native.
+ 17092: argumentUnboxingTemplates = {
+ 37044:     'octet':
+ 84755:         "    uint32_t ${name}_u32;\n"
+ 37044:         "    if (!JS_ValueToECMAUint32(cx, ${argVal}, &${name}_u32))\n"
+ 37044:         "        return JS_FALSE;\n"
+ 86464:         "    uint8_t ${name} = (uint8_t) ${name}_u32;\n",
+ 37044: 
+ 17092:     'short':
+ 84755:         "    int32_t ${name}_i32;\n"
+ 21218:         "    if (!JS_ValueToECMAInt32(cx, ${argVal}, &${name}_i32))\n"
+ 21218:         "        return JS_FALSE;\n"
+ 86464:         "    int16_t ${name} = (int16_t) ${name}_i32;\n",
+ 17092: 
+ 17092:     'unsigned short':
+ 84755:         "    uint32_t ${name}_u32;\n"
+ 21218:         "    if (!JS_ValueToECMAUint32(cx, ${argVal}, &${name}_u32))\n"
+ 21218:         "        return JS_FALSE;\n"
+ 86464:         "    uint16_t ${name} = (uint16_t) ${name}_u32;\n",
+ 17092: 
+ 17092:     'long':
+ 84755:         "    int32_t ${name};\n"
+ 21218:         "    if (!JS_ValueToECMAInt32(cx, ${argVal}, &${name}))\n"
+ 21218:         "        return JS_FALSE;\n",
+ 17092: 
+ 17092:     'unsigned long':
+ 84755:         "    uint32_t ${name};\n"
+ 21218:         "    if (!JS_ValueToECMAUint32(cx, ${argVal}, &${name}))\n"
+ 21218:         "        return JS_FALSE;\n",
+ 17092: 
+ 56112:     'long long':
+ 95450:         "    int64_t ${name};\n"
+107392:         "    if (!JS::ToInt64(cx, ${argVal}, &${name}))\n"
+ 56112:         "        return JS_FALSE;\n",
+ 56112: 
+ 56112:     'unsigned long long':
+ 95450:         "    uint64_t ${name};\n"
+107392:         "    if (!JS::ToUint64(cx, ${argVal}, &${name}))\n"
+ 56112:         "        return JS_FALSE;\n",
+ 56112: 
+ 17092:     'float':
+ 90955:         "    double ${name}_dbl;\n"
+ 21218:         "    if (!JS_ValueToNumber(cx, ${argVal}, &${name}_dbl))\n"
+ 21218:         "        return JS_FALSE;\n"
+ 17092:         "    float ${name} = (float) ${name}_dbl;\n",
+ 17092: 
+ 17092:     'double':
+ 90955:         "    double ${name};\n"
+ 21218:         "    if (!JS_ValueToNumber(cx, ${argVal}, &${name}))\n"
+ 21218:         "        return JS_FALSE;\n",
+ 17092: 
+ 17092:     'boolean':
+ 74834:         "    JSBool ${name};\n"
+ 30581:         "    JS_ValueToBoolean(cx, ${argVal}, &${name});\n",
+ 17092: 
+ 17092:     '[astring]':
+ 31979:         "    xpc_qsAString ${name}(cx, ${argVal}, ${argPtr});\n"
+ 21218:         "    if (!${name}.IsValid())\n"
+ 21218:         "        return JS_FALSE;\n",
+ 17092: 
+ 17092:     '[domstring]':
+ 33019:         "    xpc_qsDOMString ${name}(cx, ${argVal}, ${argPtr},\n"
+ 33019:         "                            xpc_qsDOMString::e${nullBehavior},\n"
+ 33019:         "                            xpc_qsDOMString::e${undefinedBehavior});\n"
+ 21218:         "    if (!${name}.IsValid())\n"
+ 21218:         "        return JS_FALSE;\n",
+ 17092: 
+ 17092:     'string':
+ 57812:         "    JSAutoByteString ${name}_bytes;\n"
+ 57812:         "    if (!xpc_qsJsvalToCharStr(cx, ${argVal}, &${name}_bytes))\n"
+ 57812:         "        return JS_FALSE;\n"
+ 57812:         "    char *${name} = ${name}_bytes.ptr();\n",
+ 17092: 
+ 17092:     'wstring':
+ 82280:         "    const PRUnichar *${name};\n"
+ 31979:         "    if (!xpc_qsJsvalToWcharStr(cx, ${argVal}, ${argPtr}, &${name}))\n"
+ 21218:         "        return JS_FALSE;\n",
+ 17092: 
+ 17092:     '[cstring]':
+ 31979:         "    xpc_qsACString ${name}(cx, ${argVal}, ${argPtr});\n"
+ 21218:         "    if (!${name}.IsValid())\n"
+ 46230:         "        return JS_FALSE;\n",
+ 46230: 
+ 58472:     '[utf8string]':
+ 58472:         "    xpc_qsAUTF8String ${name}(cx, ${argVal}, ${argPtr});\n"
+ 58472:         "    if (!${name}.IsValid())\n"
+ 58472:         "        return JS_FALSE;\n",
+ 58472: 
+ 46230:     '[jsval]':
+ 46230:         "    jsval ${name} = ${argVal};\n"
+ 17092:     }
+ 17092: 
+ 17092: # From JSData2Native.
+ 17092: #
+ 17092: # Omitted optional arguments are treated as though the caller had passed JS
+ 59267: # `null`; this behavior is from XPCWrappedNative::CallMethod. The 'jsval' type,
+ 59267: # however, defaults to 'undefined'.
+ 17092: #
+ 33019: def writeArgumentUnboxing(f, i, name, type, haveCcx, optional, rvdeclared,
+ 33019:                           nullBehavior, undefinedBehavior):
+ 17092:     # f - file to write to
+ 17092:     # i - int or None - Indicates the source jsval.  If i is an int, the source
+ 17092:     #     jsval is argv[i]; otherwise it is *vp.  But if Python i >= C++ argc,
+ 17092:     #     which can only happen if optional is True, the argument is missing;
+ 17092:     #     use JSVAL_NULL as the source jsval instead.
+ 17092:     # name - str - name of the native C++ variable to create.
+ 17092:     # type - xpidl.{Interface,Native,Builtin} - IDL type of argument
+ 17092:     # optional - bool - True if the parameter is optional.
+ 23258:     # rvdeclared - bool - False if no |nsresult rv| has been declared earlier.
+ 17092: 
+ 59267:     typeName = getBuiltinOrNativeTypeName(type)
+ 59267: 
+ 17092:     isSetter = (i is None)
+ 17092: 
+ 17092:     if isSetter:
+ 17092:         argPtr = "vp"
+ 17092:         argVal = "*vp"
+ 17092:     elif optional:
+ 59267:         if typeName == "[jsval]":
+ 59267:             val = "JSVAL_VOID"
+ 59267:         else:
+ 59267:             val = "JSVAL_NULL"
+ 59267:         argVal = "(%d < argc ? argv[%d] : %s)" % (i, i, val)
+ 31979:         argPtr = "(%d < argc ? &argv[%d] : NULL)" % (i, i)
+ 17092:     else:
+ 17092:         argVal = "argv[%d]" % i
+ 17092:         argPtr = "&" + argVal
+ 17092: 
+ 17092:     params = {
+ 17092:         'name': name,
+ 17092:         'argVal': argVal,
+ 33019:         'argPtr': argPtr,
+ 33019:         'nullBehavior': nullBehavior or 'DefaultNullBehavior',
+ 33019:         'undefinedBehavior': undefinedBehavior or 'DefaultUndefinedBehavior'
+ 17092:         }
+ 17092: 
+ 17092:     if typeName is not None:
+ 17092:         template = argumentUnboxingTemplates.get(typeName)
+ 17092:         if template is not None:
+ 17092:             f.write(substitute(template, params))
+ 23258:             return rvdeclared
+ 17092:         # else fall through; the type isn't supported yet.
+ 17092:     elif isInterfaceType(type):
+ 17092:         if type.name == 'nsIVariant':
+ 17092:             # Totally custom.
+ 17092:             assert haveCcx
+ 17092:             template = (
+ 17092:                 "    nsCOMPtr<nsIVariant> ${name}(already_AddRefed<nsIVariant>("
+ 17092:                 "XPCVariant::newVariant(ccx, ${argVal})));\n"
+ 43642:                 "    if (!${name}) {\n"
+ 43642:                 "        xpc_qsThrowBadArgWithCcx(ccx, NS_ERROR_XPC_BAD_CONVERT_JS, %d);\n"
+ 43642:                 "        return JS_FALSE;\n"
+ 43642:                 "    }") % i
+ 17092:             f.write(substitute(template, params))
+ 23258:             return rvdeclared
+ 17092:         elif type.name == 'nsIAtom':
+ 17092:             # Should have special atomizing behavior.  Fall through.
+ 17092:             pass
+ 17092:         else:
+ 23258:             if not rvdeclared:
+ 23258:                 f.write("    nsresult rv;\n");
+ 30386:             f.write("    %s *%s;\n" % (type.name, name))
+ 30386:             f.write("    xpc_qsSelfRef %sref;\n" % name)
+ 17092:             f.write("    rv = xpc_qsUnwrapArg<%s>("
+ 30386:                     "cx, %s, &%s, &%sref.ptr, %s);\n"
+ 30386:                     % (type.name, argVal, name, name, argPtr))
+ 17092:             f.write("    if (NS_FAILED(rv)) {\n")
+ 17092:             if isSetter:
+ 17092:                 f.write("        xpc_qsThrowBadSetterValue("
+ 48470:                         "cx, rv, JSVAL_TO_OBJECT(*tvr.jsval_addr()), id);\n")
+ 17092:             elif haveCcx:
+ 17092:                 f.write("        xpc_qsThrowBadArgWithCcx(ccx, rv, %d);\n" % i)
+ 17092:             else:
+ 21218:                 f.write("        xpc_qsThrowBadArg(cx, rv, vp, %d);\n" % i)
+ 21218:             f.write("        return JS_FALSE;\n"
+ 21218:                     "    }\n")
+ 23258:             return True
+ 17092: 
+ 58472:     warn("Unable to unbox argument of type %s (native type %s)" % (type.name, typeName))
+ 17092:     if i is None:
+ 17092:         src = '*vp'
+ 17092:     else:
+ 17092:         src = 'argv[%d]' % i
+ 17092:     f.write("    !; // TODO - Unbox argument %s = %s\n" % (name, src))
+ 23258:     return rvdeclared
+ 17092: 
+ 23258: def writeResultDecl(f, type, varname):
+ 17092:     if isVoidType(type):
+ 17092:         return  # nothing to declare
+ 17092: 
+ 17092:     t = unaliasType(type)
+ 17092:     if t.kind == 'builtin':
+ 17092:         if not t.nativename.endswith('*'):
+ 17092:             if type.kind == 'typedef':
+ 17092:                 typeName = type.name  # use it
+ 17092:             else:
+ 17092:                 typeName = t.nativename
+ 23258:             f.write("    %s %s;\n" % (typeName, varname))
+ 17092:             return
+ 17092:     elif t.kind == 'native':
+ 17092:         name = getBuiltinOrNativeTypeName(t)
+ 17092:         if name in ('[domstring]', '[astring]'):
+ 23258:             f.write("    nsString %s;\n" % varname)
+ 17092:             return
+ 46230:         elif name == '[jsval]':
+ 46230:             return  # nothing to declare; see special case in outParamForm
+ 17092:     elif t.kind in ('interface', 'forward'):
+ 23258:         f.write("    nsCOMPtr<%s> %s;\n" % (type.name, varname))
+ 17092:         return
+ 17092: 
+ 17092:     warn("Unable to declare result of type %s" % type.name)
+ 23258:     f.write("    !; // TODO - Declare out parameter `%s`.\n" % varname)
+ 17092: 
+ 17092: def outParamForm(name, type):
+ 17092:     type = unaliasType(type)
+ 59004:     # If we start allowing [jsval] return types here, we need to tack
+ 59004:     # the return value onto the arguments list in the callers,
+ 59004:     # possibly, and handle properly returning it too.  See bug 604198.
+ 59004:     assert getBuiltinOrNativeTypeName(type) is not '[jsval]'
+ 17092:     if type.kind == 'builtin':
+ 17092:         return '&' + name
+ 17092:     elif type.kind == 'native':
+ 46230:         if getBuiltinOrNativeTypeName(type) == '[jsval]':
+ 46230:             return 'vp'
+ 46230:         elif type.modifier == 'ref':
+ 17092:             return name
+ 17092:         else:
+ 17092:             return '&' + name
+ 17092:     else:
+ 17092:         return 'getter_AddRefs(%s)' % name
+ 17092: 
+ 17092: # From NativeData2JS.
+ 17092: resultConvTemplates = {
+ 17092:     'void':
+ 17092:             "    ${jsvalRef} = JSVAL_VOID;\n"
+ 17092:             "    return JS_TRUE;\n",
+ 17092: 
+ 37044:     'octet':
+ 86464:         "    ${jsvalRef} = INT_TO_JSVAL((int32_t) result);\n"
+ 37044:         "    return JS_TRUE;\n",
+ 37044: 
+ 17092:     'short':
+ 86464:         "    ${jsvalRef} = INT_TO_JSVAL((int32_t) result);\n"
+ 17092:         "    return JS_TRUE;\n",
+ 17092: 
+ 17092:     'long':
+ 86107:         "    ${jsvalRef} = INT_TO_JSVAL(result);\n"
+ 86107:         "    return JS_TRUE;\n",
+ 17092: 
+ 17092:     'long long':
+ 80650:         "    return xpc_qsInt64ToJsval(cx, result, ${jsvalPtr});\n",
+ 17092: 
+ 17092:     'unsigned short':
+ 86464:         "    ${jsvalRef} = INT_TO_JSVAL((int32_t) result);\n"
+ 17092:         "    return JS_TRUE;\n",
+ 17092: 
+ 17092:     'unsigned long':
+ 86107:         "    ${jsvalRef} = UINT_TO_JSVAL(result);\n"
+ 86107:         "    return JS_TRUE;\n",
+ 17092: 
+ 17092:     'unsigned long long':
+ 17092:         "    return xpc_qsUint64ToJsval(cx, result, ${jsvalPtr});\n",
+ 17092: 
+ 17092:     'float':
+107180:         "    ${jsvalRef} = JS_NumberValue(result);\n"
+107180:         "    return JS_TRUE;\n",
+ 17092: 
+ 17092:     'double':
+107180:         "    ${jsvalRef} =  JS_NumberValue(result);\n"
+107180:         "    return JS_TRUE;\n",
+ 17092: 
+ 17092:     'boolean':
+ 17092:         "    ${jsvalRef} = (result ? JSVAL_TRUE : JSVAL_FALSE);\n"
+ 17092:         "    return JS_TRUE;\n",
+ 17092: 
+ 17092:     '[astring]':
+ 86103:         "    return xpc::StringToJsval(cx, result, ${jsvalPtr});\n",
+ 17092: 
+ 17092:     '[domstring]':
+ 86103:         "    return xpc::StringToJsval(cx, result, ${jsvalPtr});\n",
+ 46230: 
+ 46230:     '[jsval]':
+ 46230:         # Here there's nothing to convert, because the result has already been
+ 46230:         # written directly to *rv. See the special case in outParamForm.
+ 46230:         "    return JS_TRUE;\n"
+ 17092:     }
+ 17092: 
+ 17092: def isVariantType(t):
+ 17092:     return isSpecificInterfaceType(t, 'nsIVariant')
+ 17092: 
+ 31395: def writeResultConv(f, type, jsvalPtr, jsvalRef):
+ 17092:     """ Emit code to convert the C++ variable `result` to a jsval.
+ 17092: 
+ 17092:     The emitted code contains a return statement; it returns JS_TRUE on
+ 17092:     success, JS_FALSE on error.
+ 17092:     """
+ 17092:     # From NativeData2JS.
+ 17092:     typeName = getBuiltinOrNativeTypeName(type)
+ 17092:     if typeName is not None:
+ 17092:         template = resultConvTemplates.get(typeName)
+ 17092:         if template is not None:
+ 17092:             values = {'jsvalRef': jsvalRef,
+ 17092:                       'jsvalPtr': jsvalPtr}
+ 17092:             f.write(substitute(template, values))
+ 17092:             return
+ 17092:         # else fall through; this type isn't supported yet
+ 17092:     elif isInterfaceType(type):
+ 17092:         if isVariantType(type):
+ 31395:             f.write("    return xpc_qsVariantToJsval(lccx, result, %s);\n"
+ 31395:                     % jsvalPtr)
+ 17092:             return
+ 17092:         else:
+ 63541:             f.write("    if (!result) {\n"
+ 63541:                     "      *%s = JSVAL_NULL;\n"
+ 63541:                     "      return JS_TRUE;\n"
+ 63541:                     "    }\n"
+ 63541:                     "    nsWrapperCache* cache = xpc_qsGetWrapperCache(result);\n"
+ 63538:                     "    if (xpc_FastGetCachedWrapper(cache, obj, %s)) {\n"
+ 51487:                     "      return JS_TRUE;\n"
+ 51487:                     "    }\n"
+ 48124:                     "    // After this point do not use 'result'!\n"
+ 51515:                     "    qsObjectHelper helper(result, cache);\n"
+ 48124:                     "    return xpc_qsXPCOMObjectToJsval(lccx, "
+ 51515:                     "helper, &NS_GET_IID(%s), &interfaces[k_%s], %s);\n"
+ 63541:                     % (jsvalPtr, jsvalPtr, type.name, type.name, jsvalPtr))
+ 17092:             return
+ 17092: 
+ 17092:     warn("Unable to convert result of type %s" % type.name)
+ 17092:     f.write("    !; // TODO - Convert `result` to jsval, store in `%s`.\n"
+ 17092:             % jsvalRef)
+ 17092:     f.write("    return xpc_qsThrow(cx, NS_ERROR_UNEXPECTED); // FIXME\n")
+ 17092: 
+ 17092: def anyParamRequiresCcx(member):
+ 17092:     for p in member.params:
+ 17092:         if isVariantType(p.realtype):
+ 17092:             return True
+ 17092:     return False
+ 17092: 
+ 38509: def memberNeedsCcx(member):
+ 38509:     return member.kind == 'method' and anyParamRequiresCcx(member)
+ 38509: 
+ 38509: def memberNeedsCallee(member):
+ 38509:     return memberNeedsCcx(member) or isInterfaceType(member.realtype)
+ 38509: 
+ 26402: def validateParam(member, param):
+ 26402:     def pfail(msg):
+ 26402:         raise UserError(
+ 26402:             member.iface.name + '.' + member.name + ": "
+ 26402:             "parameter " + param.name + ": " + msg)
+ 26402: 
+ 26402:     if param.iid_is is not None:
+ 26402:         pfail("iid_is parameters are not supported.")
+ 26402:     if param.size_is is not None:
+ 26402:         pfail("size_is parameters are not supported.")
+ 26402:     if param.retval:
+ 26402:         pfail("Unexpected retval parameter!")
+ 26402:     if param.paramtype in ('out', 'inout'):
+ 26402:         pfail("Out parameters are not supported.")
+ 26402:     if param.const or param.array or param.shared:
+ 26402:         pfail("I am a simple caveman.")
+ 26402: 
+110010: def setOptimizationForMSVC(f, b):
+110010:     """ Write a pragma that turns optimizations off (if b is False) or
+110010:     on (if b is True) for MSVC.
+110010:     """
+110010:     if b:
+110010:         pragmaParam = "on"
+110010:     else:
+110010:         pragmaParam = "off"
+110010:     f.write("#ifdef _MSC_VER\n")
+110010:     f.write('# pragma optimize("", %s)\n'%pragmaParam)
+110010:     f.write("#endif\n")
+110010: 
+ 23258: def writeQuickStub(f, customMethodCalls, member, stubName, isSetter=False):
+ 17092:     """ Write a single quick stub (a custom SpiderMonkey getter/setter/method)
+ 17092:     for the specified XPCOM interface-member. 
+ 17092:     """
+110010:     # Workaround for suspected compiler bug.
+110010:     # See https://bugzilla.mozilla.org/show_bug.cgi?id=750019
+110010:     disableOptimizationForMSVC = (stubName == 'nsIDOMHTMLDocument_Write')
+110010: 
+ 17092:     isAttr = (member.kind == 'attribute')
+ 17092:     isMethod = (member.kind == 'method')
+ 17092:     assert isAttr or isMethod
+ 17092:     isGetter = isAttr and not isSetter
+ 17092: 
+ 32848:     signature = "static JSBool\n"
+ 32848:     if isAttr:
+ 32848:         # JSPropertyOp signature.
+ 62397:         if isSetter:
+106862:             signature += "%s(JSContext *cx, JSHandleObject obj, JSHandleId id, JSBool strict,%s JSMutableHandleValue vp_)\n"
+ 62397:         else:
+106862:             signature += "%s(JSContext *cx, JSHandleObject obj, JSHandleId id,%s JSMutableHandleValue vp_)\n"
+ 32848:     else:
+ 32848:         # JSFastNative.
+ 91237:         signature += "%s(JSContext *cx, unsigned argc,%s jsval *vp)\n"
+ 32848: 
+ 23258:     customMethodCall = customMethodCalls.get(stubName, None)
+ 38908: 
+ 32848:     if customMethodCall is None:
+ 32848:         customMethodCall = customMethodCalls.get(member.iface.name + '_', None)
+ 32848:         if customMethodCall is not None:
+ 42424:             if isMethod:
+ 42424:                 code = customMethodCall.get('code', None)
+ 42424:             elif isGetter:
+ 42424:                 code = customMethodCall.get('getter_code', None)
+ 42424:             else:
+ 42424:                 code = customMethodCall.get('setter_code', None)
+ 42424:         else:
+ 42424:             code = None
+ 42424: 
+ 42424:         if code is not None:
+ 32848:             templateName = member.iface.name
+ 32848:             if isGetter:
+ 32848:                 templateName += '_Get'
+ 32848:             elif isSetter:
+ 32848:                 templateName += '_Set'
+ 32848: 
+ 32848:             # Generate the code for the stub, calling the template function
+ 32848:             # that's shared between the stubs. The stubs can't have additional
+ 32848:             # arguments, only the template function can.
+ 32848:             callTemplate = signature % (stubName, '')
+ 32848:             callTemplate += "{\n"
+ 32848: 
+ 32848:             nativeName = (member.binaryname is not None and member.binaryname
+ 32848:                           or header.firstCap(member.name))
+ 32848:             argumentValues = (customMethodCall['additionalArgumentValues']
+ 32848:                               % nativeName)
+ 32848:             if isAttr:
+106862:                 callTemplate += ("    return %s(cx, obj, id%s, %s, vp_);\n"
+ 62397:                                  % (templateName, ", strict" if isSetter else "", argumentValues))
+ 32848:             else:
+ 32848:                 callTemplate += ("    return %s(cx, argc, %s, vp);\n"
+ 32848:                                  % (templateName, argumentValues))
+ 32848:             callTemplate += "}\n\n"
+ 32848: 
+ 32848:             # Fall through and create the template function stub called from the
+ 32848:             # real stubs, but only generate the stub once. Otherwise, just write
+ 32848:             # out the call to the template function and return.
+ 32848:             templateGenerated = templateName + '_generated'
+ 32848:             if templateGenerated in customMethodCall:
+ 32848:                 f.write(callTemplate)
+ 32848:                 return
+ 32848:             customMethodCall[templateGenerated] = True
+ 32848: 
+ 32848:             stubName = templateName
+ 32848:         else:
+ 42424:             callTemplate = ""
+ 41911:     else:
+ 32848:         callTemplate = ""
+ 41911:         code = customMethodCall.get('code', None)
+ 23258: 
+ 78693:     unwrapThisFailureFatal = (customMethodCall is None or
+ 78693:                               customMethodCall.get('unwrapThisFailureFatal', True));
+ 78693:     if (not unwrapThisFailureFatal and not isAttr):
+ 78693:         raise UserError(member.iface.name + '.' + member.name + ": "
+ 78693:                         "Unwrapping this failure must be fatal for methods")
+ 78693: 
+ 17092:     # Function prolog.
+ 32848: 
+ 32848:     # Only template functions can have additional arguments.
+ 32848:     if customMethodCall is None or not 'additionalArguments' in customMethodCall:
+ 32848:         additionalArguments = ''
+ 17092:     else:
+ 32848:         additionalArguments = " %s," % customMethodCall['additionalArguments']
+110010:     if disableOptimizationForMSVC:
+110010:         setOptimizationForMSVC(f, False)
+ 32848:     f.write(signature % (stubName, additionalArguments))
+ 17092:     f.write("{\n")
+ 17092:     f.write("    XPC_QS_ASSERT_CONTEXT_OK(cx);\n")
+ 17092: 
+106862:     # Convert JSMutableHandleValue to jsval*
+106862:     if isAttr:
+106862:         f.write("    jsval *vp = vp_.address();\n")
+106862: 
+ 17092:     # For methods, compute "this".
+ 17092:     if isMethod:
+ 17092:         f.write("    JSObject *obj = JS_THIS_OBJECT(cx, vp);\n"
+ 17092:                 "    if (!obj)\n"
+ 17092:                 "        return JS_FALSE;\n")
+ 17092: 
+ 17092:     # Create ccx if needed.
+ 38509:     haveCcx = memberNeedsCcx(member)
+ 78693:     if haveCcx and not unwrapThisFailureFatal:
+ 78693:         raise UserError(member.iface.name + '.' + member.name + ": "
+ 78693:                         "Unwrapping this failure must be fatal when we have a ccx")
+ 78693: 
+ 17092:     if haveCcx:
+ 17092:         f.write("    XPCCallContext ccx(JS_CALLER, cx, obj, "
+ 17092:                 "JSVAL_TO_OBJECT(JS_CALLEE(cx, vp)));\n")
+ 31395:         if isInterfaceType(member.realtype):
+ 31395:             f.write("    XPCLazyCallContext lccx(ccx);\n")
+ 17092: 
+ 17092:     # Get the 'self' pointer.
+ 23258:     if customMethodCall is None or not 'thisType' in customMethodCall:
+ 23258:         f.write("    %s *self;\n" % member.iface.name)
+ 23258:     else:
+ 23258:         f.write("    %s *self;\n" % customMethodCall['thisType'])
+ 21218:     f.write("    xpc_qsSelfRef selfref;\n")
+ 17092:     # Don't use FromCcx for getters or setters; the way we construct the ccx in
+ 17092:     # a getter/setter causes it to find the wrong wrapper in some cases.
+ 31395:     if haveCcx:
+ 21218:         # Undocumented, but the interpreter puts 'this' at argv[-1],
+ 21218:         # which is vp[1]; and it's ok to overwrite it.
+ 21218:         f.write("    if (!xpc_qsUnwrapThisFromCcx(ccx, &self, &selfref.ptr, "
+ 21218:                 "&vp[1]))\n")
+ 21218:         f.write("        return JS_FALSE;\n")
+ 17092:     else:
+ 21218:         if isGetter:
+ 21218:             pthisval = 'vp'
+ 21218:         elif isSetter:
+ 86989:             f.write("    JS::AutoValueRooter tvr(cx);\n")
+ 48470:             pthisval = 'tvr.jsval_addr()'
+ 21218:         else:
+ 21218:             pthisval = '&vp[1]' # as above, ok to overwrite vp[1]
+ 21218: 
+ 78693:         if unwrapThisFailureFatal:
+ 78693:             unwrapFatalArg = "true"
+ 78693:         else:
+ 78693:             unwrapFatalArg = "false"
+ 78693: 
+ 31395:         if not isSetter and isInterfaceType(member.realtype):
+ 31395:             f.write("    XPCLazyCallContext lccx(JS_CALLER, cx, obj);\n")
+ 89664:             f.write("    if (!xpc_qsUnwrapThis(cx, obj, &self, "
+ 78693:                     "&selfref.ptr, %s, &lccx, %s))\n" % (pthisval, unwrapFatalArg))
+ 31395:         else:
+ 89664:             f.write("    if (!xpc_qsUnwrapThis(cx, obj, &self, "
+106838:                     "&selfref.ptr, %s, nullptr, %s))\n" % (pthisval, unwrapFatalArg))
+ 21218:         f.write("        return JS_FALSE;\n")
+ 17092: 
+ 78693:         if not unwrapThisFailureFatal:
+ 78693:             f.write("      if (!self) {\n")
+ 78693:             if (isGetter):
+ 78693:                 f.write("        *vp = JSVAL_NULL;\n")
+ 78693:             f.write("        return JS_TRUE;\n")
+ 78693:             f.write("    }\n");
+ 78693: 
+ 17092:     if isMethod:
+ 17092:         # If there are any required arguments, check argc.
+ 17092:         requiredArgs = len(member.params)
+ 17092:         while requiredArgs and member.params[requiredArgs-1].optional:
+ 17092:             requiredArgs -= 1
+ 17092:         if requiredArgs:
+ 21218:             f.write("    if (argc < %d)\n" % requiredArgs)
+ 21218:             f.write("        return xpc_qsThrow(cx, "
+ 21218:                     "NS_ERROR_XPC_NOT_ENOUGH_ARGS);\n")
+ 17092: 
+ 17092:     # Convert in-parameters.
+ 23258:     rvdeclared = False
+ 17092:     if isMethod:
+ 17092:         if len(member.params) > 0:
+ 17092:             f.write("    jsval *argv = JS_ARGV(cx, vp);\n")
+ 17092:         for i, param in enumerate(member.params):
+ 40488:             argName = 'arg%d' % i
+ 40488:             argTypeKey = argName + 'Type'
+ 40488:             if customMethodCall is None or not argTypeKey in customMethodCall:
+ 26402:                 validateParam(member, param)
+ 40488:                 realtype = param.realtype
+ 40488:             else:
+ 40488:                 realtype = xpidl.Forward(name=customMethodCall[argTypeKey],
+ 40488:                                          location='', doccomments='')
+ 17092:             # Emit code to convert this argument from jsval.
+ 23258:             rvdeclared = writeArgumentUnboxing(
+ 40488:                 f, i, argName, realtype,
+ 17092:                 haveCcx=haveCcx,
+ 23258:                 optional=param.optional,
+ 33019:                 rvdeclared=rvdeclared,
+ 33019:                 nullBehavior=param.null,
+ 33019:                 undefinedBehavior=param.undefined)
+ 17092:     elif isSetter:
+ 23258:         rvdeclared = writeArgumentUnboxing(f, None, 'arg0', member.realtype,
+ 23258:                                            haveCcx=False, optional=False,
+ 33019:                                            rvdeclared=rvdeclared,
+ 33019:                                            nullBehavior=member.null,
+ 33019:                                            undefinedBehavior=member.undefined)
+ 23258: 
+ 41911:     canFail = customMethodCall is None or customMethodCall.get('canFail', True)
+ 31979:     if canFail and not rvdeclared:
+ 31979:         f.write("    nsresult rv;\n")
+ 31979:         rvdeclared = True
+ 31979: 
+ 41911:     if code is not None:
+ 32848:         f.write("%s\n" % code)
+ 31980: 
+ 41911:     if code is None or (isGetter and callTemplate is ""):
+ 41911:         debugGetter = code is not None
+ 41911:         if debugGetter:
+ 23258:             f.write("#ifdef DEBUG\n")
+ 26502:             f.write("    nsresult debug_rv;\n")
+ 42424:             f.write("    nsCOMPtr<%s> debug_self;\n"
+ 42424:                     "    CallQueryInterface(self, getter_AddRefs(debug_self));\n"
+ 23258:                     % member.iface.name);
+ 23258:             prefix = 'debug_'
+ 23258:         else:
+ 23258:             prefix = ''
+ 23258: 
+ 23258:         resultname = prefix + 'result'
+ 23258:         selfname = prefix + 'self'
+ 26502:         nsresultname = prefix + 'rv'
+ 17092: 
+ 17092:         # Prepare out-parameter.
+ 17092:         if isMethod or isGetter:
+ 23258:             writeResultDecl(f, member.realtype, resultname)
+ 17092: 
+ 17092:         # Call the method.
+ 17092:         if isMethod:
+ 17092:             comName = header.methodNativeName(member)
+ 17092:             argv = ['arg' + str(i) for i, p in enumerate(member.params)]
+ 46381:             if member.implicit_jscontext:
+ 46381:                 argv.append('cx')
+ 34227:             if member.optional_argc:
+108994:                 argv.append('NS_MIN<uint32_t>(argc, %d) - %d' % 
+ 80181:                             (len(member.params), requiredArgs))
+ 17092:             if not isVoidType(member.realtype):
+ 23258:                 argv.append(outParamForm(resultname, member.realtype))
+ 17092:             args = ', '.join(argv)
+ 17092:         else:
+ 17092:             comName = header.attributeNativeName(member, isGetter)
+ 17092:             if isGetter:
+ 23258:                 args = outParamForm(resultname, member.realtype)
+ 17092:             else:
+ 17092:                 args = "arg0"
+ 46381:             if member.implicit_jscontext:
+ 46381:                 args = "cx, " + args
+ 17092: 
+ 41911:         f.write("    ")
+ 41911:         if canFail or debugGetter:
+ 41911:             f.write("%s = " % nsresultname)
+ 41911:         f.write("%s->%s(%s);\n" % (selfname, comName, args))
+ 23258: 
+ 41911:         if debugGetter:
+ 31979:             checkSuccess = "NS_SUCCEEDED(debug_rv)"
+ 31979:             if canFail:
+ 31979:                 checkSuccess += " == NS_SUCCEEDED(rv)"
+ 31979:             f.write("    NS_ASSERTION(%s && "
+ 31979:                     "xpc_qsSameResult(debug_result, result),\n"
+ 31979:                     "                 \"Got the wrong answer from the custom "
+ 31979:                     "method call!\");\n" % checkSuccess)
+ 31979:             f.write("#endif\n")
+ 31979: 
+ 31979:     if canFail:
+ 17092:         # Check for errors.
+ 17092:         f.write("    if (NS_FAILED(rv))\n")
+ 17092:         if isMethod:
+ 17092:             if haveCcx:
+ 23258:                 f.write("        return xpc_qsThrowMethodFailedWithCcx("
+ 23258:                         "ccx, rv);\n")
+ 17092:             else:
+ 17092:                 f.write("        return xpc_qsThrowMethodFailed("
+ 21218:                         "cx, rv, vp);\n")
+ 17092:         else:
+ 21218:             if isGetter:
+ 21218:                 thisval = '*vp'
+ 21218:             else:
+ 48470:                 thisval = '*tvr.jsval_addr()'
+ 21218:             f.write("        return xpc_qsThrowGetterSetterFailed(cx, rv, " +
+ 21218:                     "JSVAL_TO_OBJECT(%s), id);\n" % thisval)
+ 17092: 
+ 17092:     # Convert the return value.
+ 31395:     if isMethod or isGetter:
+ 31395:         writeResultConv(f, member.realtype, 'vp', '*vp')
+ 17092:     else:
+ 21218:         f.write("    return JS_TRUE;\n")
+ 17092: 
+ 17092:     # Epilog.
+110010:     f.write("}\n")
+110010:     if disableOptimizationForMSVC:
+110010:         setOptimizationForMSVC(f, True)
+110010:     f.write("\n")
+ 17092: 
+ 32848:     # Now write out the call to the template function.
+ 32848:     if customMethodCall is not None:
+ 32848:         f.write(callTemplate)
+ 32848: 
+ 87397: def writeAttrStubs(f, customMethodCalls, stringtable, attr):
+ 38908:     cmc = customMethodCalls.get(attr.iface.name + "_" + header.methodNativeName(attr), None)
+ 38908:     custom = cmc and cmc.get('skipgen', False)
+ 38908: 
+ 17092:     getterName = (attr.iface.name + '_'
+ 17092:                   + header.attributeNativeName(attr, True))
+ 38908:     if not custom:
+ 23258:         writeQuickStub(f, customMethodCalls, attr, getterName)
+ 17092:     if attr.readonly:
+ 46967:         setterName = 'xpc_qsGetterOnlyPropertyStub'
+ 17092:     else:
+ 17092:         setterName = (attr.iface.name + '_'
+ 17092:                       + header.attributeNativeName(attr, False))
+ 38908:         if not custom:
+ 23258:             writeQuickStub(f, customMethodCalls, attr, setterName, isSetter=True)
+ 17092: 
+ 87397:     ps = ('{%d, %s, %s}'
+ 87397:           % (stringtable.stringIndex(attr.name), getterName, setterName))
+ 17092:     return ps
+ 17092: 
+ 87397: def writeMethodStub(f, customMethodCalls, stringtable, method):
+ 17092:     """ Write a method stub to `f`. Return an xpc_qsFunctionSpec initializer. """
+ 38908: 
+ 38908:     cmc = customMethodCalls.get(method.iface.name + "_" + header.methodNativeName(method), None)
+ 38908:     custom = cmc and cmc.get('skipgen', False)
+ 38908: 
+ 17092:     stubName = method.iface.name + '_' + header.methodNativeName(method)
+ 38908:     if not custom:
+ 23258:         writeQuickStub(f, customMethodCalls, method, stubName)
+ 87398:     fs = '{%d, %d, %s}' % (stringtable.stringIndex(method.name),
+ 87398:                            len(method.params), stubName)
+ 17092:     return fs
+ 17092: 
+ 87397: def writeStubsForInterface(f, customMethodCalls, stringtable, iface):
+ 17092:     f.write("// === interface %s\n\n" % iface.name)
+ 17092:     propspecs = []
+ 17092:     funcspecs = []
+ 17092:     for member in iface.stubMembers:
+ 17092:         if member.kind == 'attribute':
+ 87397:             ps = writeAttrStubs(f, customMethodCalls, stringtable, member)
+ 17092:             propspecs.append(ps)
+ 17092:         elif member.kind == 'method':
+ 87397:             fs = writeMethodStub(f, customMethodCalls, stringtable, member)
+ 17092:             funcspecs.append(fs)
+ 17092:         else:
+ 17092:             raise TypeError('expected attribute or method, not %r'
+ 17092:                             % member.__class__.__name__)
+ 17092: 
+ 87396:     iface.propspecs = propspecs
+ 87396:     iface.funcspecs = funcspecs
+ 17092: 
+ 17092: def hashIID(iid):
+ 17092:     # See nsIDKey::HashCode in nsHashtable.h.
+ 17092:     return int(iid[:8], 16)
+ 17092: 
+ 17092: uuid_re = re.compile(r'^([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})$')
+ 17092: 
+ 22842: def writeResultXPCInterfacesArray(f, conf, resulttypes):
+ 22842:     f.write("// === XPCNativeInterface cache \n\n")
+ 22842:     count = len(resulttypes)
+ 22842:     if count > 0:
+ 22842:         f.write("static XPCNativeInterface* interfaces[%d];\n\n" % count)
+ 22842:     f.write("void %s_MarkInterfaces()\n"
+ 22842:             "{\n" % conf.name)
+ 22842:     if count > 0:
+108994:         f.write("    for (uint32_t i = 0; i < %d; ++i)\n"
+ 22842:                 "        if (interfaces[i])\n"
+ 22842:                 "            interfaces[i]->Mark();\n" % count)
+ 22842:     f.write("}\n")
+ 22842:     f.write("void %s_ClearInterfaces()\n"
+ 22842:             "{\n" % conf.name)
+ 22842:     if count > 0:
+ 22842:         f.write("    memset(interfaces, 0, %d * "
+ 22842:                 "sizeof(XPCNativeInterface*));\n" % count)
+ 22842:     f.write("}\n\n")
+ 22842:     i = 0
+ 22842:     for type in resulttypes:
+108994:         f.write("static const uint32_t k_%s = %d;\n" % (type, i))
+ 22842:         i += 1
+ 22842:     if count > 0:
+ 22842:         f.write("\n\n")
+ 22842: 
+ 87396: def writeSpecs(f, elementType, varname, spec_type, spec_indices, interfaces):
+ 87396:     index = 0
+ 87396:     f.write("static const %s %s[] = {\n" % (elementType, varname))
+ 87396:     for iface in interfaces:
+ 87396:         specs = getattr(iface, spec_type)
+ 87396:         if specs:
+ 87396:             spec_indices[iface.name] = index
+ 87396:             f.write("    // %s (index %d)\n" % (iface.name,index))
+ 87396:             for s in specs:
+ 87396:                 f.write("    %s,\n" % s)
+ 87396:             index += len(specs)
+ 87396:     f.write("};\n\n")
+ 87396: 
+ 87397: def writeDefiner(f, conf, stringtable, interfaces):
+ 17092:     f.write("// === Definer\n\n")
+ 17092: 
+ 87396:     # Write out the properties and functions
+ 87396:     propspecs_indices = {}
+ 87396:     funcspecs_indices = {}
+ 87396:     prop_array_name = "all_properties"
+ 87396:     func_array_name = "all_functions"
+ 87396:     writeSpecs(f, "xpc_qsPropertySpec", prop_array_name,
+ 87396:                "propspecs", propspecs_indices, interfaces)
+ 87396:     writeSpecs(f, "xpc_qsFunctionSpec", func_array_name,
+ 87396:                "funcspecs", funcspecs_indices, interfaces)
+ 87396: 
+ 17092:     # generate the static hash table
+ 17092:     loadFactor = 0.6
+ 17092:     size = int(len(interfaces) / loadFactor)
+ 17092:     buckets = [[] for i in range(size)]
+ 17092:     for iface in interfaces:
+ 17092:         # This if-statement discards interfaces specified with
+ 17092:         # "nsInterfaceName.*" that don't have any stub-able members.
+ 17092:         if iface.stubMembers:
+ 17092:             h = hashIID(iface.attributes.uuid)
+ 17092:             buckets[h % size].append(iface)
+ 17092: 
+ 17092:     # Calculate where each interface's entry will show up in tableData.  Where
+ 17092:     # there are hash collisions, the extra entries are added at the end of the
+ 17092:     # table.
+ 17092:     entryIndexes = {}
+ 17092:     arraySize = size
+ 17092:     for i, bucket in enumerate(buckets):
+ 17092:         if bucket:
+ 17092:             entryIndexes[bucket[0].attributes.uuid] = i
+ 17092:             for iface in bucket[1:]:
+ 17092:                 entryIndexes[iface.attributes.uuid] = arraySize
+ 17092:                 arraySize += 1
+ 17092: 
+ 17092:     entries = ["    {{0, 0, 0, {0, 0, 0, 0, 0, 0, 0, 0}}, "
+ 87396:                "0, 0, 0, 0, XPC_QS_NULL_INDEX, XPC_QS_NULL_INDEX}"
+ 17092:                for i in range(arraySize)]
+ 17092:     for i, bucket in enumerate(buckets):
+ 17092:         for j, iface in enumerate(bucket):
+ 17092:             # iid field
+ 17092:             uuid = iface.attributes.uuid.lower()
+ 17092:             m = uuid_re.match(uuid)
+ 17092:             assert m is not None
+ 17092:             m0, m1, m2, m3, m4 = m.groups()
+ 17092:             m3arr = ('{0x%s, 0x%s, 0x%s, 0x%s, 0x%s, 0x%s, 0x%s, 0x%s}'
+ 17092:                      % (m3[0:2], m3[2:4], m4[0:2], m4[2:4],
+ 17092:                         m4[4:6], m4[6:8], m4[8:10], m4[10:12]))
+ 17092:             iid = ('{0x%s, 0x%s, 0x%s, %s}' % (m0, m1, m2, m3arr))
+ 17092: 
+ 87396:             # properties fields
+ 87396:             prop_index = 0
+ 87396:             prop_n_entries = 0
+ 87396:             if iface.propspecs:
+ 87396:                 prop_index = propspecs_indices[iface.name]
+ 87396:                 prop_n_entries = len(iface.propspecs)
+ 17092: 
+ 87396:             # member fields
+ 87396:             func_index = 0
+ 87396:             func_n_entries = 0
+ 87396:             if iface.funcspecs:
+ 87396:                 func_index = funcspecs_indices[iface.name]
+ 87396:                 func_n_entries = len(iface.funcspecs)
+ 17092: 
+ 17092:             # parentInterface field
+ 17092:             baseName = iface.base
+ 17092:             while baseName is not None:
+ 17092:                 piface = iface.idl.getName(baseName, None)
+ 17092:                 k = entryIndexes.get(piface.attributes.uuid)
+ 17092:                 if k is not None:
+ 17092:                     parentInterface = str(k)
+ 17092:                     break
+ 17092:                 baseName = piface.base
+ 17092:             else:
+ 17092:                 parentInterface = "XPC_QS_NULL_INDEX"
+ 17092: 
+ 17092:             # chain field
+ 17092:             if j == len(bucket) - 1:
+ 17092:                 chain = "XPC_QS_NULL_INDEX"
+ 17092:             else:
+ 17092:                 k = entryIndexes[bucket[j+1].attributes.uuid]
+ 17092:                 chain = str(k)
+ 17092: 
+ 17092:             # add entry
+ 87396:             entry = "    /* %s */ {%s, %d, %d, %d, %d, %s, %s}" % (
+ 87396:                 iface.name, iid, prop_index, prop_n_entries,
+ 87396:                 func_index, func_n_entries, parentInterface, chain)
+ 17092:             entries[entryIndexes[iface.attributes.uuid]] = entry
+ 17092: 
+ 17092:     f.write("static const xpc_qsHashEntry tableData[] = {\n")
+ 17092:     f.write(",\n".join(entries))
+ 17092:     f.write("\n    };\n\n")
+ 87395:     f.write("// Make sure our table indices aren't overflowed\n"
+ 87395:             "PR_STATIC_ASSERT((sizeof(tableData) / sizeof(tableData[0])) < (1 << (8 * sizeof(tableData[0].parentInterface))));\n"
+ 87395:             "PR_STATIC_ASSERT((sizeof(tableData) / sizeof(tableData[0])) < (1 << (8 * sizeof(tableData[0].chain))));\n\n")
+ 17092: 
+ 87397:     # The string table for property and method names.
+ 87397:     table_name = "stringtab"
+ 87397:     stringtable.writeDefinition(f, table_name)
+ 87397:     structNames = [prop_array_name, func_array_name]
+ 87397:     for name in structNames:
+ 87397:         f.write("PR_STATIC_ASSERT(sizeof(%s) < (1 << (8 * sizeof(%s[0].name_index))));\n"
+ 87397:                 % (table_name, name))
+ 87397:     f.write("\n")
+ 87397: 
+ 17092:     # the definer function (entry point to this quick stubs file)
+ 95444:     f.write("namespace xpc {\n")
+ 95444:     f.write("bool %s_DefineQuickStubs(" % conf.name)
+108994:     f.write("JSContext *cx, JSObject *proto, unsigned flags, uint32_t count, "
+ 17092:             "const nsID **iids)\n"
+ 17092:             "{\n")
+ 95444:     f.write("    return !!xpc_qsDefineQuickStubs("
+ 87397:             "cx, proto, flags, count, iids, %d, tableData, %s, %s, %s);\n" % (
+ 87397:             size, prop_array_name, func_array_name, table_name))
+ 95444:     f.write("}\n")
+ 95444:     f.write("} // namespace xpc\n\n\n")
+ 17092: 
+ 17092: 
+ 17092: stubTopTemplate = '''\
+ 17092: /* THIS FILE IS AUTOGENERATED - DO NOT EDIT */
+ 17092: #include "jsapi.h"
+ 48972: #include "qsWinUndefs.h"
+ 17092: #include "prtypes.h"
+ 17092: #include "nsID.h"
+ 17092: #include "%s"
+ 17092: #include "nscore.h"
+ 17092: #include "nsCOMPtr.h"
+ 17092: #include "nsDependentString.h"
+ 17092: #include "xpcprivate.h"  // for XPCCallContext
+ 80384: #include "XPCQuickStubs.h"
+ 80074: #include "nsWrapperCacheInlines.h"
+ 17092: '''
+ 17092: 
+ 17092: def writeStubFile(filename, headerFilename, conf, interfaces):
+ 17092:     print "Creating stub file", filename
+ 17092:     make_targets.append(filename)
+ 17092: 
+ 17092:     f = open(filename, 'w')
+ 30388:     filesIncluded = set()
+ 17092: 
+ 17092:     def includeType(type):
+ 17092:         type = unaliasType(type)
+ 17092:         if type.kind in ('builtin', 'native'):
+ 22842:             return None
+ 17092:         file = conf.irregularFilenames.get(type.name, type.name) + '.h'
+ 17092:         if file not in filesIncluded:
+ 17092:             f.write('#include "%s"\n' % file)
+ 17092:             filesIncluded.add(file)
+ 22842:         return type
+ 17092: 
+ 17092:     def writeIncludesForMember(member):
+ 17092:         assert member.kind in ('attribute', 'method')
+ 22842:         resulttype = includeType(member.realtype)
+ 17092:         if member.kind == 'method':
+ 17092:             for p in member.params:
+ 17092:                 includeType(p.realtype)
+ 22842:         return resulttype
+ 17092: 
+ 17092:     def writeIncludesForInterface(iface):
+ 17092:         assert iface.kind == 'interface'
+ 22842:         resulttypes = []
+ 17092:         for member in iface.stubMembers:
+ 22842:             resulttype = writeIncludesForMember(member)
+ 22842:             if resulttype is not None and not isVariantType(resulttype):
+ 22842:                 resulttypes.append(resulttype.name)
+ 22842:                 
+ 17092:         includeType(iface)
+ 17092: 
+ 22842:         return resulttypes
+ 22842: 
+ 17092:     try:
+ 17092:         f.write(stubTopTemplate % os.path.basename(headerFilename))
+ 17092:         N = 256
+ 22842:         resulttypes = []
+ 17092:         for iface in interfaces:
+ 22842:             resulttypes.extend(writeIncludesForInterface(iface))
+ 37043:         resulttypes.extend(conf.customReturnInterfaces)
+ 37043:         for customInclude in conf.customIncludes:
+ 37043:             f.write('#include "%s"\n' % customInclude)
+ 17092:         f.write("\n\n")
+ 30388:         writeResultXPCInterfacesArray(f, conf, frozenset(resulttypes))
+ 37043:         for customQS in conf.customQuickStubs:
+ 37043:             f.write('#include "%s"\n' % customQS)
+ 87397:         stringtable = StringTable()
+ 17092:         for iface in interfaces:
+ 87397:             writeStubsForInterface(f, conf.customMethodCalls, stringtable, iface)
+ 87397:         writeDefiner(f, conf, stringtable, interfaces)
+ 17092:     finally:
+ 17092:         f.close()
+ 17092: 
+ 17092: def makeQuote(filename):
+ 17092:     return filename.replace(' ', '\\ ')  # enjoy!
+ 17092: 
+ 17092: def writeMakeDependOutput(filename):
+ 17092:     print "Creating makedepend file", filename
+ 17092:     f = open(filename, 'w')
+ 17092:     try:
+ 17092:         if len(make_targets) > 0:
+ 20748:             f.write("%s:" % makeQuote(make_targets[0]))
+ 17092:             for filename in make_dependencies:
+ 20748:                 f.write(' \\\n\t\t%s' % makeQuote(filename))
+ 20748:             f.write('\n\n')
+ 17092:             for filename in make_targets[1:]:
+ 17092:                 f.write('%s: %s\n' % (makeQuote(filename), makeQuote(make_targets[0])))
+ 17092:     finally:
+ 17092:         f.close()
+ 17092: 
+ 17092: def main():
+ 17092:     from optparse import OptionParser
+ 17092:     o = OptionParser(usage="usage: %prog [options] configfile")
+ 17092:     o.add_option('-o', "--stub-output",
+ 17092:                  type='string', dest='stub_output', default=None,
+ 17092:                  help="Quick stub C++ source output file", metavar="FILE")
+ 17092:     o.add_option('--header-output', type='string', default=None,
+ 17092:                  help="Quick stub header output file", metavar="FILE")
+ 17092:     o.add_option('--makedepend-output', type='string', default=None,
+ 17092:                  help="gnumake dependencies output file", metavar="FILE")
+ 17092:     o.add_option('--idlpath', type='string', default='.',
+ 17092:                  help="colon-separated directories to search for idl files",
+ 17092:                  metavar="PATH")
+ 17092:     o.add_option('--cachedir', dest='cachedir', default='',
+ 17092:                  help="Directory in which to cache lex/parse tables.")
+ 17092:     o.add_option("--verbose-errors", action='store_true', default=False,
+ 17092:                  help="When an error happens, display the Python traceback.")
+ 17092:     (options, filenames) = o.parse_args()
+ 17092: 
+ 17092:     if len(filenames) != 1:
+ 17092:         o.error("Exactly one config filename is needed.")
+ 17092:     filename = filenames[0]
+ 17092: 
+ 17092:     if options.stub_output is None:
+ 17092:         if filename.endswith('.qsconf') or filename.endswith('.py'):
+ 17092:             options.stub_output = filename.rsplit('.', 1)[0] + '.cpp'
+ 17092:         else:
+ 17092:             options.stub_output = filename + '.cpp'
+ 17092:     if options.header_output is None:
+ 17092:         options.header_output = re.sub(r'(\.c|\.cpp)?$', '.h',
+ 17092:                                        options.stub_output)
+ 17092: 
+ 17092:     if options.cachedir != '':
+ 17092:         sys.path.append(options.cachedir)
+ 17092:         if not os.path.isdir(options.cachedir):
+ 40656:             os.makedirs(options.cachedir)
+ 17092: 
+ 17092:     try:
+ 17092:         includePath = options.idlpath.split(':')
+ 17092:         conf, interfaces = readConfigFile(filename,
+ 17092:                                           includePath=includePath,
+ 82646:                                           cachedir=options.cachedir)
+ 17092:         writeStubFile(options.stub_output, options.header_output,
+ 17092:                       conf, interfaces)
+ 97309:         writeHeaderFile(options.header_output, conf.name)
+ 17092:         if options.makedepend_output is not None:
+ 17092:             writeMakeDependOutput(options.makedepend_output)
+ 17092:     except Exception, exc:
+ 17092:         if options.verbose_errors:
+ 17092:             raise
+ 17092:         elif isinstance(exc, (UserError, xpidl.IDLError)):
+ 17092:             warn(str(exc))
+ 17092:         elif isinstance(exc, OSError):
+ 17092:             warn("%s: %s" % (exc.__class__.__name__, exc))
+ 17092:         else:
+ 17092:             raise
+ 17092:         sys.exit(1)
+ 17092: 
+ 17092: if __name__ == '__main__':
+ 17092:     main()

@@ -1,0 +1,841 @@
+ 43340: /* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ 43340: /* vim:set ts=2 sw=2 sts=2 et cindent: */
+ 98983: /* This Source Code Form is subject to the terms of the Mozilla Public
+ 98983:  * License, v. 2.0. If a copy of the MPL was not distributed with this
+ 98983:  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 43340: #include "nsError.h"
+ 43340: #include "nsBuiltinDecoderStateMachine.h"
+ 43340: #include "nsBuiltinDecoder.h"
+ 90148: #include "MediaResource.h"
+ 43340: #include "nsWebMReader.h"
+ 92052: #include "nsWebMBufferedParser.h"
+ 43340: #include "VideoUtils.h"
+ 53765: #include "nsTimeRanges.h"
+ 43340: 
+ 92052: #define VPX_DONT_DEFINE_STDINT_TYPES
+ 92052: #include "vpx/vp8dx.h"
+ 92052: #include "vpx/vpx_decoder.h"
+ 92052: 
+ 43340: using namespace mozilla;
+ 59431: using namespace mozilla::layers;
+ 43340: 
+ 43340: // Un-comment to enable logging of seek bisections.
+ 43340: //#define SEEK_LOGGING
+ 43340: 
+ 43340: #ifdef PR_LOGGING
+ 43340: extern PRLogModuleInfo* gBuiltinDecoderLog;
+ 43340: #define LOG(type, msg) PR_LOG(gBuiltinDecoderLog, type, msg)
+ 43340: #ifdef SEEK_LOGGING
+ 43340: #define SEEK_LOG(type, msg) PR_LOG(gBuiltinDecoderLog, type, msg)
+ 43340: #else
+ 43340: #define SEEK_LOG(type, msg)
+ 43340: #endif
+ 43340: #else
+ 43340: #define LOG(type, msg)
+ 43340: #define SEEK_LOG(type, msg)
+ 43340: #endif
+ 43340: 
+ 68450: static const unsigned NS_PER_USEC = 1000;
+ 60727: static const double NS_PER_S = 1e9;
+ 60727: 
+ 68450: // If a seek request is within SEEK_DECODE_MARGIN microseconds of the
+ 60727: // current time, decode ahead from the current frame rather than performing
+ 60727: // a full seek.
+ 68450: static const int SEEK_DECODE_MARGIN = 250000;
+ 43340: 
+ 84477: template <>
+ 58313: class nsAutoRefTraits<NesteggPacketHolder> : public nsPointerRefTraits<NesteggPacketHolder>
+ 55970: {
+ 55970: public:
+ 58313:   static void Release(NesteggPacketHolder* aHolder) { delete aHolder; }
+ 55970: };
+ 55970: 
+ 90148: // Functions for reading and seeking using MediaResource required for
+ 43340: // nestegg_io. The 'user data' passed to these functions is the
+ 90148: // decoder from which the media resource is obtained.
+ 43340: static int webm_read(void *aBuffer, size_t aLength, void *aUserData)
+ 43340: {
+ 43340:   NS_ASSERTION(aUserData, "aUserData must point to a valid nsBuiltinDecoder");
+ 43340:   nsBuiltinDecoder* decoder = reinterpret_cast<nsBuiltinDecoder*>(aUserData);
+ 90148:   MediaResource* resource = decoder->GetResource();
+ 90148:   NS_ASSERTION(resource, "Decoder has no media resource");
+ 43340: 
+ 43340:   nsresult rv = NS_OK;
+ 79445:   bool eof = false;
+ 43340: 
+ 43340:   char *p = static_cast<char *>(aBuffer);
+ 43340:   while (NS_SUCCEEDED(rv) && aLength > 0) {
+108991:     uint32_t bytes = 0;
+ 90148:     rv = resource->Read(p, aLength, &bytes);
+ 43340:     if (bytes == 0) {
+ 79547:       eof = true;
+ 43340:       break;
+ 43340:     }
+ 43663:     decoder->NotifyBytesConsumed(bytes);
+ 43340:     aLength -= bytes;
+ 43340:     p += bytes;
+ 43340:   }
+ 43340: 
+ 43340:   return NS_FAILED(rv) ? -1 : eof ? 0 : 1;
+ 43340: }
+ 43340: 
+ 43340: static int webm_seek(int64_t aOffset, int aWhence, void *aUserData)
+ 43340: {
+ 43340:   NS_ASSERTION(aUserData, "aUserData must point to a valid nsBuiltinDecoder");
+ 43340:   nsBuiltinDecoder* decoder = reinterpret_cast<nsBuiltinDecoder*>(aUserData);
+ 90148:   MediaResource* resource = decoder->GetResource();
+ 90148:   NS_ASSERTION(resource, "Decoder has no media resource");
+ 90148:   nsresult rv = resource->Seek(aWhence, aOffset);
+ 43340:   return NS_SUCCEEDED(rv) ? 0 : -1;
+ 43340: }
+ 43340: 
+ 43340: static int64_t webm_tell(void *aUserData)
+ 43340: {
+ 43340:   NS_ASSERTION(aUserData, "aUserData must point to a valid nsBuiltinDecoder");
+ 43340:   nsBuiltinDecoder* decoder = reinterpret_cast<nsBuiltinDecoder*>(aUserData);
+ 90148:   MediaResource* resource = decoder->GetResource();
+ 90148:   NS_ASSERTION(resource, "Decoder has no media resource");
+ 90148:   return resource->Tell();
+ 43340: }
+ 43340: 
+ 43340: nsWebMReader::nsWebMReader(nsBuiltinDecoder* aDecoder)
+ 43340:   : nsBuiltinDecoderReader(aDecoder),
+106838:   mContext(nullptr),
+ 43340:   mPacketCount(0),
+ 43340:   mChannels(0),
+ 43340:   mVideoTrack(0),
+ 43340:   mAudioTrack(0),
+ 68450:   mAudioStartUsec(-1),
+ 79385:   mAudioFrames(0),
+ 79547:   mHasVideo(false),
+ 99292:   mHasAudio(false)
+ 43340: {
+ 43340:   MOZ_COUNT_CTOR(nsWebMReader);
+ 43340: }
+ 43340: 
+ 43340: nsWebMReader::~nsWebMReader()
+ 43340: {
+ 43340:   Cleanup();
+ 43340: 
+ 43340:   mVideoPackets.Reset();
+ 43340:   mAudioPackets.Reset();
+ 43340: 
+ 51252:   vpx_codec_destroy(&mVP8);
+ 51252: 
+ 43340:   vorbis_block_clear(&mVorbisBlock);
+ 43340:   vorbis_dsp_clear(&mVorbisDsp);
+ 43340:   vorbis_info_clear(&mVorbisInfo);
+ 43340:   vorbis_comment_clear(&mVorbisComment);
+ 43340: 
+ 43340:   MOZ_COUNT_DTOR(nsWebMReader);
+ 43340: }
+ 43340: 
+ 54993: nsresult nsWebMReader::Init(nsBuiltinDecoderReader* aCloneDonor)
+ 43340: {
+ 84613:   if (vpx_codec_dec_init(&mVP8, vpx_codec_vp8_dx(), NULL, 0)) {
+ 43340:     return NS_ERROR_FAILURE;
+ 43340:   }
+ 43340: 
+ 43340:   vorbis_info_init(&mVorbisInfo);
+ 43340:   vorbis_comment_init(&mVorbisComment);
+ 43340:   memset(&mVorbisDsp, 0, sizeof(vorbis_dsp_state));
+ 43340:   memset(&mVorbisBlock, 0, sizeof(vorbis_block));
+ 43340: 
+ 54993:   if (aCloneDonor) {
+ 54993:     mBufferedState = static_cast<nsWebMReader*>(aCloneDonor)->mBufferedState;
+ 54993:   } else {
+ 54993:     mBufferedState = new nsWebMBufferedState;
+ 54993:   }
+ 54993: 
+ 43340:   return NS_OK;
+ 43340: }
+ 43340: 
+ 43340: nsresult nsWebMReader::ResetDecode()
+ 43340: {
+ 79385:   mAudioFrames = 0;
+ 68450:   mAudioStartUsec = -1;
+ 43340:   nsresult res = NS_OK;
+ 43340:   if (NS_FAILED(nsBuiltinDecoderReader::ResetDecode())) {
+ 43340:     res = NS_ERROR_FAILURE;
+ 43340:   }
+ 43340: 
+ 43340:   // Ignore failed results from vorbis_synthesis_restart. They
+ 43340:   // aren't fatal and it fails when ResetDecode is called at a
+ 43340:   // time when no vorbis data has been read.
+ 43340:   vorbis_synthesis_restart(&mVorbisDsp);
+ 43340: 
+ 43340:   mVideoPackets.Reset();
+ 43340:   mAudioPackets.Reset();
+ 43340: 
+ 43340:   return res;
+ 43340: }
+ 43340: 
+ 43340: void nsWebMReader::Cleanup()
+ 43340: {
+ 43340:   if (mContext) {
+ 43340:     nestegg_destroy(mContext);
+106838:     mContext = nullptr;
+ 43340:   }
+ 43340: }
+ 43340: 
+106910: nsresult nsWebMReader::ReadMetadata(nsVideoInfo* aInfo,
+106910:                                     nsHTMLMediaElement::MetadataTags** aTags)
+ 43340: {
+ 73698:   NS_ASSERTION(mDecoder->OnDecodeThread(), "Should be on decode thread.");
+ 43340: 
+114156:   LOG(PR_LOG_DEBUG, ("Reader [%p] for Decoder [%p]: Reading WebM Metadata: "
+114156:                      "init bytes [%d - %d] cues bytes [%d - %d]",
+114156:                      this, mDecoder,
+114156:                      mInitByteRange.mStart, mInitByteRange.mEnd,
+114156:                      mCuesByteRange.mStart, mCuesByteRange.mEnd));
+ 43340:   nestegg_io io;
+ 43340:   io.read = webm_read;
+ 43340:   io.seek = webm_seek;
+ 43340:   io.tell = webm_tell;
+ 43340:   io.userdata = static_cast<nsBuiltinDecoder*>(mDecoder);
+114156:   int64_t maxOffset = mInitByteRange.IsNull() ? -1 : mInitByteRange.mEnd;
+114156:   int r = nestegg_init(&mContext, io, nullptr, maxOffset);
+ 43340:   if (r == -1) {
+ 43340:     return NS_ERROR_FAILURE;
+ 43340:   }
+ 43340: 
+ 43340:   uint64_t duration = 0;
+ 43340:   r = nestegg_duration(mContext, &duration);
+ 43340:   if (r == 0) {
+ 73698:     ReentrantMonitorAutoEnter mon(mDecoder->GetReentrantMonitor());
+ 68450:     mDecoder->GetStateMachine()->SetDuration(duration / NS_PER_USEC);
+ 43340:   }
+ 43340: 
+ 43340:   unsigned int ntracks = 0;
+ 43340:   r = nestegg_track_count(mContext, &ntracks);
+ 43340:   if (r == -1) {
+ 43340:     Cleanup();
+ 43340:     return NS_ERROR_FAILURE;
+ 43340:   }
+ 43340: 
+ 79547:   mInfo.mHasAudio = false;
+ 79547:   mInfo.mHasVideo = false;
+108991:   for (uint32_t track = 0; track < ntracks; ++track) {
+ 43340:     int id = nestegg_track_codec_id(mContext, track);
+ 43340:     if (id == -1) {
+ 43340:       Cleanup();
+ 43340:       return NS_ERROR_FAILURE;
+ 43340:     }
+ 43340:     int type = nestegg_track_type(mContext, track);
+ 43340:     if (!mHasVideo && type == NESTEGG_TRACK_VIDEO) {
+ 43340:       nestegg_video_params params;
+ 43340:       r = nestegg_track_video_params(mContext, track, &params);
+ 43340:       if (r == -1) {
+ 43340:         Cleanup();
+ 43340:         return NS_ERROR_FAILURE;
+ 43340:       }
+ 43340: 
+ 61490:       // Picture region, taking into account cropping, before scaling
+ 61490:       // to the display size.
+ 61490:       nsIntRect pictureRect(params.crop_left,
+ 61490:                             params.crop_top,
+ 61490:                             params.width - (params.crop_right + params.crop_left),
+ 61490:                             params.height - (params.crop_bottom + params.crop_top));
+ 61490: 
+ 61490:       // If the cropping data appears invalid then use the frame data
+ 61490:       if (pictureRect.width <= 0 ||
+ 61490:           pictureRect.height <= 0 ||
+ 61490:           pictureRect.x < 0 ||
+ 61490:           pictureRect.y < 0)
+ 61490:       {
+ 61490:         pictureRect.x = 0;
+ 61490:         pictureRect.y = 0;
+ 61490:         pictureRect.width = params.width;
+ 61490:         pictureRect.height = params.height;
+ 61490:       }
+ 61490: 
+ 61490:       // Validate the container-reported frame and pictureRect sizes. This ensures
+ 61490:       // that our video frame creation code doesn't overflow.
+ 61490:       nsIntSize displaySize(params.display_width, params.display_height);
+ 61490:       nsIntSize frameSize(params.width, params.height);
+ 61490:       if (!nsVideoInfo::ValidateVideoRegion(frameSize, pictureRect, displaySize)) {
+ 61490:         // Video track's frame sizes will overflow. Ignore the video track.
+ 61490:         continue;
+ 61490:       }
+ 61490: 
+ 43340:       mVideoTrack = track;
+ 79547:       mHasVideo = true;
+ 79547:       mInfo.mHasVideo = true;
+ 72348: 
+ 61490:       mInfo.mDisplay = displaySize;
+ 72348:       mPicture = pictureRect;
+ 72348:       mInitialFrame = frameSize;
+ 43340: 
+ 59431:       switch (params.stereo_mode) {
+ 59431:       case NESTEGG_VIDEO_MONO:
+ 59431:         mInfo.mStereoMode = STEREO_MODE_MONO;
+ 59431:         break;
+ 59431:       case NESTEGG_VIDEO_STEREO_LEFT_RIGHT:
+ 59431:         mInfo.mStereoMode = STEREO_MODE_LEFT_RIGHT;
+ 59431:         break;
+ 59431:       case NESTEGG_VIDEO_STEREO_BOTTOM_TOP:
+ 59431:         mInfo.mStereoMode = STEREO_MODE_BOTTOM_TOP;
+ 59431:         break;
+ 59431:       case NESTEGG_VIDEO_STEREO_TOP_BOTTOM:
+ 59431:         mInfo.mStereoMode = STEREO_MODE_TOP_BOTTOM;
+ 59431:         break;
+ 59431:       case NESTEGG_VIDEO_STEREO_RIGHT_LEFT:
+ 59431:         mInfo.mStereoMode = STEREO_MODE_RIGHT_LEFT;
+ 59431:         break;
+ 59431:       }
+ 90065:     }
+ 43340:     else if (!mHasAudio && type == NESTEGG_TRACK_AUDIO) {
+ 43340:       nestegg_audio_params params;
+ 43340:       r = nestegg_track_audio_params(mContext, track, &params);
+ 43340:       if (r == -1) {
+ 43340:         Cleanup();
+ 43340:         return NS_ERROR_FAILURE;
+ 43340:       }
+ 43340: 
+ 43340:       mAudioTrack = track;
+ 79547:       mHasAudio = true;
+ 79547:       mInfo.mHasAudio = true;
+ 43340: 
+ 43340:       // Get the Vorbis header data
+ 43340:       unsigned int nheaders = 0;
+ 43340:       r = nestegg_track_codec_data_count(mContext, track, &nheaders);
+ 43340:       if (r == -1 || nheaders != 3) {
+ 43340:         Cleanup();
+ 43340:         return NS_ERROR_FAILURE;
+ 43340:       }
+ 43340: 
+108991:       for (uint32_t header = 0; header < nheaders; ++header) {
+ 43340:         unsigned char* data = 0;
+ 43340:         size_t length = 0;
+ 43340: 
+ 43340:         r = nestegg_track_codec_data(mContext, track, header, &data, &length);
+ 43340:         if (r == -1) {
+ 43340:           Cleanup();
+ 43340:           return NS_ERROR_FAILURE;
+ 43340:         }
+ 43340: 
+ 79547:         ogg_packet opacket = InitOggPacket(data, length, header == 0, false, 0);
+ 43340: 
+ 43340:         r = vorbis_synthesis_headerin(&mVorbisInfo,
+ 43340:                                       &mVorbisComment,
+ 43340:                                       &opacket);
+ 55967:         if (r != 0) {
+ 43340:           Cleanup();
+ 43340:           return NS_ERROR_FAILURE;
+ 43340:         }
+ 43340:       }
+ 43340: 
+ 43340:       r = vorbis_synthesis_init(&mVorbisDsp, &mVorbisInfo);
+ 55967:       if (r != 0) {
+ 43340:         Cleanup();
+ 43340:         return NS_ERROR_FAILURE;
+ 43340:       }
+ 43340: 
+ 43340:       r = vorbis_block_init(&mVorbisDsp, &mVorbisBlock);
+ 55967:       if (r != 0) {
+ 43340:         Cleanup();
+ 43340:         return NS_ERROR_FAILURE;
+ 43340:       }
+ 43340: 
+ 43340:       mInfo.mAudioRate = mVorbisDsp.vi->rate;
+ 43340:       mInfo.mAudioChannels = mVorbisDsp.vi->channels;
+ 43340:       mChannels = mInfo.mAudioChannels;
+ 43340:     }
+ 43340:   }
+ 43340: 
+114156:   // Byte range for cues has been specified; load them.
+114156:   if (!mCuesByteRange.IsNull()) {
+114156:     maxOffset = mCuesByteRange.mEnd;
+114156: 
+114156:     // Iterate through cluster ranges until nestegg returns the last one
+114156:     NS_ENSURE_TRUE(mClusterByteRanges.IsEmpty(),
+114156:                    NS_ERROR_ALREADY_INITIALIZED);
+114156:     int clusterNum = 0;
+114156:     bool done = false;
+114156:     do {
+114156:       mClusterByteRanges.AppendElement();
+114156:       r = nestegg_get_cue_point(mContext, clusterNum, maxOffset,
+114156:                                 &(mClusterByteRanges[clusterNum].mStart),
+114156:                                 &(mClusterByteRanges[clusterNum].mEnd));
+114156:       if (r != 0) {
+114156:         Cleanup();
+114156:         return NS_ERROR_FAILURE;
+114156:       }
+114156:       LOG(PR_LOG_DEBUG, ("Reader [%p] for Decoder [%p]: Cluster [%d]: "
+114156:                          "start [%d] end [%d]",
+114156:                          this, mDecoder, clusterNum,
+114156:                          mClusterByteRanges[clusterNum].mStart,
+114156:                          mClusterByteRanges[clusterNum].mEnd));
+114156:       // Last cluster will have '-1' as end value
+114156:       if (mClusterByteRanges[clusterNum].mEnd == -1) {
+114156:         mClusterByteRanges[clusterNum].mEnd = (mCuesByteRange.mStart-1);
+114156:         done = true;
+114156:       } else {
+114156:         clusterNum++;
+114156:       }
+114156:     } while (!done);
+114156:   }
+114156: 
+ 63857:   *aInfo = mInfo;
+ 63857: 
+106910:   *aTags = nullptr;
+106910: 
+114156:   mDecoder->OnReadMetadataCompleted();
+114156: 
+ 43340:   return NS_OK;
+ 43340: }
+ 43340: 
+ 43340: ogg_packet nsWebMReader::InitOggPacket(unsigned char* aData,
+ 43340:                                        size_t aLength,
+ 79445:                                        bool aBOS,
+ 79445:                                        bool aEOS,
+108991:                                        int64_t aGranulepos)
+ 43340: {
+ 43340:   ogg_packet packet;
+ 43340:   packet.packet = aData;
+ 43340:   packet.bytes = aLength;
+ 43340:   packet.b_o_s = aBOS;
+ 43340:   packet.e_o_s = aEOS;
+ 43340:   packet.granulepos = aGranulepos;
+ 43340:   packet.packetno = mPacketCount++;
+ 43340:   return packet;
+ 43340: }
+ 43340:  
+108991: bool nsWebMReader::DecodeAudioPacket(nestegg_packet* aPacket, int64_t aOffset)
+ 43340: {
+ 73698:   NS_ASSERTION(mDecoder->OnDecodeThread(), "Should be on decode thread.");
+ 43340: 
+ 43340:   int r = 0;
+ 43340:   unsigned int count = 0;
+ 43340:   r = nestegg_packet_count(aPacket, &count);
+ 43340:   if (r == -1) {
+ 79547:     return false;
+ 43340:   }
+ 43340: 
+ 43340:   uint64_t tstamp = 0;
+ 43340:   r = nestegg_packet_tstamp(aPacket, &tstamp);
+ 43340:   if (r == -1) {
+ 79547:     return false;
+ 43340:   }
+ 43340: 
+108991:   const uint32_t rate = mVorbisDsp.vi->rate;
+108991:   uint64_t tstamp_usecs = tstamp / NS_PER_USEC;
+ 68450:   if (mAudioStartUsec == -1) {
+ 50359:     // This is the first audio chunk. Assume the start time of our decode
+ 50359:     // is the start of this chunk.
+ 68450:     mAudioStartUsec = tstamp_usecs;
+ 50359:   }
+ 76757:   // If there's a gap between the start of this audio chunk and the end of
+ 76757:   // the previous audio chunk, we need to increment the packet count so that
+ 50359:   // the vorbis decode doesn't use data from before the gap to help decode
+ 50359:   // from after the gap.
+ 90707:   CheckedInt64 tstamp_frames = UsecsToFrames(tstamp_usecs, rate);
+ 90707:   CheckedInt64 decoded_frames = UsecsToFrames(mAudioStartUsec, rate);
+ 98543:   if (!tstamp_frames.isValid() || !decoded_frames.isValid()) {
+ 90707:     NS_WARNING("Int overflow converting WebM times to frames");
+ 79547:     return false;
+ 50359:   }
+ 90707:   decoded_frames += mAudioFrames;
+ 98543:   if (!decoded_frames.isValid()) {
+ 79385:     NS_WARNING("Int overflow adding decoded_frames");
+ 79547:     return false;
+ 50359:   }
+ 90707:   if (tstamp_frames.value() > decoded_frames.value()) {
+ 50359: #ifdef DEBUG
+ 90707:     CheckedInt64 usecs = FramesToUsecs(tstamp_frames.value() - decoded_frames.value(), rate);
+ 79385:     LOG(PR_LOG_DEBUG, ("WebMReader detected gap of %lld, %lld frames, in audio stream\n",
+ 98543:       usecs.isValid() ? usecs.value() : -1,
+ 90707:       tstamp_frames.value() - decoded_frames.value()));
+ 50359: #endif
+ 50359:     mPacketCount++;
+ 68450:     mAudioStartUsec = tstamp_usecs;
+ 79385:     mAudioFrames = 0;
+ 50359:   }
+ 50359: 
+108991:   int32_t total_frames = 0;
+108991:   for (uint32_t i = 0; i < count; ++i) {
+ 43340:     unsigned char* data;
+ 43340:     size_t length;
+ 43340:     r = nestegg_packet_data(aPacket, i, &data, &length);
+ 43340:     if (r == -1) {
+ 79547:       return false;
+ 43340:     }
+ 43340: 
+ 79547:     ogg_packet opacket = InitOggPacket(data, length, false, false, -1);
+ 43340: 
+ 43340:     if (vorbis_synthesis(&mVorbisBlock, &opacket) != 0) {
+ 79547:       return false;
+ 43340:     }
+ 43340: 
+ 43340:     if (vorbis_synthesis_blockin(&mVorbisDsp,
+ 43340:                                  &mVorbisBlock) != 0) {
+ 79547:       return false;
+ 43340:     }
+ 43340: 
+ 56070:     VorbisPCMValue** pcm = 0;
+108991:     int32_t frames = 0;
+ 79385:     while ((frames = vorbis_synthesis_pcmout(&mVorbisDsp, &pcm)) > 0) {
+ 79385:       nsAutoArrayPtr<AudioDataValue> buffer(new AudioDataValue[frames * mChannels]);
+108991:       for (uint32_t j = 0; j < mChannels; ++j) {
+ 56070:         VorbisPCMValue* channel = pcm[j];
+108991:         for (uint32_t i = 0; i < uint32_t(frames); ++i) {
+ 56070:           buffer[i*mChannels + j] = MOZ_CONVERT_VORBIS_SAMPLE(channel[i]);
+ 43340:         }
+ 43340:       }
+ 43340: 
+ 90707:       CheckedInt64 duration = FramesToUsecs(frames, rate);
+ 98543:       if (!duration.isValid()) {
+ 50359:         NS_WARNING("Int overflow converting WebM audio duration");
+ 79547:         return false;
+ 50359:       }
+ 90707:       CheckedInt64 total_duration = FramesToUsecs(total_frames, rate);
+ 98543:       if (!total_duration.isValid()) {
+ 50359:         NS_WARNING("Int overflow converting WebM audio total_duration");
+ 79547:         return false;
+ 50359:       }
+ 50359:       
+ 90707:       CheckedInt64 time = total_duration + tstamp_usecs;
+ 98543:       if (!time.isValid()) {
+ 90707:         NS_WARNING("Int overflow adding total_duration and tstamp_usecs");
+ 90707:         nestegg_free_packet(aPacket);
+ 94737:         return false;
+ 90707:       };
+ 90707: 
+ 79385:       total_frames += frames;
+ 76757:       mAudioQueue.Push(new AudioData(aOffset,
+ 90707:                                      time.value(),
+ 90707:                                      duration.value(),
+ 79385:                                      frames,
+ 74549:                                      buffer.forget(),
+ 74549:                                      mChannels));
+ 79385:       mAudioFrames += frames;
+ 79385:       if (vorbis_synthesis_read(&mVorbisDsp, frames) != 0) {
+ 79547:         return false;
+ 43340:       }
+ 43340:     }
+ 43340:   }
+ 43340: 
+ 79547:   return true;
+ 43340: }
+ 43340: 
+ 58313: nsReturnRef<NesteggPacketHolder> nsWebMReader::NextPacket(TrackType aTrackType)
+ 43340: {
+ 43340:   // The packet queue that packets will be pushed on if they
+ 43340:   // are not the type we are interested in.
+ 43340:   PacketQueue& otherPackets = 
+ 43340:     aTrackType == VIDEO ? mAudioPackets : mVideoPackets;
+ 43340: 
+ 43340:   // The packet queue for the type that we are interested in.
+ 43340:   PacketQueue &packets =
+ 43340:     aTrackType == VIDEO ? mVideoPackets : mAudioPackets;
+ 43340: 
+ 43340:   // Flag to indicate that we do need to playback these types of
+ 43340:   // packets.
+ 79445:   bool hasType = aTrackType == VIDEO ? mHasVideo : mHasAudio;
+ 43340: 
+ 43340:   // Flag to indicate that we do need to playback the other type
+ 43340:   // of track.
+ 79445:   bool hasOtherType = aTrackType == VIDEO ? mHasAudio : mHasVideo;
+ 43340: 
+ 43340:   // Track we are interested in
+108991:   uint32_t ourTrack = aTrackType == VIDEO ? mVideoTrack : mAudioTrack;
+ 43340: 
+ 43340:   // Value of other track
+108991:   uint32_t otherTrack = aTrackType == VIDEO ? mAudioTrack : mVideoTrack;
+ 43340: 
+ 58313:   nsAutoRef<NesteggPacketHolder> holder;
+ 43340: 
+ 43340:   if (packets.GetSize() > 0) {
+ 58313:     holder.own(packets.PopFront());
+ 55970:   } else {
+ 43340:     // Keep reading packets until we find a packet
+ 43340:     // for the track we want.
+ 43340:     do {
+ 58313:       nestegg_packet* packet;
+ 58313:       int r = nestegg_read_packet(mContext, &packet);
+ 43340:       if (r <= 0) {
+ 58313:         return nsReturnRef<NesteggPacketHolder>();
+ 43340:       }
+108991:       int64_t offset = mDecoder->GetResource()->Tell();
+ 58313:       holder.own(new NesteggPacketHolder(packet, offset));
+ 43340: 
+ 43340:       unsigned int track = 0;
+ 43340:       r = nestegg_packet_track(packet, &track);
+ 43340:       if (r == -1) {
+ 58313:         return nsReturnRef<NesteggPacketHolder>();
+ 43340:       }
+ 43340: 
+ 43340:       if (hasOtherType && otherTrack == track) {
+ 43340:         // Save the packet for when we want these packets
+ 58313:         otherPackets.Push(holder.disown());
+ 43340:         continue;
+ 43340:       }
+ 43340: 
+ 43340:       // The packet is for the track we want to play
+ 43340:       if (hasType && ourTrack == track) {
+ 43340:         break;
+ 43340:       }
+ 79547:     } while (true);
+ 43340:   }
+ 43340: 
+ 58313:   return holder.out();
+ 43340: }
+ 43340: 
+ 79445: bool nsWebMReader::DecodeAudioData()
+ 43340: {
+ 73698:   NS_ASSERTION(mDecoder->OnDecodeThread(), "Should be on decode thread.");
+ 73698: 
+ 58313:   nsAutoRef<NesteggPacketHolder> holder(NextPacket(AUDIO));
+ 58313:   if (!holder) {
+ 43340:     mAudioQueue.Finish();
+ 79547:     return false;
+ 43340:   }
+ 43340: 
+ 58313:   return DecodeAudioPacket(holder->mPacket, holder->mOffset);
+ 43340: }
+ 43340: 
+ 79445: bool nsWebMReader::DecodeVideoFrame(bool &aKeyframeSkip,
+108991:                                       int64_t aTimeThreshold)
+ 43340: {
+ 73698:   NS_ASSERTION(mDecoder->OnDecodeThread(), "Should be on decode thread.");
+ 43340: 
+ 63611:   // Record number of frames decoded and parsed. Automatically update the
+ 63611:   // stats counters using the AutoNotifyDecoded stack-based class.
+108991:   uint32_t parsed = 0, decoded = 0;
+ 63611:   nsMediaDecoder::AutoNotifyDecoded autoNotify(mDecoder, parsed, decoded);
+ 63611: 
+ 58313:   nsAutoRef<NesteggPacketHolder> holder(NextPacket(VIDEO));
+ 58313:   if (!holder) {
+ 43340:     mVideoQueue.Finish();
+ 79547:     return false;
+ 43340:   }
+ 43340: 
+ 58313:   nestegg_packet* packet = holder->mPacket;
+ 43340:   unsigned int track = 0;
+ 55970:   int r = nestegg_packet_track(packet, &track);
+ 43340:   if (r == -1) {
+ 79547:     return false;
+ 43340:   }
+ 43340: 
+ 43340:   unsigned int count = 0;
+ 43340:   r = nestegg_packet_count(packet, &count);
+ 43340:   if (r == -1) {
+ 79547:     return false;
+ 43340:   }
+ 43340: 
+ 43340:   uint64_t tstamp = 0;
+ 43340:   r = nestegg_packet_tstamp(packet, &tstamp);
+ 43340:   if (r == -1) {
+ 79547:     return false;
+ 43340:   }
+ 43340: 
+ 43445:   // The end time of this frame is the start time of the next frame.  Fetch
+ 43445:   // the timestamp of the next packet for this track.  If we've reached the
+ 90148:   // end of the resource, use the file's duration as the end time of this
+ 43445:   // video frame.
+ 43445:   uint64_t next_tstamp = 0;
+ 43445:   {
+ 58313:     nsAutoRef<NesteggPacketHolder> next_holder(NextPacket(VIDEO));
+ 58313:     if (next_holder) {
+ 58313:       r = nestegg_packet_tstamp(next_holder->mPacket, &next_tstamp);
+ 43445:       if (r == -1) {
+ 79547:         return false;
+ 43445:       }
+ 58313:       mVideoPackets.PushFront(next_holder.disown());
+ 43445:     } else {
+ 69142:       ReentrantMonitorAutoEnter decoderMon(mDecoder->GetReentrantMonitor());
+ 54994:       nsBuiltinDecoderStateMachine* s =
+ 54994:         static_cast<nsBuiltinDecoderStateMachine*>(mDecoder->GetStateMachine());
+108991:       int64_t endTime = s->GetEndMediaTime();
+ 54994:       if (endTime == -1) {
+ 79547:         return false;
+ 43445:       }
+ 68450:       next_tstamp = endTime * NS_PER_USEC;
+ 43445:     }
+ 43445:   }
+ 43445: 
+108991:   int64_t tstamp_usecs = tstamp / NS_PER_USEC;
+108991:   for (uint32_t i = 0; i < count; ++i) {
+ 43340:     unsigned char* data;
+ 43340:     size_t length;
+ 43340:     r = nestegg_packet_data(packet, i, &data, &length);
+ 43340:     if (r == -1) {
+ 79547:       return false;
+ 43340:     }
+ 43340: 
+ 43340:     vpx_codec_stream_info_t si;
+ 43340:     memset(&si, 0, sizeof(si));
+ 43340:     si.sz = sizeof(si);
+ 84613:     vpx_codec_peek_stream_info(vpx_codec_vp8_dx(), data, length, &si);
+ 68450:     if (aKeyframeSkip && (!si.is_kf || tstamp_usecs < aTimeThreshold)) {
+ 63613:       // Skipping to next keyframe...
+ 63611:       parsed++; // Assume 1 frame per chunk.
+ 63613:       continue;
+ 43340:     }
+ 43340: 
+ 43340:     if (aKeyframeSkip && si.is_kf) {
+ 79547:       aKeyframeSkip = false;
+ 43340:     }
+ 43340: 
+ 43340:     if (vpx_codec_decode(&mVP8, data, length, NULL, 0)) {
+ 79547:       return false;
+ 43340:     }
+ 43340: 
+ 43340:     // If the timestamp of the video frame is less than
+ 43340:     // the time threshold required then it is not added
+ 43340:     // to the video queue and won't be displayed.
+ 68450:     if (tstamp_usecs < aTimeThreshold) {
+ 63611:       parsed++; // Assume 1 frame per chunk.
+ 43340:       continue;
+ 43340:     }
+ 43340: 
+ 43340:     vpx_codec_iter_t  iter = NULL;
+ 43340:     vpx_image_t      *img;
+ 43340: 
+ 43340:     while ((img = vpx_codec_get_frame(&mVP8, &iter))) {
+ 43340:       NS_ASSERTION(img->fmt == IMG_FMT_I420, "WebM image format is not I420");
+ 43340: 
+ 43340:       // Chroma shifts are rounded down as per the decoding examples in the VP8 SDK
+ 43340:       VideoData::YCbCrBuffer b;
+ 43340:       b.mPlanes[0].mData = img->planes[0];
+ 43340:       b.mPlanes[0].mStride = img->stride[0];
+ 43340:       b.mPlanes[0].mHeight = img->d_h;
+ 43340:       b.mPlanes[0].mWidth = img->d_w;
+ 99962:       b.mPlanes[0].mOffset = b.mPlanes[0].mSkip = 0;
+ 43340: 
+ 43340:       b.mPlanes[1].mData = img->planes[1];
+ 43340:       b.mPlanes[1].mStride = img->stride[1];
+119016:       b.mPlanes[1].mHeight = (img->d_h + 1) >> img->y_chroma_shift;
+119016:       b.mPlanes[1].mWidth = (img->d_w + 1) >> img->x_chroma_shift;
+ 99962:       b.mPlanes[1].mOffset = b.mPlanes[1].mSkip = 0;
+ 43340:  
+ 43340:       b.mPlanes[2].mData = img->planes[2];
+ 43340:       b.mPlanes[2].mStride = img->stride[2];
+119016:       b.mPlanes[2].mHeight = (img->d_h + 1) >> img->y_chroma_shift;
+119016:       b.mPlanes[2].mWidth = (img->d_w + 1) >> img->x_chroma_shift;
+ 99962:       b.mPlanes[2].mOffset = b.mPlanes[2].mSkip = 0;
+ 43340:   
+ 72348:       nsIntRect picture = mPicture;
+108991:       if (img->d_w != static_cast<uint32_t>(mInitialFrame.width) ||
+108991:           img->d_h != static_cast<uint32_t>(mInitialFrame.height)) {
+ 72348:         // Frame size is different from what the container reports. This is legal
+ 72348:         // in WebM, and we will preserve the ratio of the crop rectangle as it
+ 72348:         // was reported relative to the picture size reported by the container.
+ 72348:         picture.x = (mPicture.x * img->d_w) / mInitialFrame.width;
+ 72348:         picture.y = (mPicture.y * img->d_h) / mInitialFrame.height;
+ 72348:         picture.width = (img->d_w * mPicture.width) / mInitialFrame.width;
+ 72348:         picture.height = (img->d_h * mPicture.height) / mInitialFrame.height;
+ 72348:       }
+ 72348: 
+ 43340:       VideoData *v = VideoData::Create(mInfo,
+ 43340:                                        mDecoder->GetImageContainer(),
+ 58313:                                        holder->mOffset,
+ 68450:                                        tstamp_usecs,
+ 68450:                                        next_tstamp / NS_PER_USEC,
+ 43340:                                        b,
+ 43340:                                        si.is_kf,
+ 72348:                                        -1,
+ 72348:                                        picture);
+ 43340:       if (!v) {
+ 79547:         return false;
+ 43340:       }
+ 63611:       parsed++;
+ 63611:       decoded++;
+ 63611:       NS_ASSERTION(decoded <= parsed,
+ 63611:         "Expect only 1 frame per chunk per packet in WebM...");
+ 43340:       mVideoQueue.Push(v);
+ 43340:     }
+ 43340:   }
+ 43340: 
+ 79547:   return true;
+ 43340: }
+ 43340: 
+108991: nsresult nsWebMReader::Seek(int64_t aTarget, int64_t aStartTime, int64_t aEndTime,
+108991:                             int64_t aCurrentTime)
+ 43340: {
+ 73698:   NS_ASSERTION(mDecoder->OnDecodeThread(), "Should be on decode thread.");
+ 73698: 
+ 82699:   LOG(PR_LOG_DEBUG, ("%p About to seek to %fs", mDecoder, aTarget/1000000.0));
+ 43340:   if (NS_FAILED(ResetDecode())) {
+ 43340:     return NS_ERROR_FAILURE;
+ 43340:   }
+108991:   uint32_t trackToSeek = mHasVideo ? mVideoTrack : mAudioTrack;
+ 68450:   int r = nestegg_track_seek(mContext, trackToSeek, aTarget * NS_PER_USEC);
+ 43340:   if (r != 0) {
+ 43340:     return NS_ERROR_FAILURE;
+ 43340:   }
+ 50360:   return DecodeToTarget(aTarget);
+ 43340: }
+ 43340: 
+108991: nsresult nsWebMReader::GetBuffered(nsTimeRanges* aBuffered, int64_t aStartTime)
+ 48907: {
+ 90148:   MediaResource* resource = mDecoder->GetResource();
+ 53765: 
+ 68458:   uint64_t timecodeScale;
+ 54993:   if (!mContext || nestegg_tstamp_scale(mContext, &timecodeScale) == -1) {
+ 54993:     return NS_OK;
+ 54993:   }
+ 54993: 
+ 53765:   // Special case completely cached files.  This also handles local files.
+ 98502:   bool isFullyCached = resource->IsDataCachedToEndOfResource(0);
+ 98502:   if (isFullyCached) {
+ 53765:     uint64_t duration = 0;
+ 54993:     if (nestegg_duration(mContext, &duration) == 0) {
+ 54994:       aBuffered->Add(0, duration / NS_PER_S);
+ 53765:     }
+ 98502:   }
+ 98502: 
+108991:   uint32_t bufferedLength = 0;
+ 98502:   aBuffered->GetLength(&bufferedLength);
+ 98502: 
+ 98502:   // Either we the file is not fully cached, or we couldn't find a duration in
+ 98502:   // the WebM bitstream.
+ 98502:   if (!isFullyCached || !bufferedLength) {
+ 90148:     MediaResource* resource = mDecoder->GetResource();
+ 90148:     nsTArray<MediaByteRange> ranges;
+ 90148:     nsresult res = resource->GetCachedRanges(ranges);
+ 63629:     NS_ENSURE_SUCCESS(res, res);
+ 63629: 
+108991:     for (uint32_t index = 0; index < ranges.Length(); index++) {
+108991:       uint64_t start, end;
+ 98502:       bool rv = mBufferedState->CalculateBufferedForRange(ranges[index].mStart,
+ 63629:                                                           ranges[index].mEnd,
+ 98502:                                                           &start, &end);
+ 98502:       if (rv) {
+ 98502:         double startTime = start * timecodeScale / NS_PER_S - aStartTime;
+ 98502:         double endTime = end * timecodeScale / NS_PER_S - aStartTime;
+ 98502: 
+ 98502:         // If this range extends to the end of the file, the true end time
+ 98502:         // is the file's duration.
+ 98502:         if (resource->IsDataCachedToEndOfResource(ranges[index].mStart)) {
+ 98502:           uint64_t duration = 0;
+ 98502:           if (nestegg_duration(mContext, &duration) == 0) {
+ 98502:             endTime = duration / NS_PER_S;
+ 98502:           }
+ 98502:         }
+ 98502: 
+ 98502:         aBuffered->Add(startTime, endTime);
+ 98502:       }
+ 53765:     }
+ 53765:   }
+ 53765: 
+ 48907:   return NS_OK;
+ 48907: }
+ 53765: 
+108991: void nsWebMReader::NotifyDataArrived(const char* aBuffer, uint32_t aLength, int64_t aOffset)
+ 53765: {
+ 54993:   mBufferedState->NotifyDataArrived(aBuffer, aLength, aOffset);
+ 53765: }
+114156: 
+114156: nsresult
+114156: nsWebMReader::GetIndexByteRanges(nsTArray<MediaByteRange>& aByteRanges)
+114156: {
+114156:   NS_ENSURE_TRUE(mContext, NS_ERROR_NULL_POINTER);
+114156:   NS_ENSURE_TRUE(aByteRanges.IsEmpty(), NS_ERROR_ALREADY_INITIALIZED);
+114156:   NS_ENSURE_FALSE(mClusterByteRanges.IsEmpty(), NS_ERROR_NOT_INITIALIZED);
+114156:   NS_ENSURE_FALSE(mCuesByteRange.IsNull(), NS_ERROR_NOT_INITIALIZED);
+114156: 
+114156:   aByteRanges = mClusterByteRanges;
+114156: 
+114156:   return NS_OK;
+114156: }

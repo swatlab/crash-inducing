@@ -1,0 +1,1070 @@
+     1: /* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*-
+     1:  *
+ 98983:  * This Source Code Form is subject to the terms of the Mozilla Public
+ 98983:  * License, v. 2.0. If a copy of the MPL was not distributed with this
+ 98983:  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+     1: 
+     1: #include "imgRequest.h"
+ 73780: #include "ImageLogging.h"
+     1: 
+ 48312: /* We end up pulling in windows.h because we eventually hit gfxWindowsSurface;
+ 48312:  * windows.h defines LoadImage, so we have to #undef it or imgLoader::LoadImage
+ 48312:  * gets changed.
+ 48312:  * This #undef needs to be in multiple places because we don't always pull
+ 48312:  * headers in in the same order.
+ 48312:  */
+ 48312: #undef LoadImage
+ 48312: 
+     1: #include "imgLoader.h"
+     1: #include "imgRequestProxy.h"
+ 50551: #include "RasterImage.h"
+ 52216: #include "VectorImage.h"
+     1: 
+     1: #include "imgILoader.h"
+     1: 
+     1: #include "netCore.h"
+     1: 
+     1: #include "nsIChannel.h"
+     1: #include "nsICachingChannel.h"
+     1: #include "nsILoadGroup.h"
+     1: #include "nsIInputStream.h"
+     1: #include "nsIMultiPartChannel.h"
+     1: #include "nsIHttpChannel.h"
+121368: #include "nsIApplicationCache.h"
+121368: #include "nsIApplicationCacheChannel.h"
+     1: 
+     1: #include "nsIComponentManager.h"
+ 23007: #include "nsIInterfaceRequestorUtils.h"
+     1: #include "nsIServiceManager.h"
+     1: #include "nsISupportsPrimitives.h"
+  7703: #include "nsIScriptSecurityManager.h"
+     1: 
+ 18827: #include "nsICacheVisitor.h"
+ 18827: 
+     1: #include "nsString.h"
+     1: #include "nsXPIDLString.h"
+     1: #include "plstr.h" // PL_strcasestr(...)
+ 38082: #include "nsNetUtil.h"
+ 38082: #include "nsIProtocolHandler.h"
+     1: 
+ 71637: #include "mozilla/Preferences.h"
+120353: #include "mozilla/Likely.h"
+ 46172: 
+ 50548: #include "DiscardTracker.h"
+ 48889: #include "nsAsyncRedirectVerifyHelper.h"
+ 47317: 
+ 50553: #define SVG_MIMETYPE "image/svg+xml"
+ 46172: 
+ 71637: using namespace mozilla;
+ 87852: using namespace mozilla::image;
+ 50546: 
+ 86525: static bool gInitializedPrefCaches = false;
+ 79445: static bool gDecodeOnDraw = false;
+ 79445: static bool gDiscardable = false;
+ 32424: 
+ 46172: static void
+ 86525: InitPrefCaches()
+ 46172: {
+ 86525:   Preferences::AddBoolVarCache(&gDiscardable, "image.mem.discardable");
+ 86525:   Preferences::AddBoolVarCache(&gDecodeOnDraw, "image.mem.decodeondraw");
+ 86525:   gInitializedPrefCaches = true;
+ 46172: }
+ 46172: 
+     1: #if defined(PR_LOGGING)
+120415: PRLogModuleInfo *
+120415: GetImgLog()
+120415: {
+120415:   static PRLogModuleInfo *sImgLog;
+120415:   if (!sImgLog)
+120415:     sImgLog = PR_NewLogModule("imgRequest");
+120415:   return sImgLog;
+120415: }
+     1: #endif
+     1: 
+118748: NS_IMPL_ISUPPORTS5(imgRequest,
+     1:                    nsIStreamListener, nsIRequestObserver,
+ 23007:                    nsIChannelEventSink,
+ 48889:                    nsIInterfaceRequestor,
+ 48889:                    nsIAsyncVerifyRedirectCallback)
+     1: 
+114642: imgRequest::imgRequest(imgLoader* aLoader)
+114642:  : mLoader(aLoader)
+118745:  , mStatusTracker(new imgStatusTracker(nullptr, this))
+114642:  , mValidator(nullptr)
+114642:  , mImageSniffers("image-sniffing-services")
+114642:  , mInnerWindowId(0)
+114642:  , mCORSMode(imgIRequest::CORS_NONE)
+114642:  , mDecodeRequested(false)
+114642:  , mIsMultiPartChannel(false)
+114642:  , mGotData(false)
+114642:  , mIsInCache(false)
+114642:  , mResniffMimeType(false)
+ 86525: {
+ 86525:   // Register our pref observers if we haven't yet.
+120353:   if (MOZ_UNLIKELY(!gInitializedPrefCaches)) {
+ 86525:     InitPrefCaches();
+ 86525:   }
+ 86525: }
+     1: 
+     1: imgRequest::~imgRequest()
+     1: {
+122269:   // The status tracker can outlive this request, and needs to know it's dying.
+122269:   GetStatusTracker().ClearRequest();
+122269: 
+ 72911:   if (mURI) {
+110974:     nsAutoCString spec;
+ 72911:     mURI->GetSpec(spec);
+120415:     LOG_FUNC_WITH_PARAM(GetImgLog(), "imgRequest::~imgRequest()", "keyuri", spec.get());
+ 25078:   } else
+120415:     LOG_FUNC(GetImgLog(), "imgRequest::~imgRequest()");
+     1: }
+     1: 
+     1: nsresult imgRequest::Init(nsIURI *aURI,
+ 72911:                           nsIURI *aCurrentURI,
+     1:                           nsIRequest *aRequest,
+ 23007:                           nsIChannel *aChannel,
+ 18827:                           imgCacheEntry *aCacheEntry,
+ 73878:                           void *aLoadId,
+ 73879:                           nsIPrincipal* aLoadingPrincipal,
+108991:                           int32_t aCORSMode)
+     1: {
+120415:   LOG_FUNC(GetImgLog(), "imgRequest::Init");
+     1: 
+ 25078:   NS_ABORT_IF_FALSE(!mImage, "Multiple calls to init");
+ 25078:   NS_ABORT_IF_FALSE(aURI, "No uri");
+ 72911:   NS_ABORT_IF_FALSE(aCurrentURI, "No current uri");
+ 25078:   NS_ABORT_IF_FALSE(aRequest, "No request");
+ 25078:   NS_ABORT_IF_FALSE(aChannel, "No channel");
+     1: 
+     1:   mProperties = do_CreateInstance("@mozilla.org/properties;1");
+ 50553: 
+     1:   mURI = aURI;
+ 72911:   mCurrentURI = aCurrentURI;
+     1:   mRequest = aRequest;
+ 23007:   mChannel = aChannel;
+ 71556:   mTimedChannel = do_QueryInterface(mChannel);
+ 71556: 
+ 73878:   mLoadingPrincipal = aLoadingPrincipal;
+ 73879:   mCORSMode = aCORSMode;
+ 73878: 
+ 23007:   mChannel->GetNotificationCallbacks(getter_AddRefs(mPrevChannelSink));
+ 23007: 
+ 23007:   NS_ASSERTION(mPrevChannelSink != this,
+ 23007:                "Initializing with a channel that already calls back to us!");
+ 23007: 
+ 23007:   mChannel->SetNotificationCallbacks(this);
+     1: 
+     1:   mCacheEntry = aCacheEntry;
+     1: 
+     1:   SetLoadId(aLoadId);
+     1: 
+     1:   return NS_OK;
+     1: }
+     1: 
+ 51297: imgStatusTracker&
+ 51297: imgRequest::GetStatusTracker()
+ 51297: {
+ 98961:   if (mImage && mGotData) {
+ 51297:     NS_ABORT_IF_FALSE(!mStatusTracker,
+ 51297:                       "Should have given mStatusTracker to mImage");
+ 51297:     return mImage->GetStatusTracker();
+ 51297:   } else {
+ 51297:     NS_ABORT_IF_FALSE(mStatusTracker,
+ 51297:                       "Should have mStatusTracker until we create mImage");
+ 51297:     return *mStatusTracker;
+ 51297:   }
+ 51297: }
+ 51297: 
+ 25078: void imgRequest::SetCacheEntry(imgCacheEntry *entry)
+ 25078: {
+ 25078:   mCacheEntry = entry;
+ 25078: }
+ 25078: 
+ 79445: bool imgRequest::HasCacheEntry() const
+ 25078: {
+106838:   return mCacheEntry != nullptr;
+ 25078: }
+ 25078: 
+118748: void imgRequest::ResetCacheEntry()
+118748: {
+118748:   if (HasCacheEntry()) {
+118748:     mCacheEntry->SetDataSize(0);
+118748:   }
+118748: }
+118748: 
+116032: void imgRequest::AddProxy(imgRequestProxy *proxy)
+     1: {
+  6229:   NS_PRECONDITION(proxy, "null imgRequestProxy passed in");
+120415:   LOG_SCOPE_WITH_PARAM(GetImgLog(), "imgRequest::AddProxy", "proxy", proxy);
+     1: 
+ 25078:   // If we're empty before adding, we have to tell the loader we now have
+ 25078:   // proxies.
+118741:   if (GetStatusTracker().ConsumerCount() == 0) {
+ 72911:     NS_ABORT_IF_FALSE(mURI, "Trying to SetHasProxies without key uri.");
+110906:     mLoader->SetHasProxies(mURI);
+ 25078:   }
+ 25078: 
+118741:   GetStatusTracker().AddConsumer(proxy);
+     1: }
+     1: 
+118608: nsresult imgRequest::RemoveProxy(imgRequestProxy *proxy, nsresult aStatus)
+     1: {
+120415:   LOG_SCOPE_WITH_PARAM(GetImgLog(), "imgRequest::RemoveProxy", "proxy", proxy);
+     1: 
+ 52149:   // This will remove our animation consumers, so after removing
+ 52149:   // this proxy, we don't end up without proxies with observers, but still
+ 52149:   // have animation consumers.
+ 52149:   proxy->ClearAnimationConsumers();
+ 52149: 
+ 48320:   // Let the status tracker do its thing before we potentially call Cancel()
+ 48320:   // below, because Cancel() may result in OnStopRequest being called back
+ 48320:   // before Cancel() returns, leaving the image in a different state then the
+ 48320:   // one it was in at this point.
+118741:   imgStatusTracker& statusTracker = GetStatusTracker();
+118741:   if (!statusTracker.RemoveConsumer(proxy, aStatus))
+118741:     return NS_OK;
+118684: 
+118741:   if (statusTracker.ConsumerCount() == 0) {
+ 25078:     // If we have no observers, there's nothing holding us alive. If we haven't
+ 25078:     // been cancelled and thus removed from the cache, tell the image loader so
+ 25078:     // we can be evicted from the cache.
+ 25078:     if (mCacheEntry) {
+ 72911:       NS_ABORT_IF_FALSE(mURI, "Removing last observer without key uri.");
+ 25078: 
+110906:       mLoader->SetHasNoProxies(mURI, mCacheEntry);
+ 25078:     } 
+ 25078: #if defined(PR_LOGGING)
+ 25078:     else {
+110974:       nsAutoCString spec;
+ 72911:       mURI->GetSpec(spec);
+120415:       LOG_MSG_WITH_PARAM(GetImgLog(), "imgRequest::RemoveProxy no cache entry", "uri", spec.get());
+ 25078:     }
+ 25078: #endif
+ 25078: 
+     1:     /* If |aStatus| is a failure code, then cancel the load if it is still in progress.
+     1:        Otherwise, let the load continue, keeping 'this' in the cache with no observers.
+     1:        This way, if a proxy is destroyed without calling cancel on it, it won't leak
+118741:        and won't leave a bad pointer in the observer list.
+     1:      */
+ 51297:     if (statusTracker.IsLoading() && NS_FAILED(aStatus)) {
+120415:       LOG_MSG(GetImgLog(), "imgRequest::RemoveProxy", "load in progress.  canceling");
+     1: 
+     1:       this->Cancel(NS_BINDING_ABORTED);
+     1:     }
+     1: 
+     1:     /* break the cycle from the cache entry. */
+106838:     mCacheEntry = nullptr;
+     1:   }
+     1: 
+     1:   // If a proxy is removed for a reason other than its owner being
+     1:   // changed, remove the proxy from the loadgroup.
+     1:   if (aStatus != NS_IMAGELIB_CHANGING_OWNER)
+ 80486:     proxy->RemoveFromLoadGroup(true);
+     1: 
+     1:   return NS_OK;
+     1: }
+     1: 
+ 23007: void imgRequest::CancelAndAbort(nsresult aStatus)
+ 23007: {
+120415:   LOG_SCOPE(GetImgLog(), "imgRequest::CancelAndAbort");
+ 25078: 
+ 23007:   Cancel(aStatus);
+ 23007: 
+ 23007:   // It's possible for the channel to fail to open after we've set our
+ 23007:   // notification callbacks. In that case, make sure to break the cycle between
+ 23007:   // the channel and us, because it won't.
+ 23007:   if (mChannel) {
+ 23007:     mChannel->SetNotificationCallbacks(mPrevChannelSink);
+106838:     mPrevChannelSink = nullptr;
+ 23007:   }
+     1: }
+     1: 
+ 48320: void imgRequest::Cancel(nsresult aStatus)
+ 48320: {
+ 48320:   /* The Cancel() method here should only be called by this class. */
+ 48320: 
+120415:   LOG_SCOPE(GetImgLog(), "imgRequest::Cancel");
+ 48320: 
+ 51297:   imgStatusTracker& statusTracker = GetStatusTracker();
+108324: 
+118748:   statusTracker.MaybeUnblockOnload();
+108324: 
+ 51297:   statusTracker.RecordCancel();
+ 48320: 
+ 48320:   RemoveFromCache();
+ 48320: 
+ 51297:   if (mRequest && statusTracker.IsLoading())
+ 48320:     mRequest->Cancel(aStatus);
+ 48320: }
+ 48320: 
+     1: nsresult imgRequest::GetURI(nsIURI **aURI)
+     1: {
+120415:   LOG_FUNC(GetImgLog(), "imgRequest::GetURI");
+     1: 
+     1:   if (mURI) {
+     1:     *aURI = mURI;
+     1:     NS_ADDREF(*aURI);
+     1:     return NS_OK;
+     1:   }
+     1: 
+     1:   return NS_ERROR_FAILURE;
+     1: }
+     1: 
+ 18557: nsresult imgRequest::GetSecurityInfo(nsISupports **aSecurityInfo)
+ 18557: {
+120415:   LOG_FUNC(GetImgLog(), "imgRequest::GetSecurityInfo");
+ 18557: 
+ 18557:   // Missing security info means this is not a security load
+ 18557:   // i.e. it is not an error when security info is missing
+ 18557:   NS_IF_ADDREF(*aSecurityInfo = mSecurityInfo);
+ 18557:   return NS_OK;
+ 18557: }
+ 18557: 
+     1: void imgRequest::RemoveFromCache()
+     1: {
+120415:   LOG_SCOPE(GetImgLog(), "imgRequest::RemoveFromCache");
+     1: 
+ 26259:   if (mIsInCache) {
+ 26259:     // mCacheEntry is nulled out when we have no more observers.
+ 25078:     if (mCacheEntry)
+110906:       mLoader->RemoveFromCache(mCacheEntry);
+ 25078:     else
+110906:       mLoader->RemoveFromCache(mURI);
+ 26259:   }
+ 25078: 
+106838:   mCacheEntry = nullptr;
+ 26069: }
+     1: 
+108991: int32_t imgRequest::Priority() const
+     1: {
+108991:   int32_t priority = nsISupportsPriority::PRIORITY_NORMAL;
+     1:   nsCOMPtr<nsISupportsPriority> p = do_QueryInterface(mRequest);
+     1:   if (p)
+     1:     p->GetPriority(&priority);
+     1:   return priority;
+     1: }
+     1: 
+108991: void imgRequest::AdjustPriority(imgRequestProxy *proxy, int32_t delta)
+     1: {
+     1:   // only the first proxy is allowed to modify the priority of this image load.
+     1:   //
+     1:   // XXX(darin): this is probably not the most optimal algorithm as we may want
+     1:   // to increase the priority of requests that have a lot of proxies.  the key
+     1:   // concern though is that image loads remain lower priority than other pieces
+     1:   // of content such as link clicks, CSS, and JS.
+     1:   //
+118741:   if (!GetStatusTracker().FirstConsumerIs(proxy))
+     1:     return;
+     1: 
+118811:   nsCOMPtr<nsISupportsPriority> p = do_QueryInterface(mChannel);
+     1:   if (p)
+     1:     p->AdjustPriority(delta);
+     1: }
+     1: 
+ 79445: void imgRequest::SetIsInCache(bool incache)
+ 25748: {
+120415:   LOG_FUNC_WITH_PARAM(GetImgLog(), "imgRequest::SetIsCacheable", "incache", incache);
+ 26259:   mIsInCache = incache;
+ 25748: }
+ 25748: 
+ 32424: void imgRequest::UpdateCacheEntrySize()
+ 32424: {
+ 32424:   if (mCacheEntry) {
+ 90638:     mCacheEntry->SetDataSize(mImage->SizeOfData());
+     1: 
+ 32424: #ifdef DEBUG_joe
+110974:     nsAutoCString url;
+ 32424:     mURI->GetSpec(url);
+ 32424:     printf("CACHEPUT: %d %s %d\n", time(NULL), url.get(), imageSize);
+ 32424: #endif
+     1:   }
+ 32424: }
+ 32424: 
+ 72907: void imgRequest::SetCacheValidation(imgCacheEntry* aCacheEntry, nsIRequest* aRequest)
+ 72907: {
+ 72907:   /* get the expires info */
+ 72907:   if (aCacheEntry) {
+ 72907:     nsCOMPtr<nsICachingChannel> cacheChannel(do_QueryInterface(aRequest));
+ 72907:     if (cacheChannel) {
+ 72907:       nsCOMPtr<nsISupports> cacheToken;
+ 72907:       cacheChannel->GetCacheToken(getter_AddRefs(cacheToken));
+ 72907:       if (cacheToken) {
+ 72907:         nsCOMPtr<nsICacheEntryInfo> entryDesc(do_QueryInterface(cacheToken));
+ 72907:         if (entryDesc) {
+108991:           uint32_t expiration;
+ 72907:           /* get the expiration time from the caching channel's token */
+ 72907:           entryDesc->GetExpirationTime(&expiration);
+ 72907: 
+ 72907:           // Expiration time defaults to 0. We set the expiration time on our
+ 72907:           // entry if it hasn't been set yet.
+ 72907:           if (aCacheEntry->GetExpiryTime() == 0)
+ 72907:             aCacheEntry->SetExpiryTime(expiration);
+ 72907:         }
+ 72907:       }
+ 72907:     }
+ 72907: 
+ 72908:     // Determine whether the cache entry must be revalidated when we try to use it.
+ 72907:     // Currently, only HTTP specifies this information...
+ 72907:     nsCOMPtr<nsIHttpChannel> httpChannel(do_QueryInterface(aRequest));
+ 72907:     if (httpChannel) {
+ 79445:       bool bMustRevalidate = false;
+ 72907: 
+ 72907:       httpChannel->IsNoStoreResponse(&bMustRevalidate);
+ 72907: 
+ 72907:       if (!bMustRevalidate) {
+ 72907:         httpChannel->IsNoCacheResponse(&bMustRevalidate);
+ 72907:       }
+ 72907: 
+ 72907:       if (!bMustRevalidate) {
+110974:         nsAutoCString cacheHeader;
+ 72907: 
+ 72907:         httpChannel->GetResponseHeader(NS_LITERAL_CSTRING("Cache-Control"),
+ 72907:                                             cacheHeader);
+ 72907:         if (PL_strcasestr(cacheHeader.get(), "must-revalidate")) {
+ 80486:           bMustRevalidate = true;
+ 72907:         }
+ 72907:       }
+ 72907: 
+ 72907:       // Cache entries default to not needing to validate. We ensure that
+ 72907:       // multiple calls to this function don't override an earlier decision to
+ 72907:       // validate by making validation a one-way decision.
+ 72907:       if (bMustRevalidate)
+ 72908:         aCacheEntry->SetMustValidate(bMustRevalidate);
+ 72907:     }
+ 72909: 
+ 72909:     // We always need to validate file URIs.
+ 72909:     nsCOMPtr<nsIChannel> channel = do_QueryInterface(aRequest);
+ 72909:     if (channel) {
+ 72909:       nsCOMPtr<nsIURI> uri;
+ 72909:       channel->GetURI(getter_AddRefs(uri));
+ 79445:       bool isfile = false;
+ 72909:       uri->SchemeIs("file", &isfile);
+ 72909:       if (isfile)
+ 72909:         aCacheEntry->SetMustValidate(isfile);
+ 72909:     }
+ 72907:   }
+ 72907: }
+ 72907: 
+121368: namespace { // anon
+121368: 
+121368: already_AddRefed<nsIApplicationCache>
+121368: GetApplicationCache(nsIRequest* aRequest)
+121368: {
+121368:   nsresult rv;
+121368: 
+121368:   nsCOMPtr<nsIApplicationCacheChannel> appCacheChan = do_QueryInterface(aRequest);
+121368:   if (!appCacheChan) {
+121368:     return nullptr;
+121368:   }
+121368: 
+121368:   bool fromAppCache;
+121368:   rv = appCacheChan->GetLoadedFromApplicationCache(&fromAppCache);
+121368:   NS_ENSURE_SUCCESS(rv, nullptr);
+121368: 
+121368:   if (!fromAppCache) {
+121368:     return nullptr;
+121368:   }
+121368: 
+121368:   nsCOMPtr<nsIApplicationCache> appCache;
+121368:   rv = appCacheChan->GetApplicationCache(getter_AddRefs(appCache));
+121368:   NS_ENSURE_SUCCESS(rv, nullptr);
+121368: 
+121368:   return appCache.forget();
+121368: }
+121368: 
+121368: } // anon
+121368: 
+121368: bool
+121368: imgRequest::CacheChanged(nsIRequest* aNewRequest)
+121368: {
+121368:   nsCOMPtr<nsIApplicationCache> newAppCache = GetApplicationCache(aNewRequest);
+121368: 
+121368:   // Application cache not involved at all or the same app cache involved
+121368:   // in both of the loads (original and new).
+121368:   if (newAppCache == mApplicationCache)
+121368:     return false;
+121368: 
+121368:   // In a rare case it may happen that two objects still refer
+121368:   // the same application cache version.
+121368:   if (newAppCache && mApplicationCache) {
+121873:     nsresult rv;
+121873: 
+121368:     nsAutoCString oldAppCacheClientId, newAppCacheClientId;
+121368:     rv = mApplicationCache->GetClientID(oldAppCacheClientId);
+121368:     NS_ENSURE_SUCCESS(rv, true);
+121368:     rv = newAppCache->GetClientID(newAppCacheClientId);
+121368:     NS_ENSURE_SUCCESS(rv, true);
+121368: 
+121368:     if (oldAppCacheClientId == newAppCacheClientId)
+121368:       return false;
+121368:   }
+121368: 
+121368:   // When we get here, app caches differ or app cache is involved
+121368:   // just in one of the loads what we also consider as a change
+121368:   // in a loading cache.
+121368:   return true;
+121368: }
+121368: 
+ 32424: nsresult
+ 32516: imgRequest::LockImage()
+ 32516: {
+ 32516:   return mImage->LockImage();
+ 32516: }
+ 32516: 
+ 32516: nsresult
+ 32516: imgRequest::UnlockImage()
+ 32516: {
+ 32516:   return mImage->UnlockImage();
+ 32516: }
+ 32516: 
+ 32516: nsresult
+ 32516: imgRequest::RequestDecode()
+ 32516: {
+ 48320:   // If we've initialized our image, we can request a decode.
+ 51297:   if (mImage) {
+ 32516:     return mImage->RequestDecode();
+ 32516:   }
+ 32516: 
+ 32516:   // Otherwise, flag to do it when we get the image
+ 80486:   mDecodeRequested = true;
+ 32516: 
+ 32516:   return NS_OK;
+ 32516: }
+ 32516: 
+116146: nsresult
+116146: imgRequest::StartDecoding()
+116146: {
+116146:   // If we've initialized our image, we can request a decode.
+116146:   if (mImage) {
+116146:     return mImage->StartDecoding();
+116146:   }
+116146: 
+116146:   // Otherwise, flag to do it when we get the image
+116146:   mDecodeRequested = true;
+116146: 
+116146:   return NS_OK;
+116146: }
+116146: 
+     1: /** nsIRequestObserver methods **/
+     1: 
+     1: /* void onStartRequest (in nsIRequest request, in nsISupports ctxt); */
+     1: NS_IMETHODIMP imgRequest::OnStartRequest(nsIRequest *aRequest, nsISupports *ctxt)
+     1: {
+120415:   LOG_SCOPE(GetImgLog(), "imgRequest::OnStartRequest");
+     1: 
+ 32424:   // Figure out if we're multipart
+     1:   nsCOMPtr<nsIMultiPartChannel> mpchan(do_QueryInterface(aRequest));
+     1:   if (mpchan)
+ 80486:       mIsMultiPartChannel = true;
+     1: 
+ 32424:   // If we're not multipart, we shouldn't have an image yet
+ 51297:   NS_ABORT_IF_FALSE(mIsMultiPartChannel || !mImage,
+ 32424:                     "Already have an image for non-multipart request");
+ 32424: 
+114642:   // If we're multipart and about to load another image, signal so we can
+114642:   // detect the mime type in OnDataAvailable.
+ 52203:   if (mIsMultiPartChannel && mImage) {
+114642:     mResniffMimeType = true;
+114642:     if (mImage->GetType() == imgIContainer::TYPE_RASTER) {
+114642:         // Tell the RasterImage to reinitialize itself. We have to do this in
+114642:         // OnStartRequest so that its state machine is always in a consistent
+114642:         // state.
+114642:         // Note that if our MIME type changes, mImage will be replaced with a
+114642:         // new object.
+114642:         static_cast<RasterImage*>(mImage.get())->NewSourceData();
+ 52203:       }
+ 32424:   }
+ 32424: 
+ 20073:   /*
+ 20073:    * If mRequest is null here, then we need to set it so that we'll be able to
+ 20073:    * cancel it if our Cancel() method is called.  Note that this can only
+ 20073:    * happen for multipart channels.  We could simply not null out mRequest for
+ 20073:    * non-last parts, if GetIsLastPart() were reliable, but it's not.  See
+ 20073:    * https://bugzilla.mozilla.org/show_bug.cgi?id=339610
+ 20073:    */
+ 20073:   if (!mRequest) {
+ 20073:     NS_ASSERTION(mpchan,
+ 20073:                  "We should have an mRequest here unless we're multipart");
+ 20073:     nsCOMPtr<nsIChannel> chan;
+ 20073:     mpchan->GetBaseChannel(getter_AddRefs(chan));
+ 20073:     mRequest = chan;
+ 20073:   }
+ 20073: 
+118749:   GetStatusTracker().OnStartRequest();
+     1: 
+ 18557:   nsCOMPtr<nsIChannel> channel(do_QueryInterface(aRequest));
+ 18557:   if (channel)
+ 18557:     channel->GetSecurityInfo(getter_AddRefs(mSecurityInfo));
+ 18557: 
+  7703:   /* Get our principal */
+     1:   nsCOMPtr<nsIChannel> chan(do_QueryInterface(aRequest));
+  7703:   if (chan) {
+  7703:     nsCOMPtr<nsIScriptSecurityManager> secMan =
+  7703:       do_GetService("@mozilla.org/scriptsecuritymanager;1");
+  7703:     if (secMan) {
+  7703:       nsresult rv = secMan->GetChannelPrincipal(chan,
+  7703:                                                 getter_AddRefs(mPrincipal));
+  7703:       if (NS_FAILED(rv)) {
+  7703:         return rv;
+  7703:       }
+  7703:     }
+  7703:   }
+     1: 
+ 72907:   SetCacheValidation(mCacheEntry, aRequest);
+     1: 
+121368:   mApplicationCache = GetApplicationCache(aRequest);
+121368: 
+     1:   // Shouldn't we be dead already if this gets hit?  Probably multipart/x-mixed-replace...
+118741:   if (GetStatusTracker().ConsumerCount() == 0) {
+     1:     this->Cancel(NS_IMAGELIB_ERROR_FAILURE);
+     1:   }
+     1: 
+     1:   return NS_OK;
+     1: }
+     1: 
+     1: /* void onStopRequest (in nsIRequest request, in nsISupports ctxt, in nsresult status); */
+     1: NS_IMETHODIMP imgRequest::OnStopRequest(nsIRequest *aRequest, nsISupports *ctxt, nsresult status)
+     1: {
+120415:   LOG_FUNC(GetImgLog(), "imgRequest::OnStopRequest");
+     1: 
+ 79445:   bool lastPart = true;
+     1:   nsCOMPtr<nsIMultiPartChannel> mpchan(do_QueryInterface(aRequest));
+ 48319:   if (mpchan)
+ 48319:     mpchan->GetIsLastPart(&lastPart);
+     1: 
+     1:   // XXXldb What if this is a non-last part of a multipart request?
+ 23007:   // xxx before we release our reference to mRequest, lets
+     1:   // save the last status that we saw so that the
+     1:   // imgRequestProxy will have access to it.
+ 23007:   if (mRequest) {
+106838:     mRequest = nullptr;  // we no longer need the request
+     1:   }
+     1: 
+ 23007:   // stop holding a ref to the channel, since we don't need it anymore
+ 23007:   if (mChannel) {
+ 23007:     mChannel->SetNotificationCallbacks(mPrevChannelSink);
+106838:     mPrevChannelSink = nullptr;
+106838:     mChannel = nullptr;
+ 23007:   }
+ 23007: 
+ 32424:   // Tell the image that it has all of the source data. Note that this can
+ 32424:   // trigger a failure, since the image might be waiting for more non-optional
+ 32424:   // data and this is the point where we break the news that it's not coming.
+ 52203:   if (mImage) {
+ 52203:     nsresult rv;
+ 52203:     if (mImage->GetType() == imgIContainer::TYPE_RASTER) {
+ 52203:       // Notify the image
+ 52203:       rv = static_cast<RasterImage*>(mImage.get())->SourceDataComplete();
+ 52203:     } else { // imageType == imgIContainer::TYPE_VECTOR
+ 52203:       nsCOMPtr<nsIStreamListener> imageAsStream = do_QueryInterface(mImage);
+ 52203:       NS_ABORT_IF_FALSE(imageAsStream,
+ 52203:                         "SVG-typed Image failed QI to nsIStreamListener");
+ 52203:       rv = imageAsStream->OnStopRequest(aRequest, ctxt, status);
+ 52203:     }
+ 32424: 
+ 52203:     // If we got an error in the SourceDataComplete() / OnStopRequest() call,
+ 52203:     // we don't want to proceed as if nothing bad happened. However, we also
+ 52203:     // want to give precedence to failure status codes from necko, since
+ 52203:     // presumably they're more meaningful.
+ 32424:     if (NS_FAILED(rv) && NS_SUCCEEDED(status))
+ 32424:       status = rv;
+     1:   }
+     1: 
+ 51297:   imgStatusTracker& statusTracker = GetStatusTracker();
+ 51297:   statusTracker.RecordStopRequest(lastPart, status);
+ 32424: 
+ 48320:   // If the request went through, update the cache entry size. Otherwise,
+ 48320:   // cancel the request, which removes us from the cache.
+ 51297:   if (mImage && NS_SUCCEEDED(status)) {
+ 32424:     // We update the cache entry size here because this is where we finish
+ 32424:     // loading compressed source data, which is part of our size calculus.
+ 32424:     UpdateCacheEntrySize();
+ 32424:   }
+ 48320:   else {
+ 48320:     // stops animations, removes from cache
+ 48320:     this->Cancel(status);
+ 48320:   }
+ 32424: 
+118749:   GetStatusTracker().OnStopRequest(lastPart, status);
+     1: 
+106838:   mTimedChannel = nullptr;
+     1:   return NS_OK;
+     1: }
+     1: 
+114642: struct mimetype_closure
+114642: {
+114642:   imgRequest* request;
+114642:   nsACString* newType;
+114642: };
+114642: 
+ 32424: /* prototype for these defined below */
+     1: static NS_METHOD sniff_mimetype_callback(nsIInputStream* in, void* closure, const char* fromRawSegment,
+108991:                                          uint32_t toOffset, uint32_t count, uint32_t *writeCount);
+     1: 
+     1: /** nsIStreamListener methods **/
+     1: 
+111234: /* void onDataAvailable (in nsIRequest request, in nsISupports ctxt, in nsIInputStream inStr, in unsigned long long sourceOffset, in unsigned long count); */
+111234: NS_IMETHODIMP
+111234: imgRequest::OnDataAvailable(nsIRequest *aRequest, nsISupports *ctxt,
+111234:                             nsIInputStream *inStr, uint64_t sourceOffset,
+111234:                             uint32_t count)
+     1: {
+120415:   LOG_SCOPE_WITH_PARAM(GetImgLog(), "imgRequest::OnDataAvailable", "count", count);
+     1: 
+     1:   NS_ASSERTION(aRequest, "imgRequest::OnDataAvailable -- no request!");
+     1: 
+ 32424:   nsresult rv;
+ 25037: 
+114642:   if (!mGotData || mResniffMimeType) {
+120415:     LOG_SCOPE(GetImgLog(), "imgRequest::OnDataAvailable |First time through... finding mimetype|");
+     1: 
+ 80486:     mGotData = true;
+ 48320: 
+114642:     mimetype_closure closure;
+114642:     nsAutoCString newType;
+114642:     closure.request = this;
+114642:     closure.newType = &newType;
+114642: 
+     1:     /* look at the first few bytes and see if we can tell what the data is from that
+     1:      * since servers tend to lie. :(
+     1:      */
+108991:     uint32_t out;
+114642:     inStr->ReadSegments(sniff_mimetype_callback, &closure, count, &out);
+     1: 
+102909: #ifdef DEBUG
+     1:     /* NS_WARNING if the content type from the channel isn't the same if the sniffing */
+     1: #endif
+     1: 
+ 78165:     nsCOMPtr<nsIChannel> chan(do_QueryInterface(aRequest));
+114642:     if (newType.IsEmpty()) {
+120415:       LOG_SCOPE(GetImgLog(), "imgRequest::OnDataAvailable |sniffing of mimetype failed|");
+     1: 
+ 32424:       rv = NS_ERROR_FAILURE;
+     1:       if (chan) {
+114642:         rv = chan->GetContentType(newType);
+     1:       }
+     1: 
+     1:       if (NS_FAILED(rv)) {
+120415:         PR_LOG(GetImgLog(), PR_LOG_ERROR,
+     1:                ("[this=%p] imgRequest::OnDataAvailable -- Content type unavailable from the channel\n",
+     1:                 this));
+     1: 
+     1:         this->Cancel(NS_IMAGELIB_ERROR_FAILURE);
+     1: 
+     1:         return NS_BINDING_ABORTED;
+     1:       }
+     1: 
+120415:       LOG_MSG(GetImgLog(), "imgRequest::OnDataAvailable", "Got content type from the channel");
+     1:     }
+     1: 
+114642:     // If we're a regular image and this is the first call to OnDataAvailable,
+114642:     // this will always be true. If we've resniffed our MIME type (i.e. we're a
+114642:     // multipart/x-mixed-replace image), we have to be able to switch our image
+114642:     // type and decoder.
+114642:     // We always reinitialize for SVGs, because they have no way of
+114642:     // reinitializing themselves.
+114642:     if (mContentType != newType || newType.EqualsLiteral(SVG_MIMETYPE)) {
+114642:       mContentType = newType;
+114642: 
+114642:       // If we've resniffed our MIME type and it changed, we need to create a
+114642:       // new status tracker to give to the image, because we don't have one of
+114642:       // our own any more.
+114642:       if (mResniffMimeType) {
+114642:         NS_ABORT_IF_FALSE(mIsMultiPartChannel, "Resniffing a non-multipart image");
+118744:         imgStatusTracker* freshTracker = new imgStatusTracker(nullptr, this);
+118747:         freshTracker->AdoptConsumers(&GetStatusTracker());
+118741:         mStatusTracker = freshTracker;
+114642:       }
+114642: 
+114642:       mResniffMimeType = false;
+114642: 
+ 50553:       /* now we have mimetype, so we can infer the image type that we want */
+ 52216:       if (mContentType.EqualsLiteral(SVG_MIMETYPE)) {
+ 52216:         mImage = new VectorImage(mStatusTracker.forget());
+ 52216:       } else {
+ 51297:         mImage = new RasterImage(mStatusTracker.forget());
+ 52216:       }
+ 77330:       mImage->SetInnerWindowID(mInnerWindowId);
+ 51297: 
+118749:       GetStatusTracker().OnDataAvailable();
+ 50553: 
+     1:       /* set our mimetype as a property */
+     1:       nsCOMPtr<nsISupportsCString> contentType(do_CreateInstance("@mozilla.org/supports-cstring;1"));
+     1:       if (contentType) {
+     1:         contentType->SetData(mContentType);
+     1:         mProperties->Set("type", contentType);
+     1:       }
+     1: 
+     1:       /* set our content disposition as a property */
+110974:       nsAutoCString disposition;
+ 78165:       if (chan) {
+ 78165:         chan->GetContentDispositionHeader(disposition);
+     1:       }
+     1:       if (!disposition.IsEmpty()) {
+     1:         nsCOMPtr<nsISupportsCString> contentDisposition(do_CreateInstance("@mozilla.org/supports-cstring;1"));
+     1:         if (contentDisposition) {
+     1:           contentDisposition->SetData(disposition);
+     1:           mProperties->Set("content-disposition", contentDisposition);
+     1:         }
+     1:       }
+     1: 
+120415:       LOG_MSG_WITH_PARAM(GetImgLog(), "imgRequest::OnDataAvailable", "content type", mContentType.get());
+     1: 
+ 32424:       //
+ 50556:       // Figure out our Image initialization flags
+ 32424:       //
+     1: 
+ 32424:       // We default to the static globals
+ 79445:       bool isDiscardable = gDiscardable;
+ 79445:       bool doDecodeOnDraw = gDecodeOnDraw;
+     1: 
+ 32424:       // We want UI to be as snappy as possible and not to flicker. Disable discarding
+ 32424:       // and decode-on-draw for chrome URLS
+ 79445:       bool isChrome = false;
+ 32424:       rv = mURI->SchemeIs("chrome", &isChrome);
+ 32424:       if (NS_SUCCEEDED(rv) && isChrome)
+ 80486:         isDiscardable = doDecodeOnDraw = false;
+     1: 
+ 32424:       // We don't want resources like the "loading" icon to be discardable or
+ 32424:       // decode-on-draw either.
+ 79445:       bool isResource = false;
+ 32424:       rv = mURI->SchemeIs("resource", &isResource);
+ 32424:       if (NS_SUCCEEDED(rv) && isResource)
+ 80486:         isDiscardable = doDecodeOnDraw = false;
+     1: 
+ 32424:       // For multipart/x-mixed-replace, we basically want a direct channel to the
+ 32424:       // decoder. Disable both for this case as well.
+ 32424:       if (mIsMultiPartChannel)
+ 80486:         isDiscardable = doDecodeOnDraw = false;
+ 32424: 
+ 32424:       // We have all the information we need
+108991:       uint32_t imageFlags = Image::INIT_FLAG_NONE;
+ 32424:       if (isDiscardable)
+ 50556:         imageFlags |= Image::INIT_FLAG_DISCARDABLE;
+ 32424:       if (doDecodeOnDraw)
+ 50556:         imageFlags |= Image::INIT_FLAG_DECODE_ON_DRAW;
+ 32424:       if (mIsMultiPartChannel)
+ 50556:         imageFlags |= Image::INIT_FLAG_MULTIPART;
+ 32424: 
+ 53660:       // Get our URI string
+110974:       nsAutoCString uriString;
+ 53660:       rv = mURI->GetSpec(uriString);
+ 53660:       if (NS_FAILED(rv))
+ 53660:         uriString.Assign("<unknown image URI>");
+ 53660: 
+ 51297:       // Initialize the image that we created above. For RasterImages, this
+ 48320:       // instantiates a decoder behind the scenes, so if we don't have a decoder
+ 48320:       // for this mimetype we'll find out about it here.
+118748:       rv = mImage->Init(GetStatusTracker().GetDecoderObserver(),
+118748:                         mContentType.get(), uriString.get(), imageFlags);
+114644: 
+114644:       // We allow multipart images to fail to initialize without cancelling the
+114644:       // load because subsequent images might be fine.
+114644:       if (NS_FAILED(rv) && !mIsMultiPartChannel) { // Probably bad mimetype
+ 32424: 
+ 32424:         this->Cancel(rv);
+ 32424:         return NS_BINDING_ABORTED;
+ 32424:       }
+ 32516: 
+114642:       if (mImage->GetType() == imgIContainer::TYPE_RASTER) {
+ 46235:         /* Use content-length as a size hint for http channels. */
+ 78165:         nsCOMPtr<nsIHttpChannel> httpChannel(do_QueryInterface(aRequest));
+ 46235:         if (httpChannel) {
+110974:           nsAutoCString contentLength;
+ 51739:           rv = httpChannel->GetResponseHeader(NS_LITERAL_CSTRING("content-length"),
+ 51739:                                               contentLength);
+ 46235:           if (NS_SUCCEEDED(rv)) {
+108991:             int32_t len = contentLength.ToInteger(&rv);
+ 51739: 
+ 50553:             // Pass anything usable on so that the RasterImage can preallocate
+ 50553:             // its source buffer
+ 51739:             if (len > 0) {
+108991:               uint32_t sizeHint = (uint32_t) len;
+108991:               sizeHint = NS_MIN<uint32_t>(sizeHint, 20000000); /* Bound by something reasonable */
+ 50553:               RasterImage* rasterImage = static_cast<RasterImage*>(mImage.get());
+ 71472:               rv = rasterImage->SetSourceSizeHint(sizeHint);
+ 71472:               if (NS_FAILED(rv)) {
+ 71472:                 // Flush memory, try to get some back, and try again
+ 80486:                 rv = nsMemory::HeapMinimize(true);
+106850:                 nsresult rv2 = rasterImage->SetSourceSizeHint(sizeHint);
+ 71472:                 // If we've still failed at this point, things are going downhill
+106850:                 if (NS_FAILED(rv) || NS_FAILED(rv2)) {
+ 71472:                   NS_WARNING("About to hit OOM in imagelib!");
+ 71472:                 }
+ 71472:               }
+ 50553:             }
+ 46235:           }
+ 46235:         }
+ 46235:       }
+ 46235: 
+114642:       if (mImage->GetType() == imgIContainer::TYPE_RASTER) {
+ 32516:         // If we were waiting on the image to do something, now's our chance.
+ 32516:         if (mDecodeRequested) {
+116146:           mImage->StartDecoding();
+ 32516:         }
+114642:       } else { // mImage->GetType() == imgIContainer::TYPE_VECTOR
+ 52203:         nsCOMPtr<nsIStreamListener> imageAsStream = do_QueryInterface(mImage);
+ 52203:         NS_ABORT_IF_FALSE(imageAsStream,
+ 52203:                           "SVG-typed Image failed QI to nsIStreamListener");
+106838:         imageAsStream->OnStartRequest(aRequest, nullptr);
+ 52203:       }
+     1:     }
+114642:   }
+     1: 
+114642:   if (mImage->GetType() == imgIContainer::TYPE_RASTER) {
+ 50556:     // WriteToRasterImage always consumes everything it gets
+ 71472:     // if it doesn't run out of memory
+108991:     uint32_t bytesRead;
+ 50556:     rv = inStr->ReadSegments(RasterImage::WriteToRasterImage,
+ 32424:                              static_cast<void*>(mImage),
+ 32424:                              count, &bytesRead);
+ 71472:     NS_ABORT_IF_FALSE(bytesRead == count || mImage->HasError(),
+ 71472:   "WriteToRasterImage should consume everything or the image must be in error!");
+114642:   } else { // mImage->GetType() == imgIContainer::TYPE_VECTOR
+ 52203:     nsCOMPtr<nsIStreamListener> imageAsStream = do_QueryInterface(mImage);
+ 52203:     rv = imageAsStream->OnDataAvailable(aRequest, ctxt, inStr,
+ 52203:                                         sourceOffset, count);
+ 52203:   }
+     1:   if (NS_FAILED(rv)) {
+120415:     PR_LOG(GetImgLog(), PR_LOG_WARNING,
+ 32424:            ("[this=%p] imgRequest::OnDataAvailable -- "
+ 50556:             "copy to RasterImage failed\n", this));
+     1:     this->Cancel(NS_IMAGELIB_ERROR_FAILURE);
+     1:     return NS_BINDING_ABORTED;
+     1:   }
+     1: 
+     1:   return NS_OK;
+     1: }
+     1: 
+     1: static NS_METHOD sniff_mimetype_callback(nsIInputStream* in,
+114642:                                          void* data,
+     1:                                          const char* fromRawSegment,
+108991:                                          uint32_t toOffset,
+108991:                                          uint32_t count,
+108991:                                          uint32_t *writeCount)
+     1: {
+114642:   mimetype_closure* closure = static_cast<mimetype_closure*>(data);
+     1: 
+114642:   NS_ASSERTION(closure, "closure is null!");
+     1: 
+     1:   if (count > 0)
+114642:     closure->request->SniffMimeType(fromRawSegment, count, *closure->newType);
+     1: 
+     1:   *writeCount = 0;
+     1:   return NS_ERROR_FAILURE;
+     1: }
+     1: 
+     1: void
+114642: imgRequest::SniffMimeType(const char *buf, uint32_t len, nsACString& newType)
+     1: {
+114642:   imgLoader::GetMimeTypeFromContent(buf, len, newType);
+  5554: 
+  5554:   // The vast majority of the time, imgLoader will find a gif/jpeg/png image
+114642:   // and fill newType with the sniffed MIME type.
+114642:   if (!newType.IsEmpty())
+  5554:     return;
+  5554: 
+  5554:   // When our sniffing fails, we want to query registered image decoders
+  5554:   // to see if they can identify the image. If we always trusted the server
+  5554:   // to send the right MIME, images sent as text/plain would not be rendered.
+  5554:   const nsCOMArray<nsIContentSniffer>& sniffers = mImageSniffers.GetEntries();
+108991:   uint32_t length = sniffers.Count();
+108991:   for (uint32_t i = 0; i < length; ++i) {
+  5554:     nsresult rv =
+114642:       sniffers[i]->GetMIMETypeFromContent(nullptr, (const uint8_t *) buf, len, newType);
+114642:     if (NS_SUCCEEDED(rv) && !newType.IsEmpty()) {
+  5554:       return;
+  5554:     }
+  5554:   }
+     1: }
+     1: 
+ 32424: 
+ 23007: /** nsIInterfaceRequestor methods **/
+ 23007: 
+ 23007: NS_IMETHODIMP
+ 23007: imgRequest::GetInterface(const nsIID & aIID, void **aResult)
+ 23007: {
+ 23007:   if (!mPrevChannelSink || aIID.Equals(NS_GET_IID(nsIChannelEventSink)))
+ 23007:     return QueryInterface(aIID, aResult);
+ 23007: 
+ 23007:   NS_ASSERTION(mPrevChannelSink != this, 
+ 23007:                "Infinite recursion - don't keep track of channel sinks that are us!");
+ 23007:   return mPrevChannelSink->GetInterface(aIID, aResult);
+ 23007: }
+ 23007: 
+ 23007: /** nsIChannelEventSink methods **/
+ 23007: NS_IMETHODIMP
+ 48889: imgRequest::AsyncOnChannelRedirect(nsIChannel *oldChannel,
+108991:                                    nsIChannel *newChannel, uint32_t flags,
+ 48889:                                    nsIAsyncVerifyRedirectCallback *callback)
+ 23007: {
+ 48889:   NS_ASSERTION(mRequest && mChannel, "Got a channel redirect after we nulled out mRequest!");
+ 23007:   NS_ASSERTION(mChannel == oldChannel, "Got a channel redirect for an unknown channel!");
+ 23007:   NS_ASSERTION(newChannel, "Got a redirect to a NULL channel!");
+ 23007: 
+ 72907:   SetCacheValidation(mCacheEntry, oldChannel);
+ 72907: 
+ 48889:   // Prepare for callback
+ 48889:   mRedirectCallback = callback;
+ 48889:   mNewRedirectChannel = newChannel;
+ 48889: 
+ 23007:   nsCOMPtr<nsIChannelEventSink> sink(do_GetInterface(mPrevChannelSink));
+ 23007:   if (sink) {
+ 48889:     nsresult rv = sink->AsyncOnChannelRedirect(oldChannel, newChannel, flags,
+ 48889:                                                this);
+ 48889:     if (NS_FAILED(rv)) {
+106838:         mRedirectCallback = nullptr;
+106838:         mNewRedirectChannel = nullptr;
+ 48889:     }
+ 23007:     return rv;
+ 23007:   }
+ 23007: 
+ 48889:   (void) OnRedirectVerifyCallback(NS_OK);
+ 48889:   return NS_OK;
+ 48889: }
+ 48889: 
+ 48889: NS_IMETHODIMP
+ 48889: imgRequest::OnRedirectVerifyCallback(nsresult result)
+ 48889: {
+ 48889:   NS_ASSERTION(mRedirectCallback, "mRedirectCallback not set in callback");
+ 48889:   NS_ASSERTION(mNewRedirectChannel, "mNewRedirectChannel not set in callback");
+ 48889: 
+ 48889:   if (NS_FAILED(result)) {
+ 48889:       mRedirectCallback->OnRedirectVerifyCallback(result);
+106838:       mRedirectCallback = nullptr;
+106838:       mNewRedirectChannel = nullptr;
+ 48889:       return NS_OK;
+ 48889:   }
+ 48889: 
+ 48889:   mChannel = mNewRedirectChannel;
+ 71556:   mTimedChannel = do_QueryInterface(mChannel);
+106838:   mNewRedirectChannel = nullptr;
+ 23007: 
+ 72906: #if defined(PR_LOGGING)
+110974:   nsAutoCString oldspec;
+ 72911:   if (mCurrentURI)
+ 72911:     mCurrentURI->GetSpec(oldspec);
+120415:   LOG_MSG_WITH_PARAM(GetImgLog(), "imgRequest::OnChannelRedirect", "old", oldspec.get());
+ 72906: #endif
+ 23007: 
+ 38082:   // make sure we have a protocol that returns data rather than opens
+ 38082:   // an external application, e.g. mailto:
+ 72911:   mChannel->GetURI(getter_AddRefs(mCurrentURI));
+ 79445:   bool doesNotReturnData = false;
+ 48889:   nsresult rv =
+ 72911:     NS_URIChainHasFlags(mCurrentURI, nsIProtocolHandler::URI_DOES_NOT_RETURN_DATA,
+ 38082:                         &doesNotReturnData);
+ 48889: 
+ 48889:   if (NS_SUCCEEDED(rv) && doesNotReturnData)
+ 48889:     rv = NS_ERROR_ABORT;
+ 48889: 
+ 48889:   if (NS_FAILED(rv)) {
+ 48889:     mRedirectCallback->OnRedirectVerifyCallback(rv);
+106838:     mRedirectCallback = nullptr;
+ 48889:     return NS_OK;
+ 48889:   }
+ 38082: 
+ 48889:   mRedirectCallback->OnRedirectVerifyCallback(NS_OK);
+106838:   mRedirectCallback = nullptr;
+ 48889:   return NS_OK;
+ 23007: }

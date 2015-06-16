@@ -1,0 +1,786 @@
+ 43113: /* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+ 43113:  *
+ 98983:  * This Source Code Form is subject to the terms of the Mozilla Public
+ 98983:  * License, v. 2.0. If a copy of the MPL was not distributed with this
+ 98983:  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 43113: 
+ 43113: 
+123826: #include "nsCache.h"
+ 43113: #include "nsDiskCache.h"
+ 43113: #include "nsDiskCacheDevice.h"
+ 43113: #include "nsDiskCacheStreams.h"
+ 43113: #include "nsCacheService.h"
+ 58167: #include "mozilla/FileUtils.h"
+ 86808: #include "nsThreadUtils.h"
+ 86808: #include "mozilla/Telemetry.h"
+ 86808: #include "mozilla/TimeStamp.h"
+ 43113: 
+123582: 
+127617: // we pick 16k as the max buffer size because that is the threshold above which
+127617: //      we are unable to store the data in the cache block files
+127617: //      see nsDiskCacheMap.[cpp,h]
+127617: #define kMaxBufferSize      (16 * 1024)
+123582: 
+ 43113: // Assumptions:
+ 43113: //      - cache descriptors live for life of streams
+ 43113: //      - streams will only be used by FileTransport,
+ 43113: //         they will not be directly accessible to clients
+ 43113: //      - overlapped I/O is NOT supported
+ 43113: 
+ 43113: 
+ 43113: /******************************************************************************
+ 43113:  *  nsDiskCacheInputStream
+ 43113:  *****************************************************************************/
+ 43113: class nsDiskCacheInputStream : public nsIInputStream {
+ 43113: 
+ 43113: public:
+ 43113: 
+ 43113:     nsDiskCacheInputStream( nsDiskCacheStreamIO * parent,
+ 43113:                             PRFileDesc *          fileDesc,
+ 43113:                             const char *          buffer,
+108991:                             uint32_t              endOfStream);
+ 43113: 
+ 43113:     virtual ~nsDiskCacheInputStream();
+ 43113:     
+ 43113:     NS_DECL_ISUPPORTS
+ 43113:     NS_DECL_NSIINPUTSTREAM
+ 43113: 
+ 43113: private:
+ 43113:     nsDiskCacheStreamIO *           mStreamIO;  // backpointer to parent
+ 43113:     PRFileDesc *                    mFD;
+ 43113:     const char *                    mBuffer;
+108991:     uint32_t                        mStreamEnd;
+108991:     uint32_t                        mPos;       // stream position
+ 79445:     bool                            mClosed;
+ 43113: };
+ 43113: 
+ 43113: 
+ 43113: NS_IMPL_THREADSAFE_ISUPPORTS1(nsDiskCacheInputStream, nsIInputStream)
+ 43113: 
+ 43113: 
+ 43113: nsDiskCacheInputStream::nsDiskCacheInputStream( nsDiskCacheStreamIO * parent,
+ 43113:                                                 PRFileDesc *          fileDesc,
+ 43113:                                                 const char *          buffer,
+108991:                                                 uint32_t              endOfStream)
+ 43113:     : mStreamIO(parent)
+ 43113:     , mFD(fileDesc)
+ 43113:     , mBuffer(buffer)
+ 43113:     , mStreamEnd(endOfStream)
+ 43113:     , mPos(0)
+ 80486:     , mClosed(false)
+ 43113: {
+ 43113:     NS_ADDREF(mStreamIO);
+ 43113:     mStreamIO->IncrementInputStreamCount();
+ 43113: }
+ 43113: 
+ 43113: 
+ 43113: nsDiskCacheInputStream::~nsDiskCacheInputStream()
+ 43113: {
+ 43113:     Close();
+ 43113:     mStreamIO->DecrementInputStreamCount();
+ 43113:     NS_RELEASE(mStreamIO);
+ 43113: }
+ 43113: 
+ 43113: 
+ 43113: NS_IMETHODIMP
+ 43113: nsDiskCacheInputStream::Close()
+ 43113: {
+ 43113:     if (!mClosed) {
+ 43113:         if (mFD) {
+ 43113:             (void) PR_Close(mFD);
+106838:             mFD = nullptr;
+ 43113:         }
+ 80486:         mClosed = true;
+ 43113:     }
+ 43113:     return NS_OK;
+ 43113: }
+ 43113: 
+ 43113: 
+ 43113: NS_IMETHODIMP
+108991: nsDiskCacheInputStream::Available(uint64_t * bytesAvailable)
+ 43113: {
+ 43113:     if (mClosed)  return NS_BASE_STREAM_CLOSED;
+ 43113:     if (mStreamEnd < mPos)  return NS_ERROR_UNEXPECTED;
+ 43113:     
+ 43113:     *bytesAvailable = mStreamEnd - mPos;
+ 43113:     return NS_OK;
+ 43113: }
+ 43113: 
+ 43113: 
+ 43113: NS_IMETHODIMP
+108991: nsDiskCacheInputStream::Read(char * buffer, uint32_t count, uint32_t * bytesRead)
+ 43113: {
+ 43113:     *bytesRead = 0;
+ 43113: 
+ 99871:     if (mClosed) {
+ 99871:         CACHE_LOG_DEBUG(("CACHE: nsDiskCacheInputStream::Read "
+ 99871:                          "[stream=%p] stream was closed",
+ 99871:                          this, buffer, count));
+ 43113:         return NS_OK;
+ 99871:     }
+ 43113:     
+ 99871:     if (mPos == mStreamEnd) {
+ 99871:         CACHE_LOG_DEBUG(("CACHE: nsDiskCacheInputStream::Read "
+ 99871:                          "[stream=%p] stream at end of file",
+ 99871:                          this, buffer, count));
+ 99871:         return NS_OK;
+ 99871:     }
+ 99871:     if (mPos > mStreamEnd) {
+ 99871:         CACHE_LOG_DEBUG(("CACHE: nsDiskCacheInputStream::Read "
+ 99871:                          "[stream=%p] stream past end of file (!)",
+ 99871:                          this, buffer, count));
+ 99871:         return NS_ERROR_UNEXPECTED;
+ 99871:     }
+ 43113:     
+ 67724:     if (count > mStreamEnd - mPos)
+ 67724:         count = mStreamEnd - mPos;
+ 67724: 
+ 43113:     if (mFD) {
+ 43113:         // just read from file
+108991:         int32_t  result = PR_Read(mFD, buffer, count);
+ 99871:         if (result < 0) {
+ 99871:             nsresult rv = NS_ErrorAccordingToNSPR();
+ 99871:             CACHE_LOG_DEBUG(("CACHE: nsDiskCacheInputStream::Read PR_Read failed"
+ 99871:                              "[stream=%p, rv=%d, NSPR error %s",
+110507:                              this, int(rv), PR_ErrorToName(PR_GetError())));
+ 99871:             return rv;
+ 99871:         }
+ 43113:         
+108991:         mPos += (uint32_t)result;
+108991:         *bytesRead = (uint32_t)result;
+ 43113:         
+ 43113:     } else if (mBuffer) {
+ 43113:         // read data from mBuffer
+ 43113:         memcpy(buffer, mBuffer + mPos, count);
+ 43113:         mPos += count;
+ 43113:         *bytesRead = count;
+ 43113:     } else {
+ 43113:         // no data source for input stream
+ 43113:     }
+ 43113: 
+ 99871:     CACHE_LOG_DEBUG(("CACHE: nsDiskCacheInputStream::Read "
+ 99871:                      "[stream=%p, count=%ud, byteRead=%ud] ",
+108991:                      this, unsigned(count), unsigned(*bytesRead)));
+ 43113:     return NS_OK;
+ 43113: }
+ 43113: 
+ 43113: 
+ 43113: NS_IMETHODIMP
+ 43113: nsDiskCacheInputStream::ReadSegments(nsWriteSegmentFun writer,
+ 43113:                                      void *            closure,
+108991:                                      uint32_t          count,
+108991:                                      uint32_t *        bytesRead)
+ 43113: {
+ 43113:     return NS_ERROR_NOT_IMPLEMENTED;
+ 43113: }
+ 43113: 
+ 43113: 
+ 43113: NS_IMETHODIMP
+ 79445: nsDiskCacheInputStream::IsNonBlocking(bool * nonBlocking)
+ 43113: {
+ 80486:     *nonBlocking = false;
+ 43113:     return NS_OK;
+ 43113: }
+ 43113: 
+123582: 
+123582: /******************************************************************************
+123582:  *  nsDiskCacheOutputStream
+123582:  *****************************************************************************/
+123582: class nsDiskCacheOutputStream : public nsIOutputStream
+123582: {
+123582: public:
+123582:     nsDiskCacheOutputStream( nsDiskCacheStreamIO * parent);
+123582:     virtual ~nsDiskCacheOutputStream();
+123582: 
+123582:     NS_DECL_ISUPPORTS
+123582:     NS_DECL_NSIOUTPUTSTREAM
+123582: 
+123582:     void ReleaseStreamIO() { NS_IF_RELEASE(mStreamIO); }
+123582: 
+123582: private:
+123582:     nsDiskCacheStreamIO *           mStreamIO;  // backpointer to parent
+123582:     bool                            mClosed;
+123582: };
+123582: 
+123582: 
+125933: NS_IMPL_THREADSAFE_ISUPPORTS1(nsDiskCacheOutputStream,
+125933:                               nsIOutputStream)
+123582: 
+123582: nsDiskCacheOutputStream::nsDiskCacheOutputStream( nsDiskCacheStreamIO * parent)
+123582:     : mStreamIO(parent)
+123582:     , mClosed(false)
+123582: {
+123582:     NS_ADDREF(mStreamIO);
+123582: }
+123582: 
+123582: 
+123582: nsDiskCacheOutputStream::~nsDiskCacheOutputStream()
+123582: {
+123582:     Close();
+123582:     ReleaseStreamIO();
+123582: }
+123582: 
+123582: 
+123582: NS_IMETHODIMP
+123582: nsDiskCacheOutputStream::Close()
+123582: {
+123582:     nsresult rv = NS_OK;
+123582:     mozilla::TimeStamp start = mozilla::TimeStamp::Now();
+123582: 
+123582:     if (!mClosed) {
+123582:         mClosed = true;
+123582:         // tell parent streamIO we are closing
+123582:         rv = mStreamIO->CloseOutputStream(this);
+123582:     }
+123582: 
+123582:     mozilla::Telemetry::ID id;
+123582:     if (NS_IsMainThread())
+123582:         id = mozilla::Telemetry::NETWORK_DISK_CACHE_OUTPUT_STREAM_CLOSE_MAIN_THREAD;
+123582:     else
+123582:         id = mozilla::Telemetry::NETWORK_DISK_CACHE_OUTPUT_STREAM_CLOSE;
+123582: 
+123582:     mozilla::Telemetry::AccumulateTimeDelta(id, start);
+123582: 
+123582:     return rv;
+123582: }
+123582: 
+123582: NS_IMETHODIMP
+123582: nsDiskCacheOutputStream::Flush()
+123582: {
+123582:     if (mClosed)  return NS_BASE_STREAM_CLOSED;
+123582:     // yeah, yeah, well get to it...eventually...
+123582:     return NS_OK;
+123582: }
+123582: 
+123582: 
+123582: NS_IMETHODIMP
+123582: nsDiskCacheOutputStream::Write(const char *buf, uint32_t count, uint32_t *bytesWritten)
+123582: {
+123582:     if (mClosed)  return NS_BASE_STREAM_CLOSED;
+123582:     return mStreamIO->Write(buf, count, bytesWritten);
+123582: }
+123582: 
+123582: 
+123582: NS_IMETHODIMP
+123582: nsDiskCacheOutputStream::WriteFrom(nsIInputStream *inStream, uint32_t count, uint32_t *bytesWritten)
+123582: {
+123582:     NS_NOTREACHED("WriteFrom");
+123582:     return NS_ERROR_NOT_IMPLEMENTED;
+123582: }
+123582: 
+123582: 
+123582: NS_IMETHODIMP
+123582: nsDiskCacheOutputStream::WriteSegments( nsReadSegmentFun reader,
+123582:                                         void *           closure,
+123582:                                         uint32_t         count,
+123582:                                         uint32_t *       bytesWritten)
+123582: {
+123582:     NS_NOTREACHED("WriteSegments");
+123582:     return NS_ERROR_NOT_IMPLEMENTED;
+123582: }
+123582: 
+123582: 
+123582: NS_IMETHODIMP
+123582: nsDiskCacheOutputStream::IsNonBlocking(bool * nonBlocking)
+123582: {
+123582:     *nonBlocking = false;
+123582:     return NS_OK;
+123582: }
+123582: 
+123582: 
+123582: 
+ 43113: /******************************************************************************
+ 43113:  *  nsDiskCacheStreamIO
+ 43113:  *****************************************************************************/
+123582: NS_IMPL_THREADSAFE_ISUPPORTS0(nsDiskCacheStreamIO)
+123582: 
+ 43113: nsDiskCacheStreamIO::nsDiskCacheStreamIO(nsDiskCacheBinding *   binding)
+ 43113:     : mBinding(binding)
+123582:     , mOutStream(nullptr)
+ 43113:     , mInStreamCount(0)
+106838:     , mFD(nullptr)
+ 43113:     , mStreamEnd(0)
+ 43113:     , mBufSize(0)
+106838:     , mBuffer(nullptr)
+ 43113: {
+ 43113:     mDevice = (nsDiskCacheDevice *)mBinding->mCacheEntry->CacheDevice();
+ 43113: 
+ 43113:     // acquire "death grip" on cache service
+ 43113:     nsCacheService *service = nsCacheService::GlobalInstance();
+ 43113:     NS_ADDREF(service);
+ 43113: }
+ 43113: 
+ 43113: 
+ 43113: nsDiskCacheStreamIO::~nsDiskCacheStreamIO()
+ 43113: {
+123582:     Close();
+ 43113: 
+ 43113:     // release "death grip" on cache service
+ 43113:     nsCacheService *service = nsCacheService::GlobalInstance();
+ 43113:     NS_RELEASE(service);
+ 43113: }
+ 43113: 
+ 43113: 
+123582: void
+ 43113: nsDiskCacheStreamIO::Close()
+ 43113: {
+123582:     // this should only be called from our destructor
+123582:     // no one is interested in us anymore, so we don't need to grab any locks
+123582:     
+123582:     // assert streams closed
+123582:     NS_ASSERTION(!mOutStream, "output stream still open");
+123582:     NS_ASSERTION(mInStreamCount == 0, "input stream still open");
+123582:     NS_ASSERTION(!mFD, "file descriptor not closed");
+123582: 
+123582:     DeleteBuffer();
+ 43113: }
+ 43113: 
+ 43113: 
+ 43113: // NOTE: called with service lock held
+ 43113: nsresult
+108991: nsDiskCacheStreamIO::GetInputStream(uint32_t offset, nsIInputStream ** inputStream)
+ 43113: {
+ 43113:     NS_ENSURE_ARG_POINTER(inputStream);
+ 43113:     NS_ENSURE_TRUE(offset == 0, NS_ERROR_NOT_IMPLEMENTED);
+ 43113: 
+106838:     *inputStream = nullptr;
+ 43113:     
+ 43113:     if (!mBinding)  return NS_ERROR_NOT_AVAILABLE;
+ 43113: 
+123582:     if (mOutStream) {
+123582:         NS_WARNING("already have an output stream open");
+ 43113:         return NS_ERROR_NOT_AVAILABLE;
+ 43113:     }
+ 43113: 
+ 43113:     nsresult            rv;
+106838:     PRFileDesc *        fd = nullptr;
+ 43113: 
+ 43113:     mStreamEnd = mBinding->mCacheEntry->DataSize();
+ 43113:     if (mStreamEnd == 0) {
+ 43113:         // there's no data to read
+ 43113:         NS_ASSERTION(!mBinding->mRecord.DataLocationInitialized(), "storage allocated for zero data size");
+ 43113:     } else if (mBinding->mRecord.DataFile() == 0) {
+ 43113:         // open file desc for data
+ 43113:         rv = OpenCacheFile(PR_RDONLY, &fd);
+ 43113:         if (NS_FAILED(rv))  return rv;  // unable to open file        
+ 43113:         NS_ASSERTION(fd, "cache stream lacking open file.");
+ 43113:             
+ 43113:     } else if (!mBuffer) {
+ 43113:         // read block file for data
+127617:         rv = ReadCacheBlocks(mStreamEnd);
+ 43113:         if (NS_FAILED(rv))  return rv;
+ 43113:     }
+ 43113:     // else, mBuffer already contains all of the data (left over from a
+ 43113:     // previous block-file read or write).
+ 43113: 
+ 43113:     NS_ASSERTION(!(fd && mBuffer), "ambiguous data sources for input stream");
+ 43113: 
+ 43113:     // create a new input stream
+ 43113:     nsDiskCacheInputStream * inStream = new nsDiskCacheInputStream(this, fd, mBuffer, mStreamEnd);
+ 43113:     if (!inStream)  return NS_ERROR_OUT_OF_MEMORY;
+ 43113:     
+ 43113:     NS_ADDREF(*inputStream = inStream);
+ 43113:     return NS_OK;
+ 43113: }
+ 43113: 
+ 43113: 
+ 43113: // NOTE: called with service lock held
+ 43113: nsresult
+108991: nsDiskCacheStreamIO::GetOutputStream(uint32_t offset, nsIOutputStream ** outputStream)
+ 43113: {
+ 43113:     NS_ENSURE_ARG_POINTER(outputStream);
+106838:     *outputStream = nullptr;
+ 43113: 
+ 43113:     if (!mBinding)  return NS_ERROR_NOT_AVAILABLE;
+ 43113:         
+123582:     NS_ASSERTION(!mOutStream, "already have an output stream open");
+ 43113:     NS_ASSERTION(mInStreamCount == 0, "we already have input streams open");
+123582:     if (mOutStream || mInStreamCount)  return NS_ERROR_NOT_AVAILABLE;
+ 43113:     
+ 43113:     mStreamEnd = mBinding->mCacheEntry->DataSize();
+ 43113: 
+127617:     // Inits file or buffer and truncate at the desired offset
+127617:     nsresult rv = SeekAndTruncate(offset);
+123582:     if (NS_FAILED(rv)) return rv;
+111334: 
+123582:     // create a new output stream
+123582:     mOutStream = new nsDiskCacheOutputStream(this);
+123582:     if (!mOutStream)  return NS_ERROR_OUT_OF_MEMORY;
+ 43113:     
+123582:     NS_ADDREF(*outputStream = mOutStream);
+ 43113:     return NS_OK;
+ 43113: }
+ 43113: 
+ 88288: nsresult
+ 43113: nsDiskCacheStreamIO::ClearBinding()
+ 43113: {
+ 88288:     nsresult rv = NS_OK;
+123582:     if (mBinding && mOutStream)
+ 88288:         rv = Flush();
+106838:     mBinding = nullptr;
+ 88288:     return rv;
+ 43113: }
+ 43113: 
+123582: nsresult
+123582: nsDiskCacheStreamIO::CloseOutputStream(nsDiskCacheOutputStream *  outputStream)
+123582: {
+123582:     nsCacheServiceAutoLock lock(LOCK_TELEM(NSDISKCACHESTREAMIO_CLOSEOUTPUTSTREAM)); // grab service lock
+111334: 
+123582:     if (outputStream != mOutStream) {
+123582:         NS_WARNING("mismatched output streams");
+123582:         return NS_ERROR_UNEXPECTED;
+123582:     }
+123582: 
+123582:     // output stream is closing
+111334:     if (!mBinding) {    // if we're severed, just clear member variables
+123582:         mOutStream = nullptr;
+123582:         outputStream->ReleaseStreamIO();
+123582:         return NS_ERROR_NOT_AVAILABLE;
+ 60325:     }
+ 60325: 
+127617:     nsresult rv = Flush();
+123582:     if (NS_FAILED(rv))
+123582:         NS_WARNING("Flush() failed");
+123582: 
+123582:     mOutStream = nullptr;
+123582:     return rv;
+ 43113: }
+ 43113: 
+123582: nsresult
+ 43113: nsDiskCacheStreamIO::Flush()
+ 43113: {
+ 43113:     NS_ASSERTION(mBinding, "oops");
+ 43113: 
+ 43113:     CACHE_LOG_DEBUG(("CACHE: Flush [%x doomed=%u]\n",
+ 43113:         mBinding->mRecord.HashNumber(), mBinding->mDoomed));
+ 43113: 
+127617:     // When writing to a file, just close the file
+ 72221:     if (mFD) {
+ 72221:         (void) PR_Close(mFD);
+106838:         mFD = nullptr;
+ 43113:         return NS_OK;
+ 72221:     }
+ 43113: 
+ 43113:     // write data to cache blocks, or flush mBuffer to file
+ 43113:     nsDiskCacheMap *cacheMap = mDevice->CacheMap();  // get map reference
+ 43113:     nsresult rv;
+ 43113: 
+ 79445:     bool written = false;
+ 60881: 
+127385:     if (mStreamEnd <= kMaxBufferSize) {
+ 60881:         // store data (if any) in cache block files
+ 60881: 
+ 60881:         // delete existing storage
+ 60881:         nsDiskCacheRecord * record = &mBinding->mRecord;
+ 60881:         if (record->DataLocationInitialized()) {
+ 60881:             rv = cacheMap->DeleteStorage(record, nsDiskCache::kData);
+ 60881:             if (NS_FAILED(rv)) {
+ 60881:                 NS_WARNING("cacheMap->DeleteStorage() failed.");
+ 60881:                 return rv;
+ 60881:             }
+ 60881:         }
+ 60881: 
+ 60881:         // flush buffer to block files
+ 80486:         written = true;
+ 60881:         if (mStreamEnd > 0) {
+127617:             rv = cacheMap->WriteDataCacheBlocks(mBinding, mBuffer, mStreamEnd);
+ 60881:             if (NS_FAILED(rv)) {
+ 60881:                 NS_WARNING("WriteDataCacheBlocks() failed.");
+ 80486:                 written = false;
+ 60881:             }
+ 60881:         }
+ 60881:     }
+ 60881: 
+128251:     if (!written && mStreamEnd > 0) {
+127617:         // failed to store in cacheblocks, save as separate file
+ 60881:         rv = FlushBufferToFile(); // initializes DataFileLocation() if necessary
+ 43113: 
+ 43113:         if (mFD) {
+ 43113:           // Update the file size of the disk file in the cache
+ 43113:           UpdateFileSize();
+ 43113: 
+ 43113:           // close file descriptor
+ 43113:           (void) PR_Close(mFD);
+106838:           mFD = nullptr;
+ 43113:         }
+ 43113:         else
+ 43113:           NS_WARNING("no file descriptor");
+ 43113: 
+ 43113:         // close mFD first if possible before returning if FlushBufferToFile
+ 43113:         // failed
+ 43113:         NS_ENSURE_SUCCESS(rv, rv);
+ 43113:     }
+ 43113:     
+ 43113:     // XXX do we need this here?  WriteDataCacheBlocks() calls UpdateRecord()
+ 43113:     // update cache map if entry isn't doomed
+ 43113:     if (!mBinding->mDoomed) {
+ 43113:         rv = cacheMap->UpdateRecord(&mBinding->mRecord);
+ 43113:         if (NS_FAILED(rv)) {
+ 43113:             NS_WARNING("cacheMap->UpdateRecord() failed.");
+ 43113:             return rv;   // XXX doom cache entry
+ 43113:         }
+ 43113:     }
+ 43113:     
+ 43113:     return NS_OK;
+ 43113: }
+ 43113: 
+ 43113: 
+ 43113: // assumptions:
+ 43113: //      only one thread writing at a time
+ 43113: //      never have both output and input streams open
+ 43113: //      OnDataSizeChanged() will have already been called to update entry->DataSize()
+ 43113: 
+123582: nsresult
+ 43113: nsDiskCacheStreamIO::Write( const char * buffer,
+108991:                             uint32_t     count,
+108991:                             uint32_t *   bytesWritten)
+ 43113: {
+128251:     NS_ENSURE_ARG_POINTER(buffer);
+128251:     NS_ENSURE_ARG_POINTER(bytesWritten);
+128251:     *bytesWritten = 0;  // always initialize to zero in case of errors
+128251: 
+128251:     NS_ASSERTION(count, "Write called with count of zero");
+128251:     if (count == 0) {
+128251:         return NS_OK;   // nothing to write
+128251:     }
+128251: 
+127617:     // grab service lock
+127617:     nsCacheServiceAutoLock lock(LOCK_TELEM(NSDISKCACHESTREAMIO_WRITE));
+ 43113:     if (!mBinding)  return NS_ERROR_NOT_AVAILABLE;
+ 43113: 
+ 43113:     if (mInStreamCount) {
+ 43113:         // we have open input streams already
+ 43113:         // this is an error until we support overlapped I/O
+ 43113:         NS_WARNING("Attempting to write to cache entry with open input streams.\n");
+ 43113:         return NS_ERROR_NOT_AVAILABLE;
+ 43113:     }
+ 43113: 
+127617:     // Not writing to file, and it will fit in the cachedatablocks?
+127617:     if (!mFD && (mStreamEnd + count <= kMaxBufferSize)) {
+ 43113: 
+127617:         // We have more data than the current buffer size?
+127617:         if ((mStreamEnd + count > mBufSize) && (mBufSize < kMaxBufferSize)) {
+128251:             // Increase buffer to the maximum size.
+128251:             mBuffer = (char *) moz_xrealloc(mBuffer, kMaxBufferSize);
+ 43113:             mBufSize = kMaxBufferSize;
+ 43113:         }
+ 43113: 
+127617:         // Store in the buffer but only if it fits
+128251:         if (mStreamEnd + count <= mBufSize) {
+127617:             memcpy(mBuffer + mStreamEnd, buffer, count);
+127617:             mStreamEnd += count;
+127617:             *bytesWritten = count;
+127617:             return NS_OK;
+127617:         }
+127617:     }
+ 43113: 
+127617:     // There are more bytes than fit in the buffer/cacheblocks, switch to file
+127617:     if (!mFD) {
+127617:         // Opens a cache file and write the buffer to it
+127617:         nsresult rv = FlushBufferToFile();
+127617:         if (NS_FAILED(rv)) {
+127617:             return rv;
+ 43113:         }
+127617:     }
+127617:     // Write directly to the file
+127617:     if (PR_Write(mFD, buffer, count) != (int32_t)count) {
+127617:         NS_WARNING("failed to write all data");
+127617:         return NS_ERROR_UNEXPECTED;     // NS_ErrorAccordingToNSPR()
+ 43113:     }
+127617:     mStreamEnd += count;
+ 43113:     *bytesWritten = count;
+ 43113: 
+127617:     UpdateFileSize();
+ 43113:     NS_ASSERTION(mBinding->mCacheEntry->DataSize() == mStreamEnd, "bad stream");
+ 43113: 
+127617:     return NS_OK;
+ 43113: }
+ 43113: 
+ 43113: 
+ 43113: void
+ 43113: nsDiskCacheStreamIO::UpdateFileSize()
+ 43113: {
+ 43113:     NS_ASSERTION(mFD, "nsDiskCacheStreamIO::UpdateFileSize should not have been called");
+ 43113:     
+ 43113:     nsDiskCacheRecord * record = &mBinding->mRecord;
+108991:     const uint32_t      oldSizeK  = record->DataFileSize();
+108991:     uint32_t            newSizeK  = (mStreamEnd + 0x03FF) >> 10;
+ 70385: 
+ 70385:     // make sure the size won't overflow (bug #651100)
+ 70385:     if (newSizeK > kMaxDataSizeK)
+ 70385:         newSizeK = kMaxDataSizeK;
+ 43113: 
+ 43113:     if (newSizeK == oldSizeK)  return;
+ 43113:     
+ 43113:     record->SetDataFileSize(newSizeK);
+ 43113: 
+ 43113:     // update cache size totals
+ 43113:     nsDiskCacheMap * cacheMap = mDevice->CacheMap();
+ 43113:     cacheMap->DecrementTotalSize(oldSizeK);       // decrement old size
+ 43113:     cacheMap->IncrementTotalSize(newSizeK);       // increment new size
+ 43113:     
+ 43113:     if (!mBinding->mDoomed) {
+ 43113:         nsresult rv = cacheMap->UpdateRecord(record);
+ 43113:         if (NS_FAILED(rv)) {
+ 43113:             NS_WARNING("cacheMap->UpdateRecord() failed.");
+ 43113:             // XXX doom cache entry?
+ 43113:         }
+ 43113:     }
+ 43113: }
+ 43113: 
+ 43113: 
+ 43113: nsresult
+107846: nsDiskCacheStreamIO::OpenCacheFile(int flags, PRFileDesc ** fd)
+ 43113: {
+ 43113:     NS_ENSURE_ARG_POINTER(fd);
+ 43113:     
+ 99872:     CACHE_LOG_DEBUG(("nsDiskCacheStreamIO::OpenCacheFile"));
+ 99872: 
+ 43113:     nsresult         rv;
+ 43113:     nsDiskCacheMap * cacheMap = mDevice->CacheMap();
+126629:     nsCOMPtr<nsIFile>           localFile;
+ 43113:     
+ 43113:     rv = cacheMap->GetLocalFileForDiskCacheRecord(&mBinding->mRecord,
+ 43113:                                                   nsDiskCache::kData,
+ 58733:                                                   !!(flags & PR_CREATE_FILE),
+126629:                                                   getter_AddRefs(localFile));
+ 43113:     if (NS_FAILED(rv))  return rv;
+ 43113:     
+ 43113:     // create PRFileDesc for input stream - the 00600 is just for consistency
+126629:     return localFile->OpenNSPRFileDesc(flags, 00600, fd);
+ 43113: }
+ 43113: 
+ 43113: 
+ 43113: nsresult
+127617: nsDiskCacheStreamIO::ReadCacheBlocks(uint32_t bufferSize)
+ 43113: {
+ 43113:     NS_ASSERTION(mStreamEnd == mBinding->mCacheEntry->DataSize(), "bad stream");
+127617:     NS_ASSERTION(bufferSize <= kMaxBufferSize, "bufferSize too large for buffer");
+127617:     NS_ASSERTION(mStreamEnd <= bufferSize, "data too large for buffer");
+ 43113: 
+ 43113:     nsDiskCacheRecord * record = &mBinding->mRecord;
+ 43113:     if (!record->DataLocationInitialized()) return NS_OK;
+ 43113: 
+ 43113:     NS_ASSERTION(record->DataFile() != kSeparateFile, "attempt to read cache blocks on separate file");
+ 43113: 
+ 43113:     if (!mBuffer) {
+128251:         mBuffer = (char *) moz_xmalloc(bufferSize);
+127617:         mBufSize = bufferSize;
+ 43113:     }
+ 43113:     
+ 43113:     // read data stored in cache block files
+ 43113:     nsDiskCacheMap *map = mDevice->CacheMap();  // get map reference
+127617:     return map->ReadDataCacheBlocks(mBinding, mBuffer, mStreamEnd);
+ 43113: }
+ 43113: 
+ 43113: 
+ 43113: nsresult
+ 43113: nsDiskCacheStreamIO::FlushBufferToFile()
+ 43113: {
+ 43113:     nsresult  rv;
+ 43113:     nsDiskCacheRecord * record = &mBinding->mRecord;
+ 43113:     
+ 43113:     if (!mFD) {
+ 43113:         if (record->DataLocationInitialized() && (record->DataFile() > 0)) {
+ 43113:             // remove cache block storage
+ 43113:             nsDiskCacheMap * cacheMap = mDevice->CacheMap();
+ 43113:             rv = cacheMap->DeleteStorage(record, nsDiskCache::kData);
+ 43113:             if (NS_FAILED(rv))  return rv;
+ 43113:         }
+ 43113:         record->SetDataFileGeneration(mBinding->mGeneration);
+ 43113:         
+ 43113:         // allocate file
+123582:         rv = OpenCacheFile(PR_RDWR | PR_CREATE_FILE, &mFD);
+ 43113:         if (NS_FAILED(rv))  return rv;
+ 58167: 
+108991:         int64_t dataSize = mBinding->mCacheEntry->PredictedDataSize();
+ 58167:         if (dataSize != -1)
+108991:             mozilla::fallocate(mFD, NS_MIN<int64_t>(dataSize, kPreallocateLimit));
+ 43113:     }
+ 43113:     
+128251:     // write buffer to the file when there is data in it
+128251:     if (mStreamEnd > 0) {
+128251:         if (!mBuffer) {
+128251:             NS_RUNTIMEABORT("Fix me!");
+128251:         }
+127617:         if (PR_Write(mFD, mBuffer, mStreamEnd) != (int32_t)mStreamEnd) {
+ 43113:             NS_WARNING("failed to flush all data");
+ 43113:             return NS_ERROR_UNEXPECTED;     // NS_ErrorAccordingToNSPR()
+ 43113:         }
+128251:     }
+ 43113: 
+127617:     // buffer is no longer valid
+127617:     DeleteBuffer();
+ 43113:    
+ 43113:     return NS_OK;
+ 43113: }
+ 43113: 
+ 43113: 
+ 43113: void
+ 43113: nsDiskCacheStreamIO::DeleteBuffer()
+ 43113: {
+ 43113:     if (mBuffer) {
+ 43113:         free(mBuffer);
+106838:         mBuffer = nullptr;
+ 43113:         mBufSize = 0;
+ 43113:     }
+ 43113: }
+120983: 
+120983: size_t
+120983: nsDiskCacheStreamIO::SizeOfIncludingThis(nsMallocSizeOfFun aMallocSizeOf)
+120983: {
+120983:     size_t usage = aMallocSizeOf(this);
+120983: 
+120983:     usage += aMallocSizeOf(mFD);
+120983:     usage += aMallocSizeOf(mBuffer);
+120983: 
+120983:     return usage;
+120983: }
+123582: 
+123582: nsresult
+127617: nsDiskCacheStreamIO::SeekAndTruncate(uint32_t offset)
+123582: {
+123582:     if (!mBinding)  return NS_ERROR_NOT_AVAILABLE;
+123582:     
+123582:     if (uint32_t(offset) > mStreamEnd)  return NS_ERROR_FAILURE;
+123582:     
+127617:     // Set the current end to the desired offset
+127617:     mStreamEnd = offset;
+127617: 
+127617:     // Currently stored in file?
+127617:     if (mBinding->mRecord.DataLocationInitialized() && 
+127617:         (mBinding->mRecord.DataFile() == 0)) {
+123582:         if (!mFD) {
+123582:             // we need an mFD, we better open it now
+123582:             nsresult rv = OpenCacheFile(PR_RDWR | PR_CREATE_FILE, &mFD);
+123582:             if (NS_FAILED(rv))  return rv;
+123582:         }
+127617:         if (offset) {
+127617:             if (PR_Seek(mFD, offset, PR_SEEK_SET) == -1)
+127617:                 return NS_ErrorAccordingToNSPR();
+123582:         }
+127617:         nsDiskCache::Truncate(mFD, offset);
+127617:         UpdateFileSize();
+127617: 
+127617:         // When we starting at zero again, close file and start with buffer.
+127617:         // If offset is non-zero (and within buffer) an option would be
+127617:         // to read the file into the buffer, but chance is high that it is 
+127617:         // rewritten to the file anyway.
+127617:         if (offset == 0) {
+127617:             // close file descriptor
+127617:             (void) PR_Close(mFD);
+127617:             mFD = nullptr;
+127617:         }
+127617:         return NS_OK;
+123582:     }
+123582:     
+127617:     // read data into mBuffer if not read yet.
+127617:     if (offset && !mBuffer) {
+127617:         nsresult rv = ReadCacheBlocks(kMaxBufferSize);
+123582:         if (NS_FAILED(rv))  return rv;
+123582:     }
+123582: 
+127617:     // stream buffer sanity check
+127617:     NS_ASSERTION(mStreamEnd <= kMaxBufferSize, "bad stream");
+123582:     return NS_OK;
+123582: }

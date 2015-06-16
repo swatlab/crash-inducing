@@ -1,0 +1,1254 @@
+113445: /* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+113445:  * vim: set ts=4 sw=4 et tw=99:
+111670:  *
+113445:  * This Source Code Form is subject to the terms of the Mozilla Public
+113445:  * License, v. 2.0. If a copy of the MPL was not distributed with this
+113445:  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+111670: 
+111670: #include "IonBuilder.h"
+111670: #include "MIRGraph.h"
+111670: #include "Ion.h"
+111670: #include "IonAnalysis.h"
+111670: 
+111670: using namespace js;
+111670: using namespace js::ion;
+111670: 
+111749: // A critical edge is an edge which is neither its successor's only predecessor
+111749: // nor its predecessor's only successor. Critical edges must be split to
+111749: // prevent copy-insertion and code motion from affecting other edges.
+111749: bool
+119322: ion::SplitCriticalEdges(MIRGraph &graph)
+111749: {
+111900:     for (MBasicBlockIterator block(graph.begin()); block != graph.end(); block++) {
+111749:         if (block->numSuccessors() < 2)
+111749:             continue;
+111749:         for (size_t i = 0; i < block->numSuccessors(); i++) {
+111749:             MBasicBlock *target = block->getSuccessor(i);
+111749:             if (target->numPredecessors() < 2)
+111749:                 continue;
+111749: 
+111749:             // Create a new block inheriting from the predecessor.
+112761:             MBasicBlock *split = MBasicBlock::NewSplitEdge(graph, block->info(), *block);
+112709:             split->setLoopDepth(block->loopDepth());
+112870:             graph.insertBlockAfter(*block, split);
+111749:             split->end(MGoto::New(target));
+111749: 
+111749:             block->replaceSuccessor(i, split);
+111900:             target->replacePredecessor(*block, split);
+111749:         }
+111749:     }
+111749:     return true;
+111749: }
+111749: 
+124518: // Operands to a resume point which are dead at the point of the resume can be
+124518: // replaced with undefined values. This analysis supports limited detection of
+124518: // dead operands, pruning those which are defined in the resume point's basic
+124518: // block and have no uses outside the block or at points later than the resume
+124518: // point.
+124518: //
+124518: // This is intended to ensure that extra resume points within a basic block
+124518: // will not artificially extend the lifetimes of any SSA values. This could
+124518: // otherwise occur if the new resume point captured a value which is created
+124518: // between the old and new resume point and is dead at the new resume point.
+124518: bool
+124518: ion::EliminateDeadResumePointOperands(MIRGenerator *mir, MIRGraph &graph)
+124518: {
+124518:     for (PostorderIterator block = graph.poBegin(); block != graph.poEnd(); block++) {
+124518:         if (mir->shouldCancel("Eliminate Dead Resume Point Operands (main loop)"))
+124518:             return false;
+124518: 
+124518:         // The logic below can get confused on infinite loops.
+124518:         if (block->isLoopHeader() && block->backedge() == *block)
+124518:             continue;
+124518: 
+124518:         for (MInstructionIterator ins = block->begin(); ins != block->end(); ins++) {
+124518:             // No benefit to replacing constant operands with other constants.
+124518:             if (ins->isConstant())
+124518:                 continue;
+124518: 
+124518:             // Scanning uses does not give us sufficient information to tell
+124518:             // where instructions that are involved in box/unbox operations or
+124518:             // parameter passing might be live. Rewriting uses of these terms
+124518:             // in resume points may affect the interpreter's behavior. Rather
+124518:             // than doing a more sophisticated analysis, just ignore these.
+124518:             if (ins->isUnbox() || ins->isParameter())
+124518:                 continue;
+124518: 
+125403:             // If the instruction's behavior has been constant folded into a
+125403:             // separate instruction, we can't determine precisely where the
+125403:             // instruction becomes dead and can't eliminate its uses.
+125403:             if (ins->isFolded())
+125403:                 continue;
+125403: 
+124518:             // Check if this instruction's result is only used within the
+124518:             // current block, and keep track of its last use in a definition
+124518:             // (not resume point). This requires the instructions in the block
+124518:             // to be numbered, ensured by running this immediately after alias
+124518:             // analysis.
+124795:             uint32_t maxDefinition = 0;
+124518:             for (MUseDefIterator uses(*ins); uses; uses++) {
+125874:                 if (uses.def()->block() != *block ||
+125874:                     uses.def()->isBox() ||
+125874:                     uses.def()->isPassArg() ||
+125874:                     uses.def()->isPhi())
+125874:                 {
+124518:                     maxDefinition = UINT32_MAX;
+124518:                     break;
+124518:                 }
+124518:                 maxDefinition = Max(maxDefinition, uses.def()->id());
+124518:             }
+124518:             if (maxDefinition == UINT32_MAX)
+124518:                 continue;
+124518: 
+124518:             // Walk the uses a second time, removing any in resume points after
+124518:             // the last use in a definition.
+124518:             for (MUseIterator uses(ins->usesBegin()); uses != ins->usesEnd(); ) {
+124518:                 if (uses->node()->isDefinition()) {
+124518:                     uses++;
+124518:                     continue;
+124518:                 }
+124518:                 MResumePoint *mrp = uses->node()->toResumePoint();
+124518:                 if (mrp->block() != *block ||
+124518:                     !mrp->instruction() ||
+124518:                     mrp->instruction() == *ins ||
+124518:                     mrp->instruction()->id() <= maxDefinition)
+124518:                 {
+124518:                     uses++;
+124518:                     continue;
+124518:                 }
+124518: 
+124518:                 // Store an undefined value in place of all dead resume point
+124518:                 // operands. Making any such substitution can in general alter
+124518:                 // the interpreter's behavior, even though the code is dead, as
+124518:                 // the interpreter will still execute opcodes whose effects
+124518:                 // cannot be observed. If the undefined value were to flow to,
+124518:                 // say, a dead property access the interpreter could throw an
+124518:                 // exception; we avoid this problem by removing dead operands
+124518:                 // before removing dead code.
+124518:                 MConstant *constant = MConstant::New(UndefinedValue());
+124518:                 block->insertBefore(*(block->begin()), constant);
+124518:                 uses = mrp->replaceOperand(uses, constant);
+124518:             }
+124518:         }
+124518:     }
+124518: 
+124518:     return true;
+124518: }
+124518: 
+112302: // Instructions are useless if they are unused and have no side effects.
+111985: // This pass eliminates useless instructions.
+111985: // The graph itself is unchanged.
+111985: bool
+120090: ion::EliminateDeadCode(MIRGenerator *mir, MIRGraph &graph)
+111985: {
+111985:     // Traverse in postorder so that we hit uses before definitions.
+111985:     // Traverse instruction list backwards for the same reason.
+111985:     for (PostorderIterator block = graph.poBegin(); block != graph.poEnd(); block++) {
+120090:         if (mir->shouldCancel("Eliminate Dead Code (main loop)"))
+120090:             return false;
+120090: 
+111985:         // Remove unused instructions.
+111985:         for (MInstructionReverseIterator inst = block->rbegin(); inst != block->rend(); ) {
+124557:             if (!inst->isEffectful() && !inst->resumePoint() &&
+124557:                 !inst->hasUses() && !inst->isGuard() &&
+112302:                 !inst->isControlInstruction()) {
+112165:                 inst = block->discardAt(inst);
+112302:             } else {
+111985:                 inst++;
+111985:             }
+112082:         }
+112302:     }
+111985: 
+112082:     return true;
+112082: }
+112082: 
+112082: static inline bool
+112082: IsPhiObservable(MPhi *phi)
+112082: {
+125403:     // If the phi has uses which are not reflected in SSA, then behavior in the
+125403:     // interpreter may be affected by removing the phi.
+125403:     if (phi->isFolded())
+113065:         return true;
+113065: 
+113065:     // Check for any SSA uses. Note that this skips reading resume points,
+113065:     // which we don't count as actual uses. If the only uses are resume points,
+113065:     // then the SSA name is never consumed by the program.
+112082:     for (MUseDefIterator iter(phi); iter; iter++) {
+112082:         if (!iter.def()->isPhi())
+112082:             return true;
+112082:     }
+113013: 
+113013:     // If the Phi is of the |this| value, it must always be observable.
+124795:     uint32_t slot = phi->slot();
+123913:     if (slot == 1)
+113013:         return true;
+123913: 
+124860:     // If the Phi is one of the formal argument, and we are using an argument
+124860:     // object in the function.  The phi might be observable after a bailout.
+123913:     CompileInfo &info = phi->block()->info();
+123913:     if (info.fun() && info.hasArguments()) {
+123913:         // We do not support arguments object inside inline frames yet.
+123913:         JS_ASSERT(!phi->block()->callerResumePoint());
+124795:         uint32_t first = info.firstArgSlot();
+123913:         if (first <= slot && slot - first < info.nargs())
+123913:             return true;
+123913:     }
+112082:     return false;
+112082: }
+112082: 
+113502: // Handles cases like:
+113502: //    x is phi(a, x) --> a
+113502: //    x is phi(a, a) --> a
+112831: static inline MDefinition *
+112831: IsPhiRedundant(MPhi *phi)
+112831: {
+112831:     MDefinition *first = phi->getOperand(0);
+112831: 
+112831:     for (size_t i = 1; i < phi->numOperands(); i++) {
+113411:         if (phi->getOperand(i) != first && phi->getOperand(i) != phi)
+112831:             return NULL;
+112831:     }
+112831: 
+125403:     // Propagate the Folded flag if |phi| is replaced with another phi.
+125403:     if (phi->isFolded())
+125403:         first->setFoldedUnchecked();
+113065: 
+112831:     return first;
+112831: }
+112831: 
+112082: bool
+120090: ion::EliminatePhis(MIRGenerator *mir, MIRGraph &graph)
+112082: {
+112082:     Vector<MPhi *, 16, SystemAllocPolicy> worklist;
+112082: 
+112082:     // Add all observable phis to a worklist. We use the "in worklist" bit to
+112082:     // mean "this phi is live".
+112082:     for (PostorderIterator block = graph.poBegin(); block != graph.poEnd(); block++) {
+120090:         if (mir->shouldCancel("Eliminate Phis (populate loop)"))
+120090:             return false;
+120090: 
+112831:         MPhiIterator iter = block->phisBegin();
+112831:         while (iter != block->phisEnd()) {
+113489:             // Flag all as unused, only observable phis would be marked as used
+113489:             // when processed by the work list.
+113489:             iter->setUnused();
+113489: 
+112831:             // If the phi is redundant, remove it here.
+112831:             if (MDefinition *redundant = IsPhiRedundant(*iter)) {
+112831:                 iter->replaceAllUsesWith(redundant);
+112831:                 iter = block->discardPhiAt(iter);
+112831:                 continue;
+112831:             }
+113489: 
+113489:             // Enqueue observable Phis.
+112082:             if (IsPhiObservable(*iter)) {
+112082:                 iter->setInWorklist();
+112082:                 if (!worklist.append(*iter))
+112082:                     return false;
+112082:             }
+112831:             iter++;
+112082:         }
+112082:     }
+112082: 
+112874:     // Iteratively mark all phis reachable from live phis.
+112082:     while (!worklist.empty()) {
+120090:         if (mir->shouldCancel("Eliminate Phis (worklist)"))
+120090:             return false;
+120090: 
+112082:         MPhi *phi = worklist.popCopy();
+113489:         JS_ASSERT(phi->isUnused());
+113489:         phi->setNotInWorklist();
+113489: 
+113489:         // The removal of Phis can produce newly redundant phis.
+113489:         if (MDefinition *redundant = IsPhiRedundant(phi)) {
+113502:             // Add to the worklist the used phis which are impacted.
+113502:             for (MUseDefIterator it(phi); it; it++) {
+113502:                 if (it.def()->isPhi()) {
+113502:                     MPhi *use = it.def()->toPhi();
+113502:                     if (!use->isUnused()) {
+113502:                         use->setUnusedUnchecked();
+113502:                         use->setInWorklist();
+113502:                         if (!worklist.append(use))
+113502:                             return false;
+113502:                     }
+113502:                 }
+113502:             }
+113489:             phi->replaceAllUsesWith(redundant);
+113489:         } else {
+113489:             // Otherwise flag them as used.
+113489:             phi->setNotUnused();
+113489:         }
+112082: 
+113502:         // The current phi is/was used, so all its operands are used.
+112082:         for (size_t i = 0; i < phi->numOperands(); i++) {
+112082:             MDefinition *in = phi->getOperand(i);
+113489:             if (!in->isPhi() || !in->isUnused() || in->isInWorklist())
+112082:                 continue;
+112082:             in->setInWorklist();
+112082:             if (!worklist.append(in->toPhi()))
+112082:                 return false;
+112082:         }
+112082:     }
+112082: 
+112082:     // Sweep dead phis.
+112082:     for (PostorderIterator block = graph.poBegin(); block != graph.poEnd(); block++) {
+112082:         MPhiIterator iter = block->phisBegin();
+112082:         while (iter != block->phisEnd()) {
+113489:             if (iter->isUnused())
+113489:                 iter = block->discardPhiAt(iter);
+113489:             else
+112082:                 iter++;
+112082:         }
+111985:     }
+111985: 
+111985:     return true;
+111985: }
+111985: 
+112383: // The type analysis algorithm inserts conversions and box/unbox instructions
+112383: // to make the IR graph well-typed for future passes.
+112383: //
+112383: // Phi adjustment: If a phi's inputs are all the same type, the phi is
+112383: // specialized to return that type.
+112383: //
+112384: // Input adjustment: Each input is asked to apply conversion operations to its
+112383: // inputs. This may include Box, Unbox, or other instruction-specific type
+112383: // conversion operations.
+112383: //
+112383: class TypeAnalyzer
+112383: {
+120090:     MIRGenerator *mir;
+112383:     MIRGraph &graph;
+112383:     Vector<MPhi *, 0, SystemAllocPolicy> phiWorklist_;
+112383: 
+112383:     bool addPhiToWorklist(MPhi *phi) {
+112383:         if (phi->isInWorklist())
+112383:             return true;
+112383:         if (!phiWorklist_.append(phi))
+112383:             return false;
+112383:         phi->setInWorklist();
+112383:         return true;
+112383:     }
+112383:     MPhi *popPhi() {
+112383:         MPhi *phi = phiWorklist_.popCopy();
+112383:         phi->setNotInWorklist();
+112383:         return phi;
+112383:     }
+112383: 
+112993:     bool respecialize(MPhi *phi, MIRType type);
+112383:     bool propagateSpecialization(MPhi *phi);
+112383:     bool specializePhis();
+112383:     void replaceRedundantPhi(MPhi *phi);
+112383:     void adjustPhiInputs(MPhi *phi);
+112383:     bool adjustInputs(MDefinition *def);
+112383:     bool insertConversions();
+112383: 
+112383:   public:
+120090:     TypeAnalyzer(MIRGenerator *mir, MIRGraph &graph)
+120090:       : mir(mir), graph(graph)
+112383:     { }
+112383: 
+112383:     bool analyze();
+112383: };
+112383: 
+112383: // Try to specialize this phi based on its non-cyclic inputs.
+112383: static MIRType
+112383: GuessPhiType(MPhi *phi)
+112383: {
+112383:     MIRType type = MIRType_None;
+112383:     for (size_t i = 0; i < phi->numOperands(); i++) {
+112383:         MDefinition *in = phi->getOperand(i);
+113157:         if (in->isPhi()) {
+113157:             if (!in->toPhi()->triedToSpecialize())
+112383:                 continue;
+113157:             if (in->type() == MIRType_None) {
+113157:                 // The operand is a phi we tried to specialize, but we were
+113157:                 // unable to guess its type. propagateSpecialization will
+113157:                 // propagate the type to this phi when it becomes known.
+113157:                 continue;
+113157:             }
+113157:         }
+112827:         if (type == MIRType_None) {
+112383:             type = in->type();
+112827:             continue;
+112827:         }
+112827:         if (type != in->type()) {
+112827:             // Specialize phis with int32 and double operands as double.
+112827:             if (IsNumberType(type) && IsNumberType(in->type()))
+112827:                 type = MIRType_Double;
+112827:             else
+112383:                 return MIRType_Value;
+112383:         }
+112827:     }
+112383:     return type;
+112383: }
+112383: 
+112383: bool
+112993: TypeAnalyzer::respecialize(MPhi *phi, MIRType type)
+112993: {
+112993:     if (phi->type() == type)
+112993:         return true;
+112993:     phi->specialize(type);
+112993:     return addPhiToWorklist(phi);
+112993: }
+112993: 
+112993: bool
+112383: TypeAnalyzer::propagateSpecialization(MPhi *phi)
+112383: {
+113157:     JS_ASSERT(phi->type() != MIRType_None);
+113157: 
+112383:     // Verify that this specialization matches any phis depending on it.
+112383:     for (MUseDefIterator iter(phi); iter; iter++) {
+112383:         if (!iter.def()->isPhi())
+112383:             continue;
+112383:         MPhi *use = iter.def()->toPhi();
+112383:         if (!use->triedToSpecialize())
+112383:             continue;
+112771:         if (use->type() == MIRType_None) {
+112771:             // We tried to specialize this phi, but were unable to guess its
+112771:             // type. Now that we know the type of one of its operands, we can
+112771:             // specialize it.
+112993:             if (!respecialize(use, phi->type()))
+112771:                 return false;
+112771:             continue;
+112771:         }
+112383:         if (use->type() != phi->type()) {
+112827:             // Specialize phis with int32 and double operands as double.
+112827:             if (IsNumberType(use->type()) && IsNumberType(phi->type())) {
+112993:                 if (!respecialize(use, MIRType_Double))
+112993:                     return false;
+112827:                 continue;
+112827:             }
+112827: 
+112383:             // This phi in our use chain can now no longer be specialized.
+112993:             if (!respecialize(use, MIRType_Value))
+112383:                 return false;
+112383:         }
+112383:     }
+112383: 
+111800:     return true;
+111800: }
+111800: 
+112383: bool
+111800: TypeAnalyzer::specializePhis()
+111800: {
+112383:     for (PostorderIterator block(graph.poBegin()); block != graph.poEnd(); block++) {
+120090:         if (mir->shouldCancel("Specialize Phis (main loop)"))
+120090:             return false;
+120090: 
+112383:         for (MPhiIterator phi(block->phisBegin()); phi != block->phisEnd(); phi++) {
+113157:             MIRType type = GuessPhiType(*phi);
+113157:             phi->specialize(type);
+113157:             if (type == MIRType_None) {
+113157:                 // We tried to guess the type but failed because all operands are
+113157:                 // phis we still have to visit. Set the triedToSpecialize flag but
+113157:                 // don't propagate the type to other phis, propagateSpecialization
+113157:                 // will do that once we know the type of one of the operands.
+113157:                 continue;
+113157:             }
+112383:             if (!propagateSpecialization(*phi))
+112383:                 return false;
+112383:         }
+112383:     }
+111965: 
+111928:     while (!phiWorklist_.empty()) {
+120090:         if (mir->shouldCancel("Specialize Phis (worklist)"))
+120090:             return false;
+120090: 
+111928:         MPhi *phi = popPhi();
+112383:         if (!propagateSpecialization(phi))
+111949:             return false;
+111949:     }
+111949: 
+112383:     return true;
+111800: }
+111800: 
+111928: void
+111800: TypeAnalyzer::adjustPhiInputs(MPhi *phi)
+111800: {
+112084:     MIRType phiType = phi->type();
+112827: 
+112827:     if (phiType == MIRType_Double) {
+112827:         // Convert int32 operands to double.
+112827:         for (size_t i = 0; i < phi->numOperands(); i++) {
+112827:             MDefinition *in = phi->getOperand(i);
+112827: 
+112827:             if (in->type() == MIRType_Int32) {
+112827:                 MToDouble *toDouble = MToDouble::New(in);
+112827:                 in->block()->insertBefore(in->block()->lastIns(), toDouble);
+112827:                 phi->replaceOperand(i, toDouble);
+112827:             } else {
+112827:                 JS_ASSERT(in->type() == MIRType_Double);
+112827:             }
+112827:         }
+112827:         return;
+112827:     }
+112827: 
+112383:     if (phiType != MIRType_Value)
+111928:         return;
+111800: 
+111800:     // Box every typed input.
+111800:     for (size_t i = 0; i < phi->numOperands(); i++) {
+111800:         MDefinition *in = phi->getOperand(i);
+111800:         if (in->type() == MIRType_Value)
+111800:             continue;
+111800: 
+112118:         if (in->isUnbox()) {
+112118:             // The input is being explicitly unboxed, so sneak past and grab
+112118:             // the original box.
+112118:             phi->replaceOperand(i, in->toUnbox()->input());
+112118:         } else {
+111800:             MBox *box = MBox::New(in);
+111800:             in->block()->insertBefore(in->block()->lastIns(), box);
+111800:             phi->replaceOperand(i, box);
+111800:         }
+111800:     }
+112118: }
+111800: 
+111800: bool
+111800: TypeAnalyzer::adjustInputs(MDefinition *def)
+111800: {
+111800:     TypePolicy *policy = def->typePolicy();
+111800:     if (policy && !policy->adjustInputs(def->toInstruction()))
+111800:         return false;
+111800:     return true;
+111800: }
+111800: 
+111902: void
+111902: TypeAnalyzer::replaceRedundantPhi(MPhi *phi)
+111902: {
+111902:     MBasicBlock *block = phi->block();
+113503:     js::Value v;
+113503:     switch (phi->type()) {
+113503:       case MIRType_Undefined:
+113503:         v = UndefinedValue();
+113503:         break;
+113503:       case MIRType_Null:
+113503:         v = NullValue();
+113503:         break;
+113503:       case MIRType_Magic:
+113503:         v = MagicValue(JS_OPTIMIZED_ARGUMENTS);
+113503:         break;
+113503:       default:
+113503:         JS_NOT_REACHED("unexpected type");
+113503:         return;
+113503:     }
+111902:     MConstant *c = MConstant::New(v);
+111902:     // The instruction pass will insert the box
+111902:     block->insertBefore(*(block->begin()), c);
+111902:     phi->replaceAllUsesWith(c);
+111902: }
+111902: 
+111800: bool
+111800: TypeAnalyzer::insertConversions()
+111800: {
+111900:     // Instructions are processed in reverse postorder: all uses are defs are
+111900:     // seen before uses. This ensures that output adjustment (which may rewrite
+111800:     // inputs of uses) does not conflict with input adjustment.
+111900:     for (ReversePostorderIterator block(graph.rpoBegin()); block != graph.rpoEnd(); block++) {
+120090:         if (mir->shouldCancel("Insert Conversions"))
+120090:             return false;
+120090: 
+111902:         for (MPhiIterator phi(block->phisBegin()); phi != block->phisEnd();) {
+113503:             if (phi->type() <= MIRType_Null || phi->type() == MIRType_Magic) {
+111902:                 replaceRedundantPhi(*phi);
+112165:                 phi = block->discardPhiAt(phi);
+111902:             } else {
+111928:                 adjustPhiInputs(*phi);
+111902:                 phi++;
+111902:             }
+111800:         }
+111897:         for (MInstructionIterator iter(block->begin()); iter != block->end(); iter++) {
+111800:             if (!adjustInputs(*iter))
+111800:                 return false;
+111800:         }
+111800:     }
+111800:     return true;
+111800: }
+111800: 
+111800: bool
+111800: TypeAnalyzer::analyze()
+111800: {
+112383:     if (!specializePhis())
+111800:         return false;
+111800:     if (!insertConversions())
+111800:         return false;
+111800:     return true;
+111800: }
+111800: 
+111691: bool
+120090: ion::ApplyTypeInformation(MIRGenerator *mir, MIRGraph &graph)
+111671: {
+120090:     TypeAnalyzer analyzer(mir, graph);
+111800: 
+111800:     if (!analyzer.analyze())
+111800:         return false;
+111800: 
+111671:     return true;
+111671: }
+111671: 
+111688: bool
+112870: ion::RenumberBlocks(MIRGraph &graph)
+111688: {
+112870:     size_t id = 0;
+112870:     for (ReversePostorderIterator block(graph.rpoBegin()); block != graph.rpoEnd(); block++)
+112870:         block->setId(id++);
+112219: 
+111688:     return true;
+111688: }
+111690: 
+111738: // A Simple, Fast Dominance Algorithm by Cooper et al.
+112219: // Modified to support empty intersections for OSR, and in RPO.
+111738: static MBasicBlock *
+111738: IntersectDominators(MBasicBlock *block1, MBasicBlock *block2)
+111738: {
+111738:     MBasicBlock *finger1 = block1;
+111738:     MBasicBlock *finger2 = block2;
+111738: 
+112219:     JS_ASSERT(finger1);
+112219:     JS_ASSERT(finger2);
+112219: 
+112219:     // In the original paper, the block ID comparisons are on the postorder index.
+112219:     // This implementation iterates in RPO, so the comparisons are reversed.
+112219: 
+112219:     // For this function to be called, the block must have multiple predecessors.
+112219:     // If a finger is then found to be self-dominating, it must therefore be
+112219:     // reachable from multiple roots through non-intersecting control flow.
+112219:     // NULL is returned in this case, to denote an empty intersection.
+112219: 
+111738:     while (finger1->id() != finger2->id()) {
+112219:         while (finger1->id() > finger2->id()) {
+112219:             MBasicBlock *idom = finger1->immediateDominator();
+112219:             if (idom == finger1)
+112219:                 return NULL; // Empty intersection.
+112219:             finger1 = idom;
+112219:         }
+111738: 
+112219:         while (finger2->id() > finger1->id()) {
+112219:             MBasicBlock *idom = finger2->immediateDominator();
+112219:             if (idom == finger2)
+112219:                 return NULL; // Empty intersection.
+111738:             finger2 = finger2->immediateDominator();
+111738:         }
+112219:     }
+111738:     return finger1;
+111738: }
+111738: 
+111738: static void
+111738: ComputeImmediateDominators(MIRGraph &graph)
+111738: {
+112219:     // The default start block is a root and therefore only self-dominates.
+111900:     MBasicBlock *startBlock = *graph.begin();
+111738:     startBlock->setImmediateDominator(startBlock);
+111738: 
+112219:     // Any OSR block is a root and therefore only self-dominates.
+112219:     MBasicBlock *osrBlock = graph.osrBlock();
+112219:     if (osrBlock)
+112219:         osrBlock->setImmediateDominator(osrBlock);
+112219: 
+111738:     bool changed = true;
+111738: 
+111738:     while (changed) {
+111738:         changed = false;
+112219: 
+112219:         ReversePostorderIterator block = graph.rpoBegin();
+112219: 
+112219:         // For each block in RPO, intersect all dominators.
+112219:         for (; block != graph.rpoEnd(); block++) {
+112219:             // If a node has once been found to have no exclusive dominator,
+112219:             // it will never have an exclusive dominator, so it may be skipped.
+112219:             if (block->immediateDominator() == *block)
+111738:                 continue;
+111738: 
+111738:             MBasicBlock *newIdom = block->getPredecessor(0);
+111738: 
+112219:             // Find the first common dominator.
+111738:             for (size_t i = 1; i < block->numPredecessors(); i++) {
+111898:                 MBasicBlock *pred = block->getPredecessor(i);
+111738:                 if (pred->immediateDominator() != NULL)
+111738:                     newIdom = IntersectDominators(pred, newIdom);
+112219: 
+112219:                 // If there is no common dominator, the block self-dominates.
+112219:                 if (newIdom == NULL) {
+112219:                     block->setImmediateDominator(*block);
+112219:                     changed = true;
+112219:                     break;
+112219:                 }
+111738:             }
+111738: 
+112219:             if (newIdom && block->immediateDominator() != newIdom) {
+111738:                 block->setImmediateDominator(newIdom);
+111738:                 changed = true;
+111738:             }
+111738:         }
+111738:     }
+112219: 
+112219: #ifdef DEBUG
+112219:     // Assert that all blocks have dominator information.
+112219:     for (MBasicBlockIterator block(graph.begin()); block != graph.end(); block++) {
+112219:         JS_ASSERT(block->immediateDominator() != NULL);
+112219:     }
+112219: #endif
+111738: }
+111738: 
+111738: bool
+111738: ion::BuildDominatorTree(MIRGraph &graph)
+111738: {
+111738:     ComputeImmediateDominators(graph);
+111738: 
+112219:     // Traversing through the graph in post-order means that every use
+112219:     // of a definition is visited before the def itself. Since a def
+112219:     // dominates its uses, by the time we reach a particular
+111738:     // block, we have processed all of its dominated children, so
+111738:     // block->numDominated() is accurate.
+112219:     for (PostorderIterator i(graph.poBegin()); i != graph.poEnd(); i++) {
+111900:         MBasicBlock *child = *i;
+111738:         MBasicBlock *parent = child->immediateDominator();
+111738: 
+112219:         // If the block only self-dominates, it has no definite parent.
+112219:         if (child == parent)
+112219:             continue;
+112219: 
+111738:         if (!parent->addImmediatelyDominatedBlock(child))
+111738:             return false;
+111738: 
+112219:         // An additional +1 for the child block.
+111738:         parent->addNumDominated(child->numDominated() + 1);
+111738:     }
+112219: 
+112219: #ifdef DEBUG
+112219:     // If compiling with OSR, many blocks will self-dominate.
+112219:     // Without OSR, there is only one root block which dominates all.
+112219:     if (!graph.osrBlock())
+111900:         JS_ASSERT(graph.begin()->numDominated() == graph.numBlocks() - 1);
+112219: #endif
+113360:     // Now, iterate through the dominator tree and annotate every
+113360:     // block with its index in the pre-order traversal of the
+113360:     // dominator tree.
+113360:     Vector<MBasicBlock *, 1, IonAllocPolicy> worklist;
+113360: 
+113360:     // The index of the current block in the CFG traversal.
+113360:     size_t index = 0;
+113360: 
+113360:     // Add all self-dominating blocks to the worklist.
+113360:     // This includes all roots. Order does not matter.
+113360:     for (MBasicBlockIterator i(graph.begin()); i != graph.end(); i++) {
+113360:         MBasicBlock *block = *i;
+113360:         if (block->immediateDominator() == block) {
+113360:             if (!worklist.append(block))
+113360:                 return false;
+113360:         }
+113360:     }
+113360:     // Starting from each self-dominating block, traverse the CFG in pre-order.
+113360:     while (!worklist.empty()) {
+113360:         MBasicBlock *block = worklist.popCopy();
+113360:         block->setDomIndex(index);
+113360: 
+113360:         for (size_t i = 0; i < block->numImmediatelyDominatedBlocks(); i++) {
+113360:             if (!worklist.append(block->getImmediatelyDominatedBlock(i)))
+113360:                 return false;
+113360:         }
+113360:         index++;
+113360:     }
+112219: 
+111738:     return true;
+111738: }
+111738: 
+111718: bool
+111718: ion::BuildPhiReverseMapping(MIRGraph &graph)
+111718: {
+111718:     // Build a mapping such that given a basic block, whose successor has one or
+111718:     // more phis, we can find our specific input to that phi. To make this fast
+111718:     // mapping work we rely on a specific property of our structured control
+111718:     // flow graph: For a block with phis, its predecessors each have only one
+111718:     // successor with phis. Consider each case:
+111718:     //   * Blocks with less than two predecessors cannot have phis.
+111718:     //   * Breaks. A break always has exactly one successor, and the break
+111718:     //             catch block has exactly one predecessor for each break, as
+111718:     //             well as a final predecessor for the actual loop exit.
+111718:     //   * Continues. A continue always has exactly one successor, and the
+111718:     //             continue catch block has exactly one predecessor for each
+111718:     //             continue, as well as a final predecessor for the actual
+111718:     //             loop continuation. The continue itself has exactly one
+111718:     //             successor.
+111718:     //   * An if. Each branch as exactly one predecessor.
+111718:     //   * A switch. Each branch has exactly one predecessor.
+111718:     //   * Loop tail. A new block is always created for the exit, and if a
+111718:     //             break statement is present, the exit block will forward
+111718:     //             directly to the break block.
+111900:     for (MBasicBlockIterator block(graph.begin()); block != graph.end(); block++) {
+111718:         if (block->numPredecessors() < 2) {
+111897:             JS_ASSERT(block->phisEmpty());
+111718:             continue;
+111718:         }
+111718: 
+111718:         // Assert on the above.
+111718:         for (size_t j = 0; j < block->numPredecessors(); j++) {
+111718:             MBasicBlock *pred = block->getPredecessor(j);
+111718: 
+111718: #ifdef DEBUG
+111718:             size_t numSuccessorsWithPhis = 0;
+111718:             for (size_t k = 0; k < pred->numSuccessors(); k++) {
+111718:                 MBasicBlock *successor = pred->getSuccessor(k);
+111897:                 if (!successor->phisEmpty())
+111718:                     numSuccessorsWithPhis++;
+111718:             }
+111723:             JS_ASSERT(numSuccessorsWithPhis <= 1);
+111718: #endif
+111718: 
+111900:             pred->setSuccessorWithPhis(*block, j);
+111718:         }
+111718:     }
+111718: 
+111718:     return true;
+111718: }
+111718: 
+112166: static inline MBasicBlock *
+112166: SkipContainedLoop(MBasicBlock *block, MBasicBlock *header)
+112166: {
+112166:     while (block->loopHeader() || block->isLoopHeader()) {
+112166:         if (block->loopHeader())
+112166:             block = block->loopHeader();
+112166:         if (block == header)
+112166:             break;
+112166:         block = block->loopPredecessor();
+112166:     }
+112166:     return block;
+112166: }
+112166: 
+112755: #ifdef DEBUG
+112755: static bool
+112755: CheckSuccessorImpliesPredecessor(MBasicBlock *A, MBasicBlock *B)
+112755: {
+112755:     // Assuming B = succ(A), verify A = pred(B).
+112755:     for (size_t i = 0; i < B->numPredecessors(); i++) {
+112755:         if (A == B->getPredecessor(i))
+112755:             return true;
+112755:     }
+112755:     return false;
+112755: }
+112755: 
+112755: static bool
+112755: CheckPredecessorImpliesSuccessor(MBasicBlock *A, MBasicBlock *B)
+112755: {
+112755:     // Assuming B = pred(A), verify A = succ(B).
+112755:     for (size_t i = 0; i < B->numSuccessors(); i++) {
+112755:         if (A == B->getSuccessor(i))
+112755:             return true;
+112755:     }
+112755:     return false;
+112755: }
+112755: 
+112755: static bool
+112755: CheckMarkedAsUse(MInstruction *ins, MDefinition *operand)
+112755: {
+112755:     for (MUseIterator i = operand->usesBegin(); i != operand->usesEnd(); i++) {
+112755:         if (i->node()->isDefinition()) {
+112774:             if (ins == i->node()->toDefinition())
+112755:                 return true;
+112755:         }
+112755:     }
+112755:     return false;
+112755: }
+112755: #endif // DEBUG
+112755: 
+112870: #ifdef DEBUG
+112870: static void
+112870: AssertReversePostOrder(MIRGraph &graph)
+112870: {
+112870:     // Check that every block is visited after all its predecessors (except backedges).
+112870:     for (ReversePostorderIterator block(graph.rpoBegin()); block != graph.rpoEnd(); block++) {
+112870:         JS_ASSERT(!block->isMarked());
+112870: 
+112870:         for (size_t i = 0; i < block->numPredecessors(); i++) {
+112870:             MBasicBlock *pred = block->getPredecessor(i);
+112870:             JS_ASSERT_IF(!pred->isLoopBackedge(), pred->isMarked());
+112870:         }
+112870: 
+112870:         block->mark();
+112870:     }
+112870: 
+112870:     graph.unmarkBlocks();
+112870: }
+112870: #endif
+112870: 
+112219: void
+112219: ion::AssertGraphCoherency(MIRGraph &graph)
+112219: {
+112219: #ifdef DEBUG
+112219:     // Assert successor and predecessor list coherency.
+112219:     for (MBasicBlockIterator block(graph.begin()); block != graph.end(); block++) {
+112755:         for (size_t i = 0; i < block->numSuccessors(); i++)
+112755:             JS_ASSERT(CheckSuccessorImpliesPredecessor(*block, block->getSuccessor(i)));
+112219: 
+112755:         for (size_t i = 0; i < block->numPredecessors(); i++)
+112755:             JS_ASSERT(CheckPredecessorImpliesSuccessor(*block, block->getPredecessor(i)));
+112219: 
+112755:         for (MInstructionIterator ins = block->begin(); ins != block->end(); ins++) {
+124795:             for (uint32_t i = 0; i < ins->numOperands(); i++)
+112755:                 JS_ASSERT(CheckMarkedAsUse(*ins, ins->getOperand(i)));
+112219:         }
+112219:     }
+112870: 
+112870:     AssertReversePostOrder(graph);
+112219: #endif
+112219: }
+112219: 
+113380: 
+113380: struct BoundsCheckInfo
+113380: {
+113380:     MBoundsCheck *check;
+124795:     uint32_t validUntil;
+113380: };
+113380: 
+124795: typedef HashMap<uint32_t,
+113380:                 BoundsCheckInfo,
+124795:                 DefaultHasher<uint32_t>,
+113380:                 IonAllocPolicy> BoundsCheckMap;
+113380: 
+113380: // Compute a hash for bounds checks which ignores constant offsets in the index.
+113380: static HashNumber
+113380: BoundsCheckHashIgnoreOffset(MBoundsCheck *check)
+113380: {
+123949:     SimpleLinearSum indexSum = ExtractLinearSum(check->index());
+113380:     uintptr_t index = indexSum.term ? uintptr_t(indexSum.term) : 0;
+113380:     uintptr_t length = uintptr_t(check->length());
+113380:     return index ^ length;
+113380: }
+113380: 
+113380: static MBoundsCheck *
+113380: FindDominatingBoundsCheck(BoundsCheckMap &checks, MBoundsCheck *check, size_t index)
+113380: {
+113380:     // See the comment in ValueNumberer::findDominatingDef.
+113380:     HashNumber hash = BoundsCheckHashIgnoreOffset(check);
+113380:     BoundsCheckMap::Ptr p = checks.lookup(hash);
+113380:     if (!p || index > p->value.validUntil) {
+113380:         // We didn't find a dominating bounds check.
+113380:         BoundsCheckInfo info;
+113380:         info.check = check;
+113380:         info.validUntil = index + check->block()->numDominated();
+113380: 
+113380:         if(!checks.put(hash, info))
+113380:             return NULL;
+113380: 
+113380:         return check;
+113380:     }
+113380: 
+113380:     return p->value.check;
+113380: }
+113380: 
+113380: // Extract a linear sum from ins, if possible (otherwise giving the sum 'ins + 0').
+123949: SimpleLinearSum
+113380: ion::ExtractLinearSum(MDefinition *ins)
+113380: {
+123949:     if (ins->isBeta())
+123949:         ins = ins->getOperand(0);
+123949: 
+113380:     if (ins->type() != MIRType_Int32)
+123949:         return SimpleLinearSum(ins, 0);
+113380: 
+113380:     if (ins->isConstant()) {
+113380:         const Value &v = ins->toConstant()->value();
+113380:         JS_ASSERT(v.isInt32());
+123949:         return SimpleLinearSum(NULL, v.toInt32());
+113380:     } else if (ins->isAdd() || ins->isSub()) {
+113380:         MDefinition *lhs = ins->getOperand(0);
+113380:         MDefinition *rhs = ins->getOperand(1);
+113380:         if (lhs->type() == MIRType_Int32 && rhs->type() == MIRType_Int32) {
+123949:             SimpleLinearSum lsum = ExtractLinearSum(lhs);
+123949:             SimpleLinearSum rsum = ExtractLinearSum(rhs);
+113380: 
+113380:             if (lsum.term && rsum.term)
+123949:                 return SimpleLinearSum(ins, 0);
+113380: 
+113380:             // Check if this is of the form <SUM> + n, n + <SUM> or <SUM> - n.
+113380:             if (ins->isAdd()) {
+124795:                 int32_t constant;
+113380:                 if (!SafeAdd(lsum.constant, rsum.constant, &constant))
+123949:                     return SimpleLinearSum(ins, 0);
+123949:                 return SimpleLinearSum(lsum.term ? lsum.term : rsum.term, constant);
+113380:             } else if (lsum.term) {
+124795:                 int32_t constant;
+113380:                 if (!SafeSub(lsum.constant, rsum.constant, &constant))
+123949:                     return SimpleLinearSum(ins, 0);
+123949:                 return SimpleLinearSum(lsum.term, constant);
+113380:             }
+113380:         }
+113380:     }
+113380: 
+123949:     return SimpleLinearSum(ins, 0);
+123949: }
+123949: 
+123949: // Extract a linear inequality holding when a boolean test goes in the
+123949: // specified direction, of the form 'lhs + lhsN <= rhs' (or >=).
+123949: bool
+123949: ion::ExtractLinearInequality(MTest *test, BranchDirection direction,
+123949:                              SimpleLinearSum *plhs, MDefinition **prhs, bool *plessEqual)
+123949: {
+123949:     if (!test->getOperand(0)->isCompare())
+123949:         return false;
+123949: 
+123949:     MCompare *compare = test->getOperand(0)->toCompare();
+123949: 
+123949:     MDefinition *lhs = compare->getOperand(0);
+123949:     MDefinition *rhs = compare->getOperand(1);
+123949: 
+123949:     if (compare->specialization() != MIRType_Int32)
+123949:         return false;
+123949: 
+123949:     JS_ASSERT(lhs->type() == MIRType_Int32);
+123949:     JS_ASSERT(rhs->type() == MIRType_Int32);
+123949: 
+123949:     JSOp jsop = compare->jsop();
+123949:     if (direction == FALSE_BRANCH)
+123949:         jsop = analyze::NegateCompareOp(jsop);
+123949: 
+123949:     SimpleLinearSum lsum = ExtractLinearSum(lhs);
+123949:     SimpleLinearSum rsum = ExtractLinearSum(rhs);
+123949: 
+123949:     if (!SafeSub(lsum.constant, rsum.constant, &lsum.constant))
+123949:         return false;
+123949: 
+123949:     // Normalize operations to use <= or >=.
+123949:     switch (jsop) {
+123949:       case JSOP_LE:
+123949:         *plessEqual = true;
+123949:         break;
+123949:       case JSOP_LT:
+123949:         /* x < y ==> x + 1 <= y */
+123949:         if (!SafeAdd(lsum.constant, 1, &lsum.constant))
+123949:             return false;
+123949:         *plessEqual = true;
+123949:         break;
+123949:       case JSOP_GE:
+123949:         *plessEqual = false;
+123949:         break;
+123949:       case JSOP_GT:
+123949:         /* x > y ==> x - 1 >= y */
+123949:         if (!SafeSub(lsum.constant, 1, &lsum.constant))
+123949:             return false;
+123949:         *plessEqual = false;
+123949:         break;
+123949:       default:
+123949:         return false;
+123949:     }
+123949: 
+123949:     *plhs = lsum;
+123949:     *prhs = rsum.term;
+123949: 
+123949:     return true;
+113380: }
+113380: 
+113380: static bool
+113380: TryEliminateBoundsCheck(MBoundsCheck *dominating, MBoundsCheck *dominated, bool *eliminated)
+113380: {
+113380:     JS_ASSERT(!*eliminated);
+113380: 
+113380:     // We found two bounds checks with the same hash number, but we still have
+113380:     // to make sure the lengths and index terms are equal.
+113380:     if (dominating->length() != dominated->length())
+113380:         return true;
+113380: 
+123949:     SimpleLinearSum sumA = ExtractLinearSum(dominating->index());
+123949:     SimpleLinearSum sumB = ExtractLinearSum(dominated->index());
+113380: 
+113380:     // Both terms should be NULL or the same definition.
+113380:     if (sumA.term != sumB.term)
+113380:         return true;
+113380: 
+113380:     // This bounds check is redundant.
+113380:     *eliminated = true;
+113380: 
+113380:     // Normalize the ranges according to the constant offsets in the two indexes.
+124795:     int32_t minimumA, maximumA, minimumB, maximumB;
+113380:     if (!SafeAdd(sumA.constant, dominating->minimum(), &minimumA) ||
+113380:         !SafeAdd(sumA.constant, dominating->maximum(), &maximumA) ||
+113380:         !SafeAdd(sumB.constant, dominated->minimum(), &minimumB) ||
+113380:         !SafeAdd(sumB.constant, dominated->maximum(), &maximumB))
+113380:     {
+113380:         return false;
+113380:     }
+113380: 
+113380:     // Update the dominating check to cover both ranges, denormalizing the
+113380:     // result per the constant offset in the index.
+124795:     int32_t newMinimum, newMaximum;
+113380:     if (!SafeSub(Min(minimumA, minimumB), sumA.constant, &newMinimum) ||
+113380:         !SafeSub(Max(maximumA, maximumB), sumA.constant, &newMaximum))
+113380:     {
+113380:         return false;
+113380:     }
+113380: 
+113380:     dominating->setMinimum(newMinimum);
+113380:     dominating->setMaximum(newMaximum);
+113380:     return true;
+113380: }
+113380: 
+113380: // A bounds check is considered redundant if it's dominated by another bounds
+113380: // check with the same length and the indexes differ by only a constant amount.
+113380: // In this case we eliminate the redundant bounds check and update the other one
+113380: // to cover the ranges of both checks.
+113380: //
+113380: // Bounds checks are added to a hash map and since the hash function ignores
+113380: // differences in constant offset, this offers a fast way to find redundant
+113380: // checks.
+113380: bool
+113380: ion::EliminateRedundantBoundsChecks(MIRGraph &graph)
+113380: {
+113380:     BoundsCheckMap checks;
+113380: 
+113380:     if (!checks.init())
+113380:         return false;
+113380: 
+113380:     // Stack for pre-order CFG traversal.
+113380:     Vector<MBasicBlock *, 1, IonAllocPolicy> worklist;
+113380: 
+113380:     // The index of the current block in the CFG traversal.
+113380:     size_t index = 0;
+113380: 
+113380:     // Add all self-dominating blocks to the worklist.
+113380:     // This includes all roots. Order does not matter.
+113380:     for (MBasicBlockIterator i(graph.begin()); i != graph.end(); i++) {
+113380:         MBasicBlock *block = *i;
+113380:         if (block->immediateDominator() == block) {
+113380:             if (!worklist.append(block))
+113380:                 return false;
+113380:         }
+113380:     }
+113380: 
+113380:     // Starting from each self-dominating block, traverse the CFG in pre-order.
+113380:     while (!worklist.empty()) {
+113380:         MBasicBlock *block = worklist.popCopy();
+113380: 
+113380:         // Add all immediate dominators to the front of the worklist.
+113380:         for (size_t i = 0; i < block->numImmediatelyDominatedBlocks(); i++) {
+113380:             if (!worklist.append(block->getImmediatelyDominatedBlock(i)))
+113380:                 return false;
+113380:         }
+113380: 
+113380:         for (MDefinitionIterator iter(block); iter; ) {
+113380:             if (!iter->isBoundsCheck()) {
+113380:                 iter++;
+113380:                 continue;
+113380:             }
+113380: 
+113380:             MBoundsCheck *check = iter->toBoundsCheck();
+113380: 
+113380:             // Replace all uses of the bounds check with the actual index.
+113380:             // This is (a) necessary, because we can coalesce two different
+113380:             // bounds checks and would otherwise use the wrong index and
+113380:             // (b) helps register allocation. Note that this is safe since
+113380:             // no other pass after bounds check elimination moves instructions.
+113380:             check->replaceAllUsesWith(check->index());
+113380: 
+113380:             if (!check->isMovable()) {
+113380:                 iter++;
+113380:                 continue;
+113380:             }
+113380: 
+113380:             MBoundsCheck *dominating = FindDominatingBoundsCheck(checks, check, index);
+113380:             if (!dominating)
+113380:                 return false;
+113380: 
+113380:             if (dominating == check) {
+113380:                 // We didn't find a dominating bounds check.
+113380:                 iter++;
+113380:                 continue;
+113380:             }
+113380: 
+113380:             bool eliminated = false;
+113380:             if (!TryEliminateBoundsCheck(dominating, check, &eliminated))
+113380:                 return false;
+113380: 
+113380:             if (eliminated)
+113380:                 iter = check->block()->discardDefAt(iter);
+113380:             else
+113380:                 iter++;
+113380:         }
+113380:         index++;
+113380:     }
+113380: 
+113380:     JS_ASSERT(index == graph.numBlocks());
+113380:     return true;
+113380: }
+123949: 
+123949: bool
+124795: LinearSum::multiply(int32_t scale)
+123949: {
+123949:     for (size_t i = 0; i < terms_.length(); i++) {
+123949:         if (!SafeMul(scale, terms_[i].scale, &terms_[i].scale))
+123949:             return false;
+123949:     }
+123949:     return SafeMul(scale, constant_, &constant_);
+123949: }
+123949: 
+123949: bool
+123949: LinearSum::add(const LinearSum &other)
+123949: {
+123949:     for (size_t i = 0; i < other.terms_.length(); i++) {
+123949:         if (!add(other.terms_[i].term, other.terms_[i].scale))
+123949:             return false;
+123949:     }
+123949:     return add(other.constant_);
+123949: }
+123949: 
+123949: bool
+124795: LinearSum::add(MDefinition *term, int32_t scale)
+123949: {
+123949:     JS_ASSERT(term);
+123949: 
+123949:     if (scale == 0)
+123949:         return true;
+123949: 
+123949:     if (term->isConstant()) {
+124795:         int32_t constant = term->toConstant()->value().toInt32();
+123949:         if (!SafeMul(constant, scale, &constant))
+123949:             return false;
+123949:         return add(constant);
+123949:     }
+123949: 
+123949:     for (size_t i = 0; i < terms_.length(); i++) {
+123949:         if (term == terms_[i].term) {
+123949:             if (!SafeAdd(scale, terms_[i].scale, &terms_[i].scale))
+123949:                 return false;
+123949:             if (terms_[i].scale == 0) {
+123949:                 terms_[i] = terms_.back();
+123949:                 terms_.popBack();
+123949:             }
+123949:             return true;
+123949:         }
+123949:     }
+123949: 
+123949:     terms_.append(LinearTerm(term, scale));
+123949:     return true;
+123949: }
+123949: 
+123949: bool
+124795: LinearSum::add(int32_t constant)
+123949: {
+123949:     return SafeAdd(constant, constant_, &constant_);
+123949: }
+123949: 
+123949: void
+123949: LinearSum::print(Sprinter &sp) const
+123949: {
+123949:     for (size_t i = 0; i < terms_.length(); i++) {
+124795:         int32_t scale = terms_[i].scale;
+124795:         int32_t id = terms_[i].term->id();
+123949:         JS_ASSERT(scale);
+123949:         if (scale > 0) {
+123949:             if (i)
+123949:                 sp.printf("+");
+123949:             if (scale == 1)
+123949:                 sp.printf("#%d", id);
+123949:             else
+123949:                 sp.printf("%d*#%d", scale, id);
+123949:         } else if (scale == -1) {
+123949:             sp.printf("-#%d", id);
+123949:         } else {
+123949:             sp.printf("%d*#%d", scale, id);
+123949:         }
+123949:     }
+123949:     if (constant_ > 0)
+123949:         sp.printf("+%d", constant_);
+123949:     else if (constant_ < 0)
+123949:         sp.printf("%d", constant_);
+123949: }

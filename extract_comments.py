@@ -5,7 +5,8 @@ from numpy import median, percentile
 
 # initialize the MySQL service
 def initDatabase():
-    database = MySQLdb.connect(host = 'localhost', user = 'root', passwd = 'poly', db = 'Mozilla_Bugzilla', port = 3306)
+    #   Please set the database host, user and password here
+    database = MySQLdb.connect(host = 'localhost', user = 'root', passwd = 'your_passwd', db = dbname, port = 3306)
     cursor = database.cursor()
     return cursor
 

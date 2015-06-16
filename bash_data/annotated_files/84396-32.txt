@@ -1,0 +1,682 @@
+    1: /* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*-
+    1:  *
+    1:  * ***** BEGIN LICENSE BLOCK *****
+    1:  * Version: MPL 1.1/GPL 2.0/LGPL 2.1
+    1:  *
+    1:  * The contents of this file are subject to the Mozilla Public License Version
+    1:  * 1.1 (the "License"); you may not use this file except in compliance with
+    1:  * the License. You may obtain a copy of the License at
+    1:  * http://www.mozilla.org/MPL/
+    1:  *
+    1:  * Software distributed under the License is distributed on an "AS IS" basis,
+    1:  * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+    1:  * for the specific language governing rights and limitations under the
+    1:  * License.
+    1:  *
+    1:  * The Original Code is mozilla.org code.
+    1:  *
+    1:  * The Initial Developer of the Original Code is
+    1:  * Netscape Communications Corporation.
+    1:  * Portions created by the Initial Developer are Copyright (C) 1998
+    1:  * the Initial Developer. All Rights Reserved.
+    1:  *
+    1:  * Contributor(s):
+    1:  *   Brian Ryner <bryner@brianryner.com>
+    1:  *   Terry Hayes <thayes@netscape.com>
+    1:  *   Kai Engert <kengert@redhat.com>
+ 8756:  *   Petr Kostka <petr.kostka@st.com>
+28629:  *   Honza Bambas <honzab@firemni.cz>
+    1:  *
+    1:  * Alternatively, the contents of this file may be used under the terms of
+    1:  * either the GNU General Public License Version 2 or later (the "GPL"), or
+    1:  * the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+    1:  * in which case the provisions of the GPL or the LGPL are applicable instead
+    1:  * of those above. If you wish to allow use of your version of this file only
+    1:  * under the terms of either the GPL or the LGPL, and not to allow others to
+    1:  * use your version of this file under the terms of the MPL, indicate your
+    1:  * decision by deleting the provisions above and replace them with the notice
+    1:  * and other provisions required by the GPL or the LGPL. If you do not delete
+    1:  * the provisions above, a recipient may use your version of this file under
+    1:  * the terms of any one of the MPL, the GPL or the LGPL.
+    1:  *
+    1:  * ***** END LICENSE BLOCK ***** */
+83083: 
+83083: /* 
+83083:  * All I/O is done on the socket transport thread, including all calls into
+83083:  * libssl. That is, all SSL_* functions must be called on the socket transport
+83083:  * thread. This also means that all SSL callback functions will be called on
+83083:  * the socket transport thread, including in particular the auth certificate
+83083:  * hook.
+83083:  *
+83083:  * During certificate authentication, we call CERT_PKIXVerifyCert or
+83083:  * CERT_VerifyCert. These functions may make zero or more HTTP requests
+83083:  * for OCSP responses, CRLs, intermediate certificates, etc.
+83083:  *
+83083:  * If our cert auth hook were to call the CERT_*Verify* functions directly,
+83083:  * there would be a deadlock: The CERT_*Verify* function would cause an event
+83083:  * to be asynchronously posted to the socket transport thread, and then it
+83083:  * would block the socket transport thread waiting to be notified of the HTTP
+83083:  * response. However, the HTTP request would never actually be processed
+83083:  * because the socket transport thread would be blocked and so it wouldn't be
+83083:  * able process HTTP requests. (i.e. Deadlock.)
+83083:  *
+83083:  * Consequently, we must always call the CERT_*Verify* cert functions off the
+83083:  * socket transport thread. To accomplish this, our auth cert hook dispatches a
+83083:  * SSLServerCertVerificationJob to a pool of background threads, and then
+83083:  * immediatley return SECWouldBlock to libssl. These jobs are where the
+83083:  * CERT_*Verify* functions are actually called. 
+83083:  *
+83083:  * When our auth cert hook returns SECWouldBlock, libssl will carry on the
+83083:  * handshake while we validate the certificate. This will free up the socket
+83083:  * transport thread so that HTTP requests--in particular, the OCSP/CRL/cert
+83083:  * requests needed for cert verification as mentioned above--can be processed.
+83083:  *
+83083:  * Once the CERT_*Verify* function returns, the cert verification job
+83083:  * dispatches a SSLServerCertVerificationResult to the socket transport thread;
+83083:  * the SSLServerCertVerificationResult will notify libssl that the certificate
+83083:  * authentication is complete. Once libssl is notified that the authentication
+83083:  * is complete, it will continue the SSL handshake (if it hasn't already
+83083:  * finished) and it will begin allowing us to send/receive data on the
+83083:  * connection.
+83083:  *
+83083:  * Timeline of events:
+83083:  *
+83083:  *    * libssl calls SSLServerCertVerificationJob::Dispatch on the socket
+83083:  *      transport thread.
+83083:  *    * SSLServerCertVerificationJob::Dispatch queues a job
+83083:  *      (instance of SSLServerCertVerificationJob) to its background thread
+83083:  *      pool and returns.
+83083:  *    * One of the background threads calls CERT_*Verify*, which may enqueue
+83083:  *      some HTTP request(s) onto the socket transport thread, and then
+83083:  *      blocks that background thread waiting for the responses and/or timeouts
+83083:  *      or errors for those requests.
+83083:  *    * Once those HTTP responses have all come back or failed, the
+83083:  *      CERT_*Verify* function returns a result indicating that the validation
+83083:  *      succeeded or failed.
+83083:  *    * If the validation succeeded, then a SSLServerCertVerificationResult
+83083:  *      event is posted to the socket transport thread, and the cert
+83083:  *      verification thread becomes free to verify other certificates.
+83083:  *    * Otherwise, a CertErrorRunnable is posted to the socket transport thread
+83083:  *      and then to the main thread (blocking both, see CertErrorRunnable) to
+83083:  *      do cert override processing and bad cert listener notification. Then
+83083:  *      the cert verification thread becomes free to verify other certificates.
+83083:  *    * After processing cert overrides, the CertErrorRunnable will dispatch a
+83083:  *      SSLServerCertVerificationResult event to the socket transport thread to
+83083:  *      notify it of the result of the override processing; then it returns,
+83083:  *      freeing up the main thread.
+83083:  *    * The SSLServerCertVerificationResult event will either wake up the 
+83083:  *      socket (using SSL_RestartHandshakeAfterServerCert) if validation
+83083:  *      succeeded or there was an error override, or it will set an error flag
+83083:  *      so that the next I/O operation on the socket will fail, causing the
+83083:  *      socket transport thread to close the connection.
+83083:  *
+83083:  * Cert override processing must happen on the main thread because it accesses
+83083:  * the nsICertOverrideService, and that service must be accessed on the main 
+83083:  * thread because some extensions (Selenium, in particular) replace it with a
+83083:  * Javascript implementation, and chrome JS must always be run on the main
+83083:  * thread.
+83083:  *
+83083:  * SSLServerCertVerificationResult must be dispatched to the socket transport
+83083:  * thread because we must only call SSL_* functions on the socket transport
+83083:  * thread since they may do I/O, because many parts of nsNSSSocketInfo and
+83083:  * the PSM NSS I/O layer are not thread-safe, and because we need the event to
+83083:  * interrupt the PR_Poll that may waiting for I/O on the socket for which we
+83083:  * are validating the cert.
+83083:  */
+83083: 
+83083: #include "SSLServerCertVerification.h"
+83082: #include "nsNSSComponent.h"
+    1: #include "nsNSSCertificate.h"
+83082: #include "nsNSSIOLayer.h"
+    1: 
+83083: #include "nsIThreadPool.h"
+83083: #include "nsXPCOMCIDInternal.h"
+83083: #include "nsComponentManagerUtils.h"
+83083: #include "nsServiceManagerUtils.h"
+83083: 
+    1: #include "ssl.h"
+63436: #include "secerr.h"
+69383: #include "sslerr.h"
+    1: 
+    1: #ifdef PR_LOGGING
+    1: extern PRLogModuleInfo* gPIPNSSLog;
+    1: #endif
+    1: 
+83083: namespace mozilla { namespace psm {
+83083: 
+83083: namespace {
+83083: // do not use a nsCOMPtr to avoid static initializer/destructor
+83083: nsIThreadPool * gCertVerificationThreadPool = nsnull;
+83083: } // unnamed namespace
+83083: 
+83083: // Called when the socket transport thread starts, to initialize the SSL cert
+83083: // verification thread pool. By tying the thread pool startup/shutdown directly
+83083: // to the STS thread's lifetime, we ensure that they are *always* available for
+83083: // SSL connections and that there are no races during startup and especially
+83083: // shutdown. (Previously, we have had multiple problems with races in PSM
+83083: // background threads, and the race-prevention/shutdown logic used there is
+83083: // brittle. Since this service is critical to things like downloading updates,
+83083: // we take no chances.) Also, by doing things this way, we avoid the need for
+83083: // locks, since gCertVerificationThreadPool is only ever accessed on the socket
+83083: // transport thread.
+83083: void
+83083: InitializeSSLServerCertVerificationThreads()
+83083: {
+83083:   // TODO: tuning, make parameters preferences
+83083:   // XXX: instantiate nsThreadPool directly, to make this more bulletproof.
+83083:   // Currently, the nsThreadPool.h header isn't exported for us to do so.
+83083:   nsresult rv = CallCreateInstance(NS_THREADPOOL_CONTRACTID,
+83083:                                    &gCertVerificationThreadPool);
+83083:   if (NS_FAILED(rv)) {
+83083:     NS_WARNING("Failed to create SSL cert verification threads.");
+83083:     return;
+83083:   }
+83083: 
+83083:   (void) gCertVerificationThreadPool->SetIdleThreadLimit(5);
+83083:   (void) gCertVerificationThreadPool->SetIdleThreadTimeout(30 * 1000);
+83083:   (void) gCertVerificationThreadPool->SetThreadLimit(5);
+83083: }
+83083: 
+83083: // Called when the socket transport thread finishes, to destroy the thread
+83083: // pool. Since the socket transport service has stopped processing events, it
+83083: // will not attempt any more SSL I/O operations, so it is clearly safe to shut
+83083: // down the SSL cert verification infrastructure. Also, the STS will not
+83083: // dispatch many SSL verification result events at this point, so any pending
+83083: // cert verifications will (correctly) fail at the point they are dispatched.
+83083: //
+83083: // The other shutdown race condition that is possible is a race condition with
+83083: // shutdown of the nsNSSComponent service. We use the
+83083: // nsNSSShutdownPreventionLock where needed (not here) to prevent that.
+83083: void StopSSLServerCertVerificationThreads()
+83083: {
+83083:   if (gCertVerificationThreadPool) {
+83083:     gCertVerificationThreadPool->Shutdown();
+83083:     NS_RELEASE(gCertVerificationThreadPool);
+83083:   }
+83083: }
+83083: 
+83083: namespace {
+83083: 
+83083: class SSLServerCertVerificationJob : public nsRunnable
+83083: {
+83083: public:
+83083:   // Must be called only on the socket transport thread
+83083:   static SECStatus Dispatch(const void * fdForLogging,
+83083:                             nsNSSSocketInfo * infoObject,
+83083:                             CERTCertificate * serverCert);
+83083: private:
+83083:   NS_DECL_NSIRUNNABLE
+83083: 
+83083:   // Must be called only on the socket transport thread
+83083:   SSLServerCertVerificationJob(const void * fdForLogging,
+83083:                                nsNSSSocketInfo & socketInfo, 
+83083:                                CERTCertificate & cert);
+83083:   ~SSLServerCertVerificationJob();
+83083: 
+83083:   // Runs on one of the background threads
+83083:   SECStatus AuthCertificate(const nsNSSShutDownPreventionLock & proofOfLock);
+83083: 
+83083:   const void * const mFdForLogging;
+83083:   const nsRefPtr<nsNSSSocketInfo> mSocketInfo;
+83083:   CERTCertificate * const mCert;
+83083: };
+83083: 
+83083: SSLServerCertVerificationJob::SSLServerCertVerificationJob(
+83083:     const void * fdForLogging, nsNSSSocketInfo & socketInfo,
+83083:     CERTCertificate & cert)
+83083:   : mFdForLogging(fdForLogging)
+83083:   , mSocketInfo(&socketInfo)
+83083:   , mCert(CERT_DupCertificate(&cert))
+83083: {
+83083: }
+83083: 
+83083: SSLServerCertVerificationJob::~SSLServerCertVerificationJob()
+83083: {
+83083:   CERT_DestroyCertificate(mCert);
+83083: }
+83083: 
+83083: static NS_DEFINE_CID(kNSSComponentCID, NS_NSSCOMPONENT_CID);
+83083: 
+69383: SECStatus
+83083: PSM_SSL_PKIX_AuthCertificate(CERTCertificate *peerCert, void * pinarg,
+83083:                              const char * hostname,
+83083:                              const nsNSSShutDownPreventionLock & /*proofOfLock*/)
+69383: {
+69383:     SECStatus          rv;
+69383:     
+69383:     if (!nsNSSComponent::globalConstFlagUsePKIXVerification) {
+83083:         rv = CERT_VerifyCertNow(CERT_GetDefaultCertDB(), peerCert, true,
+83083:                                 certUsageSSLServer, pinarg);
+69383:     }
+69383:     else {
+69383:         nsresult nsrv;
+69383:         nsCOMPtr<nsINSSComponent> inss = do_GetService(kNSSComponentCID, &nsrv);
+69383:         if (!inss)
+69383:           return SECFailure;
+69383:         nsRefPtr<nsCERTValInParamWrapper> survivingParams;
+69383:         if (NS_FAILED(inss->GetDefaultCERTValInParam(survivingParams)))
+69383:           return SECFailure;
+69383: 
+69383:         CERTValOutParam cvout[1];
+69383:         cvout[0].type = cert_po_end;
+69383: 
+83083:         rv = CERT_PKIXVerifyCert(peerCert, certificateUsageSSLServer,
+69383:                                 survivingParams->GetRawPointerForNSS(),
+69383:                                 cvout, pinarg);
+69383:     }
+69383: 
+83083:     if (rv == SECSuccess) {
+69383:         /* cert is OK.  This is the client side of an SSL connection.
+69383:         * Now check the name field in the cert against the desired hostname.
+69383:         * NB: This is our only defense against Man-In-The-Middle (MITM) attacks!
+69383:         */
+69383:         if (hostname && hostname[0])
+69383:             rv = CERT_VerifyCertName(peerCert, hostname);
+69383:         else
+69383:             rv = SECFailure;
+69383:         if (rv != SECSuccess)
+69383:             PORT_SetError(SSL_ERROR_BAD_CERT_DOMAIN);
+69383:     }
+69383:         
+69383:     return rv;
+69383: }
+69383: 
+63436: struct nsSerialBinaryBlacklistEntry
+63436: {
+63436:   unsigned int len;
+63436:   const char *binary_serial;
+63436: };
+63436: 
+63436: // bug 642395
+63436: static struct nsSerialBinaryBlacklistEntry myUTNBlacklistEntries[] = {
+63436:   { 17, "\x00\x92\x39\xd5\x34\x8f\x40\xd1\x69\x5a\x74\x54\x70\xe1\xf2\x3f\x43" },
+63436:   { 17, "\x00\xd8\xf3\x5f\x4e\xb7\x87\x2b\x2d\xab\x06\x92\xe3\x15\x38\x2f\xb0" },
+63436:   { 16, "\x72\x03\x21\x05\xc5\x0c\x08\x57\x3d\x8e\xa5\x30\x4e\xfe\xe8\xb0" },
+63436:   { 17, "\x00\xb0\xb7\x13\x3e\xd0\x96\xf9\xb5\x6f\xae\x91\xc8\x74\xbd\x3a\xc0" },
+63437:   { 16, "\x39\x2a\x43\x4f\x0e\x07\xdf\x1f\x8a\xa3\x05\xde\x34\xe0\xc2\x29" },
+63437:   { 16, "\x3e\x75\xce\xd4\x6b\x69\x30\x21\x21\x88\x30\xae\x86\xa8\x2a\x71" },
+63436:   { 17, "\x00\xe9\x02\x8b\x95\x78\xe4\x15\xdc\x1a\x71\x0a\x2b\x88\x15\x44\x47" },
+63436:   { 17, "\x00\xd7\x55\x8f\xda\xf5\xf1\x10\x5b\xb2\x13\x28\x2b\x70\x77\x29\xa3" },
+63436:   { 16, "\x04\x7e\xcb\xe9\xfc\xa5\x5f\x7b\xd0\x9e\xae\x36\xe1\x0c\xae\x1e" },
+63436:   { 17, "\x00\xf5\xc8\x6a\xf3\x61\x62\xf1\x3a\x64\xf5\x4f\x6d\xc9\x58\x7c\x06" },
+63436:   { 0, 0 } // end marker
+63436: };
+63436: 
+77758: // Call this if we have already decided that a cert should be treated as INVALID,
+77758: // in order to check if we to worsen the error to REVOKED.
+77758: PRErrorCode
+77758: PSM_SSL_DigiNotarTreatAsRevoked(CERTCertificate * serverCert,
+77758:                                 CERTCertList * serverCertChain)
+77758: {
+77758:   // If any involved cert was issued by DigiNotar, 
+77758:   // and serverCert was issued after 01-JUL-2011,
+77758:   // then worsen the error to revoked.
+77758:   
+77758:   PRTime cutoff = 0;
+80486:   PRStatus status = PR_ParseTimeString("01-JUL-2011 00:00", true, &cutoff);
+77758:   if (status != PR_SUCCESS) {
+77758:     NS_ASSERTION(status == PR_SUCCESS, "PR_ParseTimeString failed");
+77758:     // be safe, assume it's afterwards, keep going
+77758:   } else {
+77758:     PRTime notBefore = 0, notAfter = 0;
+77758:     if (CERT_GetCertTimes(serverCert, &notBefore, &notAfter) == SECSuccess &&
+77758:            notBefore < cutoff) {
+77758:       // no worsening for certs issued before the cutoff date
+77758:       return 0;
+77758:     }
+77758:   }
+77758:   
+77758:   for (CERTCertListNode *node = CERT_LIST_HEAD(serverCertChain);
+77758:        !CERT_LIST_END(node, serverCertChain);
+77758:        node = CERT_LIST_NEXT(node)) {
+77758:     if (node->cert->issuerName &&
+77758:         strstr(node->cert->issuerName, "CN=DigiNotar")) {
+77758:       return SEC_ERROR_REVOKED_CERTIFICATE;
+77758:     }
+77758:   }
+77758:   
+77758:   return 0;
+77758: }
+77758: 
+77758: // Call this only if a cert has been reported by NSS as VALID
+77514: PRErrorCode
+77514: PSM_SSL_BlacklistDigiNotar(CERTCertificate * serverCert,
+77514:                            CERTCertList * serverCertChain)
+77514: {
+79445:   bool isDigiNotarIssuedCert = false;
+77514: 
+77514:   for (CERTCertListNode *node = CERT_LIST_HEAD(serverCertChain);
+77514:        !CERT_LIST_END(node, serverCertChain);
+77514:        node = CERT_LIST_NEXT(node)) {
+77514:     if (!node->cert->issuerName)
+77514:       continue;
+77514: 
+77514:     if (strstr(node->cert->issuerName, "CN=DigiNotar")) {
+80486:       isDigiNotarIssuedCert = true;
+77514:     }
+77514:   }
+77514: 
+77758:   if (isDigiNotarIssuedCert) {
+77758:     // let's see if we want to worsen the error code to revoked.
+77758:     PRErrorCode revoked_code = PSM_SSL_DigiNotarTreatAsRevoked(serverCert, serverCertChain);
+77758:     return (revoked_code != 0) ? revoked_code : SEC_ERROR_UNTRUSTED_ISSUER;
+77758:   }
+77758: 
+77758:   return 0;
+77514: }
+77514: 
+83083: SECStatus
+83083: SSLServerCertVerificationJob::AuthCertificate(
+83083:   nsNSSShutDownPreventionLock const & nssShutdownPreventionLock)
+83083: {
+83083:   if (mCert->serialNumber.data &&
+83083:       mCert->issuerName &&
+83083:       !strcmp(mCert->issuerName, 
+63436:         "CN=UTN-USERFirst-Hardware,OU=http://www.usertrust.com,O=The USERTRUST Network,L=Salt Lake City,ST=UT,C=US")) {
+63436: 
+83083:     unsigned char *server_cert_comparison_start = mCert->serialNumber.data;
+83083:     unsigned int server_cert_comparison_len = mCert->serialNumber.len;
+63436: 
+63436:     while (server_cert_comparison_len) {
+63436:       if (*server_cert_comparison_start != 0)
+63436:         break;
+63436: 
+63436:       ++server_cert_comparison_start;
+63436:       --server_cert_comparison_len;
+63436:     }
+63436: 
+63436:     nsSerialBinaryBlacklistEntry *walk = myUTNBlacklistEntries;
+63436:     for ( ; walk && walk->len; ++walk) {
+63436: 
+63436:       unsigned char *locked_cert_comparison_start = (unsigned char*)walk->binary_serial;
+63436:       unsigned int locked_cert_comparison_len = walk->len;
+63436:       
+63436:       while (locked_cert_comparison_len) {
+63436:         if (*locked_cert_comparison_start != 0)
+63436:           break;
+63436:         
+63436:         ++locked_cert_comparison_start;
+63436:         --locked_cert_comparison_len;
+63436:       }
+63436: 
+63436:       if (server_cert_comparison_len == locked_cert_comparison_len &&
+63436:           !memcmp(server_cert_comparison_start, locked_cert_comparison_start, locked_cert_comparison_len)) {
+63436:         PR_SetError(SEC_ERROR_REVOKED_CERTIFICATE, 0);
+63436:         return SECFailure;
+63436:       }
+63436:     }
+63436:   }
+63436: 
+83083:   SECStatus rv = PSM_SSL_PKIX_AuthCertificate(mCert, mSocketInfo,
+83083:                                               mSocketInfo->GetHostName(),
+83083:                                               nssShutdownPreventionLock);
+    1: 
+    1:   // We want to remember the CA certs in the temp db, so that the application can find the
+    1:   // complete chain at any time it might need it.
+    1:   // But we keep only those CA certs in the temp db, that we didn't already know.
+    1: 
+83083:   nsRefPtr<nsSSLStatus> status = mSocketInfo->SSLStatus();
+14100:   nsRefPtr<nsNSSCertificate> nsc;
+14100: 
+14100:   if (!status || !status->mServerCert) {
+83083:     nsc = nsNSSCertificate::Create(mCert);
+14100:   }
+14100: 
+77514:   CERTCertList *certList = nsnull;
+83083:   certList = CERT_GetCertChainFromCert(mCert, PR_Now(), certUsageSSLCA);
+77514:   if (!certList) {
+77514:     rv = SECFailure;
+77514:   } else {
+77758:     PRErrorCode blacklistErrorCode;
+77758:     if (rv == SECSuccess) { // PSM_SSL_PKIX_AuthCertificate said "valid cert"
+83083:       blacklistErrorCode = PSM_SSL_BlacklistDigiNotar(mCert, certList);
+77758:     } else { // PSM_SSL_PKIX_AuthCertificate said "invalid cert"
+77758:       PRErrorCode savedErrorCode = PORT_GetError();
+77758:       // Check if we want to worsen the error code to "revoked".
+83083:       blacklistErrorCode = PSM_SSL_DigiNotarTreatAsRevoked(mCert, certList);
+77758:       if (blacklistErrorCode == 0) {
+77758:         // we don't worsen the code, let's keep the original error code from NSS
+77758:         PORT_SetError(savedErrorCode);
+77758:       }
+77758:     }
+77758:       
+77514:     if (blacklistErrorCode != 0) {
+83083:       mSocketInfo->SetCertIssuerBlacklisted();
+77514:       PORT_SetError(blacklistErrorCode);
+77514:       rv = SECFailure;
+77514:     }
+77514:   }
+77514: 
+77514:   if (rv == SECSuccess) {
+14100:     if (nsc) {
+79445:       bool dummyIsEV;
+14100:       nsc->GetIsExtendedValidation(&dummyIsEV); // the nsc object will cache the status
+14100:     }
+14100:     
+    1:     nsCOMPtr<nsINSSComponent> nssComponent;
+    1:       
+    1:     for (CERTCertListNode *node = CERT_LIST_HEAD(certList);
+    1:          !CERT_LIST_END(node, certList);
+    1:          node = CERT_LIST_NEXT(node)) {
+    1: 
+    1:       if (node->cert->slot) {
+    1:         // This cert was found on a token, no need to remember it in the temp db.
+    1:         continue;
+    1:       }
+    1: 
+    1:       if (node->cert->isperm) {
+    1:         // We don't need to remember certs already stored in perm db.
+    1:         continue;
+    1:       }
+    1:         
+83083:       if (node->cert == mCert) {
+    1:         // We don't want to remember the server cert, 
+    1:         // the code that cares for displaying page info does this already.
+    1:         continue;
+    1:       }
+    1: 
+    1:       // We have found a signer cert that we want to remember.
+64032:       char* nickname = nsNSSCertificate::defaultServerNickname(node->cert);
+64032:       if (nickname && *nickname) {
+ 7051:         PK11SlotInfo *slot = PK11_GetInternalKeySlot();
+ 7051:         if (slot) {
+ 7051:           PK11_ImportCert(slot, node->cert, CK_INVALID_HANDLE, 
+80486:                           nickname, false);
+ 7051:           PK11_FreeSlot(slot);
+    1:         }
+    1:       }
+64032:       PR_FREEIF(nickname);
+    1:     }
+    1: 
+77514:     if (certList) {
+    1:       CERT_DestroyCertList(certList);
+ 6598:     }
+ 8223: 
+ 8223:     // The connection may get terminated, for example, if the server requires
+ 8223:     // a client cert. Let's provide a minimal SSLStatus
+ 6598:     // to the caller that contains at least the cert and its status.
+ 6598:     if (!status) {
+ 6598:       status = new nsSSLStatus();
+83083:       mSocketInfo->SetSSLStatus(status);
+ 6598:     }
+28629: 
+28629:     if (rv == SECSuccess) {
+28629:       // Certificate verification succeeded delete any potential record
+28629:       // of certificate error bits.
+28629:       nsSSLIOLayerHelpers::mHostsWithCertErrors->RememberCertHasError(
+83083:         mSocketInfo, nsnull, rv);
+28629:     }
+28629:     else {
+28629:       // Certificate verification failed, update the status' bits.
+28629:       nsSSLIOLayerHelpers::mHostsWithCertErrors->LookupCertErrorBits(
+83083:         mSocketInfo, status);
+28629:     }
+28629: 
+10258:     if (status && !status->mServerCert) {
+14100:       status->mServerCert = nsc;
+10258:       PR_LOG(gPIPNSSLog, PR_LOG_DEBUG,
+83083:              ("AuthCertificate setting NEW cert %p\n", status->mServerCert.get()));
+ 6598:     }
+    1:   }
+    1: 
+    1:   return rv;
+    1: }
+83083: 
+83083: /*static*/ SECStatus
+83083: SSLServerCertVerificationJob::Dispatch(const void * fdForLogging,
+83083:                                        nsNSSSocketInfo * socketInfo,
+83083:                                        CERTCertificate * serverCert)
+83083: {
+83083:   // Runs on the socket transport thread
+83083: 
+83083:   if (!socketInfo || !serverCert) {
+83083:     NS_ERROR("Invalid parameters for SSL server cert validation");
+83083:     socketInfo->SetCertVerificationResult(PR_INVALID_STATE_ERROR,
+83083:                                           PlainErrorMessage);
+83083:     PR_SetError(PR_INVALID_STATE_ERROR, 0);
+83083:     return SECFailure;
+83083:   }
+83083:   
+83083:   nsRefPtr<SSLServerCertVerificationJob> job
+83083:     = new SSLServerCertVerificationJob(fdForLogging, *socketInfo, *serverCert);
+83083: 
+83083:   socketInfo->SetCertVerificationWaiting();
+83083:   nsresult nrv;
+83083:   if (!gCertVerificationThreadPool) {
+83083:     nrv = NS_ERROR_NOT_INITIALIZED;
+83083:   } else {
+83083:     nrv = gCertVerificationThreadPool->Dispatch(job, NS_DISPATCH_NORMAL);
+83083:   }
+83083:   if (NS_FAILED(nrv)) {
+83083:     PRErrorCode error = nrv == NS_ERROR_OUT_OF_MEMORY
+83083:                       ? SEC_ERROR_NO_MEMORY
+83083:                       : PR_INVALID_STATE_ERROR;
+83083:     socketInfo->SetCertVerificationResult(error, PlainErrorMessage);
+83083:     PORT_SetError(error);
+83083:     return SECFailure;
+83083:   }
+83083: 
+83083:   PORT_SetError(PR_WOULD_BLOCK_ERROR);
+83083:   return SECWouldBlock;    
+83083: }
+83083: 
+83083: NS_IMETHODIMP
+83083: SSLServerCertVerificationJob::Run()
+83083: {
+83083:   // Runs on a cert verification thread
+83083: 
+83083:   PR_LOG(gPIPNSSLog, PR_LOG_DEBUG,
+83083:           ("[%p] SSLServerCertVerificationJob::Run\n", mSocketInfo.get()));
+83083: 
+83083:   PRErrorCode error;
+83083: 
+83083:   nsNSSShutDownPreventionLock nssShutdownPrevention;
+83083:   if (mSocketInfo->isAlreadyShutDown()) {
+83083:     error = SEC_ERROR_USER_CANCELLED;
+83083:   } else {
+83083:     // Reset the error code here so we can detect if AuthCertificate fails to
+83083:     // set the error code if/when it fails.
+83083:     PR_SetError(0, 0); 
+83083:     SECStatus rv = AuthCertificate(nssShutdownPrevention);
+83083:     if (rv == SECSuccess) {
+83083:       nsRefPtr<SSLServerCertVerificationResult> restart 
+83083:         = new SSLServerCertVerificationResult(*mSocketInfo, 0);
+83083:       restart->Dispatch();
+83083:       return NS_OK;
+83083:     }
+83083: 
+83083:     error = PR_GetError();
+83083:     if (error != 0) {
+83083:       rv = HandleBadCertificate(error, mSocketInfo, *mCert, mFdForLogging,
+83083:                                 nssShutdownPrevention);
+83083:       if (rv == SECSuccess) {
+83083:         // The CertErrorRunnable will run on the main thread and it will dispatch
+83083:         // the cert verification result to the socket transport thread, so we
+83083:         // don't have to. This way, this verification thread doesn't need to
+83083:         // wait for the CertErrorRunnable to complete.
+83083:         return NS_OK; 
+83083:       }
+83083:       // DispatchCertErrorRunnable set a new error code.
+83083:       error = PR_GetError(); 
+83083:     }
+83083:   }
+83083: 
+83083:   if (error == 0) {
+83083:     NS_NOTREACHED("no error set during certificate validation failure");
+83083:     error = PR_INVALID_STATE_ERROR;
+83083:   }
+83083: 
+83083:   nsRefPtr<SSLServerCertVerificationResult> failure
+83083:     = new SSLServerCertVerificationResult(*mSocketInfo, error);
+83083:   failure->Dispatch();
+83083:   return NS_OK;
+83083: }
+83083: 
+83083: } // unnamed namespace
+83083: 
+83083: // Extracts whatever information we need out of fd (using SSL_*) and passes it
+83083: // to SSLServerCertVerificationJob::Dispatch. SSLServerCertVerificationJob should
+83083: // never do anything with fd except logging.
+83083: SECStatus
+83083: AuthCertificateHook(void *arg, PRFileDesc *fd, PRBool checkSig, PRBool isServer)
+83083: {
+83083:   // Runs on the socket transport thread
+83083: 
+83083:   PR_LOG(gPIPNSSLog, PR_LOG_DEBUG,
+83083:          ("[%p] starting AuthCertificateHook\n", fd));
+83083: 
+83083:   // Modern libssl always passes PR_TRUE for checkSig, and we have no means of
+83083:   // doing verification without checking signatures.
+83083:   NS_ASSERTION(checkSig, "AuthCertificateHook: checkSig unexpectedly false");
+83083: 
+83083:   // PSM never causes libssl to call this function with PR_TRUE for isServer,
+83083:   // and many things in PSM assume that we are a client.
+83083:   NS_ASSERTION(!isServer, "AuthCertificateHook: isServer unexpectedly true");
+83083: 
+83083:   if (!checkSig || isServer) {
+83083:       PR_SetError(PR_INVALID_STATE_ERROR, 0);
+83083:       return SECFailure;
+83083:   }
+83083:       
+83083:   CERTCertificate *serverCert = SSL_PeerCertificate(fd);
+83083: 
+83083:   nsNSSSocketInfo *socketInfo = static_cast<nsNSSSocketInfo*>(arg);
+83083:   SECStatus rv = SSLServerCertVerificationJob::Dispatch(
+83083:                         static_cast<const void *>(fd), socketInfo, serverCert);
+83083: 
+83083:   CERT_DestroyCertificate(serverCert);
+83083: 
+83083:   return rv;
+83083: }
+83083: 
+83083: SSLServerCertVerificationResult::SSLServerCertVerificationResult(
+83083:         nsNSSSocketInfo & socketInfo, PRErrorCode errorCode,
+83083:         SSLErrorMessageType errorMessageType)
+83083:   : mSocketInfo(&socketInfo)
+83083:   , mErrorCode(errorCode)
+83083:   , mErrorMessageType(errorMessageType)
+83083: {
+83083: }
+83083: 
+83083: void
+83083: SSLServerCertVerificationResult::Dispatch()
+83083: {
+83083:   nsresult rv;
+83083:   nsCOMPtr<nsIEventTarget> stsTarget
+83083:     = do_GetService(NS_SOCKETTRANSPORTSERVICE_CONTRACTID, &rv);
+83083:   NS_ASSERTION(stsTarget,
+83083:                "Failed to get socket transport service event target");
+83083:   rv = stsTarget->Dispatch(this, NS_DISPATCH_NORMAL);
+83083:   NS_ASSERTION(NS_SUCCEEDED(rv), 
+83083:                "Failed to dispatch SSLServerCertVerificationResult");
+83083: }
+83083: 
+83083: NS_IMETHODIMP
+83083: SSLServerCertVerificationResult::Run()
+83083: {
+83083:   // TODO: Assert that we're on the socket transport thread
+83083:   mSocketInfo->SetCertVerificationResult(mErrorCode, mErrorMessageType);
+83083:   return NS_OK;
+83083: }
+83083: 
+83083: } } // namespace mozilla::psm

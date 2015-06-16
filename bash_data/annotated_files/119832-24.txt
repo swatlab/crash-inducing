@@ -1,0 +1,818 @@
+     1: /* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*-
+     1:  *
+ 99778:  * This Source Code Form is subject to the terms of the Mozilla Public
+ 99778:  * License, v. 2.0. If a copy of the MPL was not distributed with this
+ 99778:  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+     1: 
+119832: extern "C" {
+     1: #include "secdert.h"
+119832: }
+     1: #include "nspr.h"
+     1: #include "nsNSSComponent.h" // for PIPNSS string bundle calls.
+     1: #include "keyhi.h"
+     1: #include "secder.h"
+     1: #include "cryptohi.h"
+     1: #include "base64.h"
+     1: #include "secasn1.h"
+119832: extern "C" {
+     1: #include "pk11pqg.h"
+119832: }
+     1: #include "nsKeygenHandler.h"
+ 29263: #include "nsVoidArray.h"
+     1: #include "nsIServiceManager.h"
+     1: #include "nsIDOMHTMLSelectElement.h"
+     1: #include "nsIContent.h"
+     1: #include "nsKeygenThread.h"
+     1: #include "nsReadableUtils.h"
+     1: #include "nsUnicharUtils.h"
+     1: #include "nsCRT.h"
+     1: #include "nsITokenDialogs.h"
+     1: #include "nsIGenKeypairInfoDlg.h"
+     1: #include "nsNSSShutDown.h"
+     1: 
+     1: //These defines are taken from the PKCS#11 spec
+     1: #define CKM_RSA_PKCS_KEY_PAIR_GEN     0x00000000
+     1: #define CKM_DH_PKCS_KEY_PAIR_GEN      0x00000020
+     1: #define CKM_DSA_KEY_PAIR_GEN          0x00000010
+     1: 
+  8177: DERTemplate SECAlgorithmIDTemplate[] = {
+  8177:     { DER_SEQUENCE,
+119832:           0, NULL, sizeof(SECAlgorithmID) },
+  8177:     { DER_OBJECT_ID,
+  8177:           offsetof(SECAlgorithmID,algorithm), },
+  8177:     { DER_OPTIONAL | DER_ANY,
+  8177:           offsetof(SECAlgorithmID,parameters), },
+  8177:     { 0, }
+  8177: };
+  8177: 
+     1: DERTemplate CERTSubjectPublicKeyInfoTemplate[] = {
+     1:     { DER_SEQUENCE,
+106838:           0, nullptr, sizeof(CERTSubjectPublicKeyInfo) },
+     1:     { DER_INLINE,
+     1:           offsetof(CERTSubjectPublicKeyInfo,algorithm),
+     1:           SECAlgorithmIDTemplate, },
+     1:     { DER_BIT_STRING,
+     1:           offsetof(CERTSubjectPublicKeyInfo,subjectPublicKey), },
+     1:     { 0, }
+     1: };
+     1: 
+     1: DERTemplate CERTPublicKeyAndChallengeTemplate[] =
+     1: {
+106838:     { DER_SEQUENCE, 0, nullptr, sizeof(CERTPublicKeyAndChallenge) },
+     1:     { DER_ANY, offsetof(CERTPublicKeyAndChallenge,spki), },
+     1:     { DER_IA5_STRING, offsetof(CERTPublicKeyAndChallenge,challenge), },
+     1:     { 0, }
+     1: };
+     1: 
+     1: const SEC_ASN1Template SECKEY_PQGParamsTemplate[] = {
+119832:     { SEC_ASN1_SEQUENCE, 0, NULL, sizeof(PQGParams) },
+     1:     { SEC_ASN1_INTEGER, offsetof(PQGParams,prime) },
+     1:     { SEC_ASN1_INTEGER, offsetof(PQGParams,subPrime) },
+     1:     { SEC_ASN1_INTEGER, offsetof(PQGParams,base) },
+     1:     { 0, }
+     1: };
+     1: 
+     1: 
+     1: static NS_DEFINE_IID(kIDOMHTMLSelectElementIID, NS_IDOMHTMLSELECTELEMENT_IID);
+     1: static NS_DEFINE_CID(kNSSComponentCID, NS_NSSCOMPONENT_CID);
+     1: 
+     1: static PQGParams *
+     1: decode_pqg_params(char *aStr)
+     1: {
+106838:     unsigned char *buf = nullptr;
+     1:     unsigned int len;
+119200:     PLArenaPool *arena = nullptr;
+106838:     PQGParams *params = nullptr;
+     1:     SECStatus status;
+     1: 
+     1:     arena = PORT_NewArena(DER_DEFAULT_CHUNKSIZE);
+     1:     if (!arena)
+106838:         return nullptr;
+     1: 
+  3233:     params = static_cast<PQGParams*>(PORT_ArenaZAlloc(arena, sizeof(PQGParams)));
+     1:     if (!params)
+     1:         goto loser;
+     1:     params->arena = arena;
+     1: 
+     1:     buf = ATOB_AsciiToData(aStr, &len);
+     1:     if ((!buf) || (len == 0))
+     1:         goto loser;
+     1: 
+     1:     status = SEC_ASN1Decode(arena, params, SECKEY_PQGParamsTemplate, (const char*)buf, len);
+     1:     if (status != SECSuccess)
+     1:         goto loser;
+     1: 
+     1:     return params;
+     1: 
+     1: loser:
+     1:     if (arena) {
+ 80486:       PORT_FreeArena(arena, false);
+     1:     }
+     1:     if (buf) {
+     1:       PR_Free(buf);
+     1:     }
+106838:     return nullptr;
+     1: }
+     1: 
+     1: static int
+     1: pqg_prime_bits(char *str)
+     1: {
+106838:     PQGParams *params = nullptr;
+     1:     int primeBits = 0, i;
+     1: 
+     1:     params = decode_pqg_params(str);
+     1:     if (!params)
+     1:         goto done; /* lose */
+     1: 
+     1:     for (i = 0; params->prime.data[i] == 0; i++)
+     1:         /* empty */;
+     1:     primeBits = (params->prime.len - i) * 8;
+     1: 
+     1: done:
+     1:     if (params)
+     1:         PK11_PQG_DestroyParams(params);
+     1:     return primeBits;
+     1: }
+     1: 
+     1: typedef struct curveNameTagPairStr {
+ 26177:     const char *curveName;
+     1:     SECOidTag curveOidTag;
+     1: } CurveNameTagPair;
+     1: 
+     1: static CurveNameTagPair nameTagPair[] =
+     1: { 
+     1:   { "prime192v1", SEC_OID_ANSIX962_EC_PRIME192V1 },
+     1:   { "prime192v2", SEC_OID_ANSIX962_EC_PRIME192V2 },
+     1:   { "prime192v3", SEC_OID_ANSIX962_EC_PRIME192V3 },
+     1:   { "prime239v1", SEC_OID_ANSIX962_EC_PRIME239V1 },
+     1:   { "prime239v2", SEC_OID_ANSIX962_EC_PRIME239V2 },
+     1:   { "prime239v3", SEC_OID_ANSIX962_EC_PRIME239V3 },
+     1:   { "prime256v1", SEC_OID_ANSIX962_EC_PRIME256V1 },
+     1: 
+     1:   { "secp112r1", SEC_OID_SECG_EC_SECP112R1},
+     1:   { "secp112r2", SEC_OID_SECG_EC_SECP112R2},
+     1:   { "secp128r1", SEC_OID_SECG_EC_SECP128R1},
+     1:   { "secp128r2", SEC_OID_SECG_EC_SECP128R2},
+     1:   { "secp160k1", SEC_OID_SECG_EC_SECP160K1},
+     1:   { "secp160r1", SEC_OID_SECG_EC_SECP160R1},
+     1:   { "secp160r2", SEC_OID_SECG_EC_SECP160R2},
+     1:   { "secp192k1", SEC_OID_SECG_EC_SECP192K1},
+     1:   { "secp192r1", SEC_OID_ANSIX962_EC_PRIME192V1 },
+     1:   { "nistp192", SEC_OID_ANSIX962_EC_PRIME192V1 },
+     1:   { "secp224k1", SEC_OID_SECG_EC_SECP224K1},
+     1:   { "secp224r1", SEC_OID_SECG_EC_SECP224R1},
+     1:   { "nistp224", SEC_OID_SECG_EC_SECP224R1},
+     1:   { "secp256k1", SEC_OID_SECG_EC_SECP256K1},
+     1:   { "secp256r1", SEC_OID_ANSIX962_EC_PRIME256V1 },
+     1:   { "nistp256", SEC_OID_ANSIX962_EC_PRIME256V1 },
+     1:   { "secp384r1", SEC_OID_SECG_EC_SECP384R1},
+     1:   { "nistp384", SEC_OID_SECG_EC_SECP384R1},
+     1:   { "secp521r1", SEC_OID_SECG_EC_SECP521R1},
+     1:   { "nistp521", SEC_OID_SECG_EC_SECP521R1},
+     1: 
+     1:   { "c2pnb163v1", SEC_OID_ANSIX962_EC_C2PNB163V1 },
+     1:   { "c2pnb163v2", SEC_OID_ANSIX962_EC_C2PNB163V2 },
+     1:   { "c2pnb163v3", SEC_OID_ANSIX962_EC_C2PNB163V3 },
+     1:   { "c2pnb176v1", SEC_OID_ANSIX962_EC_C2PNB176V1 },
+     1:   { "c2tnb191v1", SEC_OID_ANSIX962_EC_C2TNB191V1 },
+     1:   { "c2tnb191v2", SEC_OID_ANSIX962_EC_C2TNB191V2 },
+     1:   { "c2tnb191v3", SEC_OID_ANSIX962_EC_C2TNB191V3 },
+     1:   { "c2onb191v4", SEC_OID_ANSIX962_EC_C2ONB191V4 },
+     1:   { "c2onb191v5", SEC_OID_ANSIX962_EC_C2ONB191V5 },
+     1:   { "c2pnb208w1", SEC_OID_ANSIX962_EC_C2PNB208W1 },
+     1:   { "c2tnb239v1", SEC_OID_ANSIX962_EC_C2TNB239V1 },
+     1:   { "c2tnb239v2", SEC_OID_ANSIX962_EC_C2TNB239V2 },
+     1:   { "c2tnb239v3", SEC_OID_ANSIX962_EC_C2TNB239V3 },
+     1:   { "c2onb239v4", SEC_OID_ANSIX962_EC_C2ONB239V4 },
+     1:   { "c2onb239v5", SEC_OID_ANSIX962_EC_C2ONB239V5 },
+     1:   { "c2pnb272w1", SEC_OID_ANSIX962_EC_C2PNB272W1 },
+     1:   { "c2pnb304w1", SEC_OID_ANSIX962_EC_C2PNB304W1 },
+     1:   { "c2tnb359v1", SEC_OID_ANSIX962_EC_C2TNB359V1 },
+     1:   { "c2pnb368w1", SEC_OID_ANSIX962_EC_C2PNB368W1 },
+     1:   { "c2tnb431r1", SEC_OID_ANSIX962_EC_C2TNB431R1 },
+     1: 
+     1:   { "sect113r1", SEC_OID_SECG_EC_SECT113R1},
+     1:   { "sect113r2", SEC_OID_SECG_EC_SECT113R2},
+     1:   { "sect131r1", SEC_OID_SECG_EC_SECT131R1},
+     1:   { "sect131r2", SEC_OID_SECG_EC_SECT131R2},
+     1:   { "sect163k1", SEC_OID_SECG_EC_SECT163K1},
+     1:   { "nistk163", SEC_OID_SECG_EC_SECT163K1},
+     1:   { "sect163r1", SEC_OID_SECG_EC_SECT163R1},
+     1:   { "sect163r2", SEC_OID_SECG_EC_SECT163R2},
+     1:   { "nistb163", SEC_OID_SECG_EC_SECT163R2},
+     1:   { "sect193r1", SEC_OID_SECG_EC_SECT193R1},
+     1:   { "sect193r2", SEC_OID_SECG_EC_SECT193R2},
+     1:   { "sect233k1", SEC_OID_SECG_EC_SECT233K1},
+     1:   { "nistk233", SEC_OID_SECG_EC_SECT233K1},
+     1:   { "sect233r1", SEC_OID_SECG_EC_SECT233R1},
+     1:   { "nistb233", SEC_OID_SECG_EC_SECT233R1},
+     1:   { "sect239k1", SEC_OID_SECG_EC_SECT239K1},
+     1:   { "sect283k1", SEC_OID_SECG_EC_SECT283K1},
+     1:   { "nistk283", SEC_OID_SECG_EC_SECT283K1},
+     1:   { "sect283r1", SEC_OID_SECG_EC_SECT283R1},
+     1:   { "nistb283", SEC_OID_SECG_EC_SECT283R1},
+     1:   { "sect409k1", SEC_OID_SECG_EC_SECT409K1},
+     1:   { "nistk409", SEC_OID_SECG_EC_SECT409K1},
+     1:   { "sect409r1", SEC_OID_SECG_EC_SECT409R1},
+     1:   { "nistb409", SEC_OID_SECG_EC_SECT409R1},
+     1:   { "sect571k1", SEC_OID_SECG_EC_SECT571K1},
+     1:   { "nistk571", SEC_OID_SECG_EC_SECT571K1},
+     1:   { "sect571r1", SEC_OID_SECG_EC_SECT571R1},
+     1:   { "nistb571", SEC_OID_SECG_EC_SECT571R1},
+     1: 
+     1: };
+     1: 
+     1: SECKEYECParams * 
+ 26177: decode_ec_params(const char *curve)
+     1: {
+     1:     SECKEYECParams *ecparams;
+119832:     SECOidData *oidData = NULL;
+     1:     SECOidTag curveOidTag = SEC_OID_UNKNOWN; /* default */
+     1:     int i, numCurves;
+     1: 
+     1:     if (curve && *curve) {
+     1:         numCurves = sizeof(nameTagPair)/sizeof(CurveNameTagPair);
+     1:         for (i = 0; ((i < numCurves) && (curveOidTag == SEC_OID_UNKNOWN)); 
+     1:              i++) {
+     1:             if (PL_strcmp(curve, nameTagPair[i].curveName) == 0)
+     1:                 curveOidTag = nameTagPair[i].curveOidTag;
+     1:         }
+     1:     }
+     1: 
+119832:     /* Return NULL if curve name is not recognized */
+     1:     if ((curveOidTag == SEC_OID_UNKNOWN) || 
+119832:         (oidData = SECOID_FindOIDByTag(curveOidTag)) == NULL) {
+106838:         return nullptr;
+     1:     }
+     1: 
+119832:     ecparams = SECITEM_AllocItem(NULL, NULL, (2 + oidData->oid.len));
+     1: 
+     1:     if (!ecparams)
+106838:       return nullptr;
+     1: 
+     1:     /* 
+     1:      * ecparams->data needs to contain the ASN encoding of an object ID (OID)
+     1:      * representing the named curve. The actual OID is in 
+     1:      * oidData->oid.data so we simply prepend 0x06 and OID length
+     1:      */
+     1:     ecparams->data[0] = SEC_ASN1_OBJECT_ID;
+     1:     ecparams->data[1] = oidData->oid.len;
+     1:     memcpy(ecparams->data + 2, oidData->oid.data, oidData->oid.len);
+     1: 
+     1:     return ecparams;
+     1: }
+     1: 
+     1: NS_IMPL_THREADSAFE_ISUPPORTS1(nsKeygenFormProcessor, nsIFormProcessor)
+     1: 
+     1: nsKeygenFormProcessor::nsKeygenFormProcessor()
+     1: { 
+     1:    m_ctx = new PipUIContext();
+     1: 
+     1: } 
+     1: 
+     1: nsKeygenFormProcessor::~nsKeygenFormProcessor()
+     1: {
+     1: }
+     1: 
+ 46998: nsresult
+     1: nsKeygenFormProcessor::Create(nsISupports* aOuter, const nsIID& aIID, void* *aResult)
+     1: {
+     1:   nsresult rv;
+     1:   NS_ENSURE_NO_AGGREGATION(aOuter);
+     1:   nsKeygenFormProcessor* formProc = new nsKeygenFormProcessor();
+119832:   if (!formProc)
+119832:     return NS_ERROR_OUT_OF_MEMORY;
+     1: 
+     1:   nsCOMPtr<nsISupports> stabilize = formProc;
+     1:   rv = formProc->Init();
+     1:   if (NS_SUCCEEDED(rv)) {
+     1:     rv = formProc->QueryInterface(aIID, aResult);
+     1:   }
+     1:   return rv;
+     1: }
+     1: 
+     1: nsresult
+     1: nsKeygenFormProcessor::Init()
+     1: {
+     1:   nsresult rv;
+     1: 
+     1:   nsCOMPtr<nsINSSComponent> nssComponent;
+     1:   nssComponent = do_GetService(kNSSComponentCID, &rv);
+     1:   if (NS_FAILED(rv))
+     1:     return rv;
+     1: 
+  7878:   // Init possible key size choices.
+  7878:   nssComponent->GetPIPNSSBundleString("HighGrade", mSECKeySizeChoiceList[0].name);
+  7878:   mSECKeySizeChoiceList[0].size = 2048;
+     1: 
+  7878:   nssComponent->GetPIPNSSBundleString("MediumGrade", mSECKeySizeChoiceList[1].name);
+  7878:   mSECKeySizeChoiceList[1].size = 1024;
+     1: 
+     1:   return NS_OK;
+     1: }
+     1: 
+     1: nsresult
+108991: nsKeygenFormProcessor::GetSlot(uint32_t aMechanism, PK11SlotInfo** aSlot)
+     1: {
+     1:   return GetSlotWithMechanism(aMechanism,m_ctx,aSlot);
+     1: }
+     1: 
+     1: 
+108991: uint32_t MapGenMechToAlgoMech(uint32_t mechanism)
+     1: {
+108991:     uint32_t searchMech;
+     1: 
+     1:     /* We are interested in slots based on the ability to perform
+     1:        a given algorithm, not on their ability to generate keys usable
+     1:        by that algorithm. Therefore, map keygen-specific mechanism tags
+     1:        to tags for the corresponding crypto algorthm. */
+     1:     switch(mechanism)
+     1:     {
+     1:     case CKM_RSA_PKCS_KEY_PAIR_GEN:
+     1:         searchMech = CKM_RSA_PKCS;
+     1:         break;
+     1:     case CKM_DSA_KEY_PAIR_GEN:
+     1:         searchMech = CKM_DSA;
+     1:         break;
+     1:     case CKM_RC4_KEY_GEN:
+     1:         searchMech = CKM_RC4;
+     1:         break;
+     1:     case CKM_DH_PKCS_KEY_PAIR_GEN:
+     1:         searchMech = CKM_DH_PKCS_DERIVE; /* ### mwelch  is this right? */
+     1:         break;
+     1:     case CKM_DES_KEY_GEN:
+     1:         /* What do we do about DES keygen? Right now, we're just using
+     1:            DES_KEY_GEN to look for tokens, because otherwise we'll have
+     1:            to search the token list three times. */
+     1:     case CKM_EC_KEY_PAIR_GEN:
+     1:         /* The default should also work for EC key pair generation. */
+     1:     default:
+     1:         searchMech = mechanism;
+     1:         break;
+     1:     }
+     1:     return searchMech;
+     1: }
+     1: 
+     1: 
+     1: nsresult
+108991: GetSlotWithMechanism(uint32_t aMechanism, 
+     1:                      nsIInterfaceRequestor *m_ctx,
+     1:                      PK11SlotInfo** aSlot)
+     1: {
+     1:     nsNSSShutDownPreventionLock locker;
+106838:     PK11SlotList * slotList = nullptr;
+106838:     PRUnichar** tokenNameList = nullptr;
+     1:     nsITokenDialogs * dialogs;
+     1:     PRUnichar *unicodeTokenChosen;
+     1:     PK11SlotListElement *slotElement, *tmpSlot;
+108991:     uint32_t numSlots = 0, i = 0;
+ 79445:     bool canceled;
+     1:     nsresult rv = NS_OK;
+     1: 
+106838:     *aSlot = nullptr;
+     1: 
+     1:     // Get the slot
+     1:     slotList = PK11_GetAllTokens(MapGenMechToAlgoMech(aMechanism), 
+ 80486:                                 true, true, m_ctx);
+     1:     if (!slotList || !slotList->head) {
+     1:         rv = NS_ERROR_FAILURE;
+     1:         goto loser;
+     1:     }
+     1: 
+     1:     if (!slotList->head->next) {
+     1:         /* only one slot available, just return it */
+     1:         *aSlot = slotList->head->slot;
+     1:       } else {
+     1:         // Gerenate a list of slots and ask the user to choose //
+     1:         tmpSlot = slotList->head;
+     1:         while (tmpSlot) {
+     1:             numSlots++;
+     1:             tmpSlot = tmpSlot->next;
+     1:         }
+     1: 
+     1:         // Allocate the slot name buffer //
+  3233:         tokenNameList = static_cast<PRUnichar**>(nsMemory::Alloc(sizeof(PRUnichar *) * numSlots));
+     1:         if (!tokenNameList) {
+     1:             rv = NS_ERROR_OUT_OF_MEMORY;
+     1:             goto loser;
+     1:         }
+     1: 
+     1:         i = 0;
+     1:         slotElement = PK11_GetFirstSafe(slotList);
+     1:         while (slotElement) {
+     1:             tokenNameList[i] = UTF8ToNewUnicode(nsDependentCString(PK11_GetTokenName(slotElement->slot)));
+ 80486:             slotElement = PK11_GetNextSafe(slotList, slotElement, false);
+     1:             if (tokenNameList[i])
+     1:                 i++;
+     1:             else {
+     1:                 // OOM. adjust numSlots so we don't free unallocated memory. 
+     1:                 numSlots = i;
+ 39329:                 PK11_FreeSlotListElement(slotList, slotElement);
+     1:                 rv = NS_ERROR_OUT_OF_MEMORY;
+     1:                 goto loser;
+     1:             }
+     1:         }
+     1: 
+     1: 		/* Throw up the token list dialog and get back the token */
+     1: 		rv = getNSSDialogs((void**)&dialogs,
+     1: 			               NS_GET_IID(nsITokenDialogs),
+     1:                      NS_TOKENDIALOGS_CONTRACTID);
+     1: 
+     1: 		if (NS_FAILED(rv)) goto loser;
+     1: 
+     1:     {
+     1:       nsPSMUITracker tracker;
+     1:       if (!tokenNameList || !*tokenNameList) {
+     1:           rv = NS_ERROR_OUT_OF_MEMORY;
+     1:       }
+     1:       else if (tracker.isUIForbidden()) {
+     1:         rv = NS_ERROR_NOT_AVAILABLE;
+     1:       }
+     1:       else {
+  7024:         rv = dialogs->ChooseToken(m_ctx, (const PRUnichar**)tokenNameList, numSlots, &unicodeTokenChosen, &canceled);
+     1:       }
+     1:     }
+     1: 		NS_RELEASE(dialogs);
+     1: 		if (NS_FAILED(rv)) goto loser;
+     1: 
+     1: 		if (canceled) { rv = NS_ERROR_NOT_AVAILABLE; goto loser; }
+     1: 
+     1:         // Get the slot //
+     1:         slotElement = PK11_GetFirstSafe(slotList);
+     1:         nsAutoString tokenStr(unicodeTokenChosen);
+     1:         while (slotElement) {
+     1:             if (tokenStr.Equals(NS_ConvertUTF8toUTF16(PK11_GetTokenName(slotElement->slot)))) {
+     1:                 *aSlot = slotElement->slot;
+ 39329:                 PK11_FreeSlotListElement(slotList, slotElement);
+     1:                 break;
+     1:             }
+ 80486:             slotElement = PK11_GetNextSafe(slotList, slotElement, false);
+     1:         }
+     1:         if(!(*aSlot)) {
+     1:             rv = NS_ERROR_FAILURE;
+     1:             goto loser;
+     1:         }
+     1:       }
+     1: 
+     1:       // Get a reference to the slot //
+     1:       PK11_ReferenceSlot(*aSlot);
+     1: loser:
+     1:       if (slotList) {
+     1:           PK11_FreeSlotList(slotList);
+     1:       }
+     1:       if (tokenNameList) {
+     1:           NS_FREE_XPCOM_ALLOCATED_POINTER_ARRAY(numSlots, tokenNameList);
+     1:       }
+     1:       return rv;
+     1: }
+     1: 
+     1: nsresult
+     1: nsKeygenFormProcessor::GetPublicKey(nsAString& aValue, nsAString& aChallenge, 
+     1: 				    nsAFlatString& aKeyType,
+     1: 				    nsAString& aOutPublicKey, nsAString& aKeyParams)
+     1: {
+     1:     nsNSSShutDownPreventionLock locker;
+     1:     nsresult rv = NS_ERROR_FAILURE;
+106838:     char *keystring = nullptr;
+106838:     char *keyparamsString = nullptr, *str = nullptr;
+108991:     uint32_t keyGenMechanism;
+108991:     int32_t primeBits;
+106838:     PK11SlotInfo *slot = nullptr;
+     1:     PK11RSAGenParams rsaParams;
+     1:     SECOidTag algTag;
+     1:     int keysize = 0;
+     1:     void *params;
+106838:     SECKEYPrivateKey *privateKey = nullptr;
+106838:     SECKEYPublicKey *publicKey = nullptr;
+106838:     CERTSubjectPublicKeyInfo *spkInfo = nullptr;
+119200:     PLArenaPool *arena = nullptr;
+     1:     SECStatus sec_rv = SECFailure;
+     1:     SECItem spkiItem;
+     1:     SECItem pkacItem;
+     1:     SECItem signedItem;
+     1:     CERTPublicKeyAndChallenge pkac;
+106838:     pkac.challenge.data = nullptr;
+     1:     nsIGeneratingKeypairInfoDialogs * dialogs;
+     1:     nsKeygenThread *KeygenRunnable = 0;
+     1:     nsCOMPtr<nsIKeygenThread> runnable;
+     1:     
+ 93708:     // permanent and sensitive flags for keygen
+ 93708:     PK11AttrFlags attrFlags = PK11_ATTR_TOKEN | PK11_ATTR_SENSITIVE | PK11_ATTR_PRIVATE;
+ 93708: 
+     1:     // Get the key size //
+  7878:     for (size_t i = 0; i < number_of_key_size_choices; ++i) {
+  7878:         if (aValue.Equals(mSECKeySizeChoiceList[i].name)) {
+  7878:             keysize = mSECKeySizeChoiceList[i].size;
+     1:             break;
+     1:         }
+     1:     }
+     1:     if (!keysize) {
+     1:         goto loser;
+     1:     }
+     1: 
+     1:     arena = PORT_NewArena(DER_DEFAULT_CHUNKSIZE);
+     1:     if (!arena) {
+     1:         goto loser;
+     1:     }
+     1: 
+     1:     // Set the keygen mechanism
+     1:     if (aKeyType.IsEmpty() || aKeyType.LowerCaseEqualsLiteral("rsa")) {
+     1:         keyGenMechanism = CKM_RSA_PKCS_KEY_PAIR_GEN;
+     1:     } else if (aKeyType.LowerCaseEqualsLiteral("dsa")) {
+     1:         char * end;
+     1:         keyparamsString = ToNewCString(aKeyParams);
+     1:         if (!keyparamsString) {
+     1:             rv = NS_ERROR_OUT_OF_MEMORY;
+     1:             goto loser;
+     1:         }
+     1: 
+     1:         keyGenMechanism = CKM_DSA_KEY_PAIR_GEN;
+     1:         if (strcmp(keyparamsString, "null") == 0)
+     1:             goto loser;
+     1:         str = keyparamsString;
+ 79445:         bool found_match = false;
+     1:         do {
+     1:             end = strchr(str, ',');
+119832:             if (end != nullptr)
+     1:                 *end = '\0';
+     1:             primeBits = pqg_prime_bits(str);
+ 64062:             if (keysize == primeBits) {
+ 80486:                 found_match = true;
+ 64062:                 break;
+ 64062:             }
+     1:             str = end + 1;
+119832:         } while (end != nullptr);
+ 64062:         if (!found_match) {
+     1:             goto loser;
+ 64062:         }
+     1:     } else if (aKeyType.LowerCaseEqualsLiteral("ec")) {
+     1:         keyparamsString = ToNewCString(aKeyParams);
+     1:         if (!keyparamsString) {
+     1:             rv = NS_ERROR_OUT_OF_MEMORY;
+     1:             goto loser;
+     1:         }
+     1: 
+     1:         keyGenMechanism = CKM_EC_KEY_PAIR_GEN;
+     1:         /* ecParams are initialized later */
+     1:     } else {
+     1:         goto loser;
+     1:     }
+     1: 
+     1:     // Get the slot
+     1:     rv = GetSlot(keyGenMechanism, &slot);
+     1:     if (NS_FAILED(rv)) {
+     1:         goto loser;
+     1:     }
+     1:     switch (keyGenMechanism) {
+     1:         case CKM_RSA_PKCS_KEY_PAIR_GEN:
+     1:             rsaParams.keySizeInBits = keysize;
+     1:             rsaParams.pe = DEFAULT_RSA_KEYGEN_PE;
+     1:             algTag = DEFAULT_RSA_KEYGEN_ALG;
+     1:             params = &rsaParams;
+     1:             break;
+     1:         case CKM_DSA_KEY_PAIR_GEN:
+     1:             // XXX Fix this! XXX //
+     1:             goto loser;
+     1:         case CKM_EC_KEY_PAIR_GEN:
+     1:             /* XXX We ought to rethink how the KEYGEN tag is 
+     1:              * displayed. The pulldown selections presented
+     1:              * to the user must depend on the keytype.
+     1:              * The displayed selection could be picked
+     1:              * from the keyparams attribute (this is currently called
+     1:              * the pqg attribute).
+     1:              * For now, we pick ecparams from the keyparams field
+     1:              * if it specifies a valid supported curve, or else 
+     1:              * we pick one of secp384r1, secp256r1 or secp192r1
+     1:              * respectively depending on the user's selection
+     1:              * (High, Medium, Low). 
+     1:              * (RSA uses RSA-2048, RSA-1024 and RSA-512 for historical
+     1:              * reasons, while ECC choices represent a stronger mapping)
+     1:              * NOTE: The user's selection
+     1:              * is silently ignored when a valid curve is presented
+     1:              * in keyparams.
+     1:              */
+106838:             if ((params = decode_ec_params(keyparamsString)) == nullptr) {
+     1:                 /* The keyparams attribute did not specify a valid
+     1:                  * curve name so use a curve based on the keysize.
+     1:                  * NOTE: Here keysize is used only as an indication of
+     1:                  * High/Medium/Low strength; elliptic curve
+     1:                  * cryptography uses smaller keys than RSA to provide
+     1:                  * equivalent security.
+     1:                  */
+     1:                 switch (keysize) {
+     1:                 case 2048:
+     1:                     params = decode_ec_params("secp384r1");
+     1:                     break;
+     1:                 case 1024:
+     1:                 case 512:
+     1:                     params = decode_ec_params("secp256r1");
+     1:                     break;
+     1:                 } 
+     1:             }
+     1:             /* XXX The signature algorithm ought to choose the hashing
+     1:              * algorithm based on key size once ECDSA variations based
+     1:              * on SHA256 SHA384 and SHA512 are standardized.
+     1:              */
+     1:             algTag = SEC_OID_ANSIX962_ECDSA_SIGNATURE_WITH_SHA1_DIGEST;
+     1:             break;
+     1:       default:
+     1:           goto loser;
+     1:       }
+     1: 
+     1:     /* Make sure token is initialized. */
+     1:     rv = setPassword(slot, m_ctx);
+     1:     if (NS_FAILED(rv))
+     1:         goto loser;
+     1: 
+ 80486:     sec_rv = PK11_Authenticate(slot, true, m_ctx);
+     1:     if (sec_rv != SECSuccess) {
+     1:         goto loser;
+     1:     }
+     1: 
+     1:     rv = getNSSDialogs((void**)&dialogs,
+     1:                        NS_GET_IID(nsIGeneratingKeypairInfoDialogs),
+     1:                        NS_GENERATINGKEYPAIRINFODIALOGS_CONTRACTID);
+     1: 
+     1:     if (NS_SUCCEEDED(rv)) {
+     1:         KeygenRunnable = new nsKeygenThread();
+ 64061:         NS_IF_ADDREF(KeygenRunnable);
+     1:     }
+     1: 
+     1:     if (NS_FAILED(rv) || !KeygenRunnable) {
+     1:         rv = NS_OK;
+ 93708:         privateKey = PK11_GenerateKeyPairWithFlags(slot, keyGenMechanism, params,
+ 93708:                                                    &publicKey, attrFlags, m_ctx);
+     1:     } else {
+106838:         KeygenRunnable->SetParams( slot, attrFlags, nullptr, 0,
+ 93708:                                    keyGenMechanism, params, m_ctx );
+     1: 
+     1:         runnable = do_QueryInterface(KeygenRunnable);
+     1:         
+     1:         if (runnable) {
+     1:             {
+     1:               nsPSMUITracker tracker;
+     1:               if (tracker.isUIForbidden()) {
+     1:                 rv = NS_ERROR_NOT_AVAILABLE;
+     1:               }
+     1:               else {
+     1:                 rv = dialogs->DisplayGeneratingKeypairInfo(m_ctx, runnable);
+     1:                 // We call join on the thread, 
+     1:                 // so we can be sure that no simultaneous access to the passed parameters will happen.
+     1:                 KeygenRunnable->Join();
+     1:               }
+     1:             }
+     1: 
+     1:             NS_RELEASE(dialogs);
+     1:             if (NS_SUCCEEDED(rv)) {
+106838:                 PK11SlotInfo *used_slot = nullptr;
+ 93708:                 rv = KeygenRunnable->ConsumeResult(&used_slot, &privateKey, &publicKey);
+ 93708:                 if (NS_SUCCEEDED(rv) && used_slot) {
+ 93708:                   PK11_FreeSlot(used_slot);
+ 93708:                 }
+     1:             }
+     1:         }
+     1:     }
+     1:     
+     1:     if (NS_FAILED(rv) || !privateKey) {
+     1:         goto loser;
+     1:     }
+     1:     // just in case we'll need to authenticate to the db -jp //
+     1:     privateKey->wincx = m_ctx;
+     1: 
+     1:     /*
+     1:      * Create a subject public key info from the public key.
+     1:      */
+     1:     spkInfo = SECKEY_CreateSubjectPublicKeyInfo(publicKey);
+     1:     if ( !spkInfo ) {
+     1:         goto loser;
+     1:     }
+     1:     
+     1:     /*
+     1:      * Now DER encode the whole subjectPublicKeyInfo.
+     1:      */
+     1:     sec_rv=DER_Encode(arena, &spkiItem, CERTSubjectPublicKeyInfoTemplate, spkInfo);
+     1:     if (sec_rv != SECSuccess) {
+     1:         goto loser;
+     1:     }
+     1: 
+     1:     /*
+     1:      * set up the PublicKeyAndChallenge data structure, then DER encode it
+     1:      */
+     1:     pkac.spki = spkiItem;
+     1:     pkac.challenge.len = aChallenge.Length();
+     1:     pkac.challenge.data = (unsigned char *)ToNewCString(aChallenge);
+     1:     if (!pkac.challenge.data) {
+     1:         rv = NS_ERROR_OUT_OF_MEMORY;
+     1:         goto loser;
+     1:     }
+     1:     
+     1:     sec_rv = DER_Encode(arena, &pkacItem, CERTPublicKeyAndChallengeTemplate, &pkac);
+     1:     if ( sec_rv != SECSuccess ) {
+     1:         goto loser;
+     1:     }
+     1: 
+     1:     /*
+     1:      * now sign the DER encoded PublicKeyAndChallenge
+     1:      */
+     1:     sec_rv = SEC_DerSignData(arena, &signedItem, pkacItem.data, pkacItem.len,
+     1: 			 privateKey, algTag);
+     1:     if ( sec_rv != SECSuccess ) {
+     1:         goto loser;
+     1:     }
+     1:     
+     1:     /*
+     1:      * Convert the signed public key and challenge into base64/ascii.
+     1:      */
+     1:     keystring = BTOA_DataToAscii(signedItem.data, signedItem.len);
+     1:     if (!keystring) {
+     1:         rv = NS_ERROR_OUT_OF_MEMORY;
+     1:         goto loser;
+     1:     }
+     1: 
+     1:     CopyASCIItoUTF16(keystring, aOutPublicKey);
+     1:     nsCRT::free(keystring);
+     1: 
+     1:     rv = NS_OK;
+     1: loser:
+     1:     if ( sec_rv != SECSuccess ) {
+     1:         if ( privateKey ) {
+     1:             PK11_DestroyTokenObject(privateKey->pkcs11Slot,privateKey->pkcs11ID);
+     1:         }
+     1:         if ( publicKey ) {
+     1:             PK11_DestroyTokenObject(publicKey->pkcs11Slot,publicKey->pkcs11ID);
+     1:         }
+     1:     }
+     1:     if ( spkInfo ) {
+     1:         SECKEY_DestroySubjectPublicKeyInfo(spkInfo);
+     1:     }
+     1:     if ( publicKey ) {
+     1:         SECKEY_DestroyPublicKey(publicKey);
+     1:     }
+     1:     if ( privateKey ) {
+     1:         SECKEY_DestroyPrivateKey(privateKey);
+     1:     }
+     1:     if ( arena ) {
+ 80486:         PORT_FreeArena(arena, true);
+     1:     }
+119832:     if (slot != nullptr) {
+     1:         PK11_FreeSlot(slot);
+     1:     }
+     1:     if (KeygenRunnable) {
+     1:         NS_RELEASE(KeygenRunnable);
+     1:     }
+     1:     if (keyparamsString) {
+     1:         nsMemory::Free(keyparamsString);
+     1:     }
+     1:     if (pkac.challenge.data) {
+     1:         nsMemory::Free(pkac.challenge.data);
+     1:     }
+     1:     return rv;
+     1: }
+     1: 
+     1: NS_METHOD 
+     1: nsKeygenFormProcessor::ProcessValue(nsIDOMHTMLElement *aElement, 
+     1: 				    const nsAString& aName, 
+     1: 				    nsAString& aValue) 
+     1: { 
+     1:     nsAutoString challengeValue;
+     1:     nsAutoString keyTypeValue;
+     1:     nsAutoString keyParamsValue;
+     1:     
+ 38672:     aElement->GetAttribute(NS_LITERAL_STRING("keytype"), keyTypeValue);
+ 38672:     if (keyTypeValue.IsEmpty()) {
+     1:         // If this field is not present, we default to rsa.
+     1:         keyTypeValue.AssignLiteral("rsa");
+     1:     }
+     1:     
+ 38672:     aElement->GetAttribute(NS_LITERAL_STRING("pqg"), 
+     1:                            keyParamsValue);
+     1:     /* XXX We can still support the pqg attribute in the keygen 
+     1:      * tag for backward compatibility while introducing a more 
+     1:      * general attribute named keyparams.
+     1:      */
+ 38672:     if (keyParamsValue.IsEmpty()) {
+ 38672:         aElement->GetAttribute(NS_LITERAL_STRING("keyparams"), 
+     1:                                keyParamsValue);
+     1:     }
+     1: 
+ 38672:     aElement->GetAttribute(NS_LITERAL_STRING("challenge"), challengeValue);
+ 38672: 
+ 38672:     return GetPublicKey(aValue, challengeValue, keyTypeValue, 
+     1:                         aValue, keyParamsValue);
+     1: } 
+     1: 
+     1: NS_METHOD nsKeygenFormProcessor::ProvideContent(const nsAString& aFormType, 
+ 23904: 						nsTArray<nsString>& aContent, 
+     1: 						nsAString& aAttribute) 
+     1: { 
+     1:   if (Compare(aFormType, NS_LITERAL_STRING("SELECT"), 
+     1:     nsCaseInsensitiveStringComparator()) == 0) {
+  7878: 
+  7878:     for (size_t i = 0; i < number_of_key_size_choices; ++i) {
+ 23904:       aContent.AppendElement(mSECKeySizeChoiceList[i].name);
+     1:     }
+     1:     aAttribute.AssignLiteral("-mozilla-keygen");
+     1:   }
+     1:   return NS_OK;
+     1: } 
+     1: 

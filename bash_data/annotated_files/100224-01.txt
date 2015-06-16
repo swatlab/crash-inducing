@@ -1,0 +1,2318 @@
+ 84549: /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ 84549: /* vim: set sw=2 ts=8 et tw=80 : */
+ 98983: /* This Source Code Form is subject to the terms of the Mozilla Public
+ 98983:  * License, v. 2.0. If a copy of the MPL was not distributed with this
+ 98983:  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 84549: 
+ 84549: #include "nsHttp.h"
+ 99497: #include "SpdySession2.h"
+ 99497: #include "SpdyStream2.h"
+ 84549: #include "nsHttpConnection.h"
+ 88247: #include "nsHttpHandler.h"
+ 84549: #include "prnetdb.h"
+ 84549: #include "mozilla/Telemetry.h"
+ 84549: #include "mozilla/Preferences.h"
+ 84549: #include "prprf.h"
+ 84549: 
+ 84549: #ifdef DEBUG
+ 84549: // defined by the socket transport service while active
+ 84549: extern PRThread *gSocketThread;
+ 84549: #endif
+ 84549: 
+ 84549: namespace mozilla {
+ 84549: namespace net {
+ 84549: 
+ 99497: // SpdySession2 has multiple inheritance of things that implement
+ 84549: // nsISupports, so this magic is taken from nsHttpPipeline that
+ 84549: // implements some of the same abstract classes.
+ 99497: NS_IMPL_THREADSAFE_ADDREF(SpdySession2)
+ 99497: NS_IMPL_THREADSAFE_RELEASE(SpdySession2)
+ 99497: NS_INTERFACE_MAP_BEGIN(SpdySession2)
+ 84549:     NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsAHttpConnection)
+ 84549: NS_INTERFACE_MAP_END
+ 84549: 
+ 99497: SpdySession2::SpdySession2(nsAHttpTransaction *aHttpTransaction,
+ 84549:                          nsISocketTransport *aSocketTransport,
+ 84549:                          PRInt32 firstPriority)
+ 84549:   : mSocketTransport(aSocketTransport),
+ 84549:     mSegmentReader(nsnull),
+ 84549:     mSegmentWriter(nsnull),
+ 99497:     mSendingChunkSize(ASpdySession::kSendingChunkSize),
+ 84549:     mNextStreamID(1),
+ 84549:     mConcurrentHighWater(0),
+ 84549:     mDownstreamState(BUFFERING_FRAME_HEADER),
+ 88247:     mInputFrameBufferSize(kDefaultBufferSize),
+ 88247:     mInputFrameBufferUsed(0),
+ 88247:     mInputFrameDataLast(false),
+ 88247:     mInputFrameDataStream(nsnull),
+ 84549:     mNeedsCleanup(nsnull),
+ 84549:     mDecompressBufferSize(kDefaultBufferSize),
+ 84549:     mDecompressBufferUsed(0),
+ 84549:     mShouldGoAway(false),
+ 84549:     mClosed(false),
+ 84549:     mCleanShutdown(false),
+ 84549:     mGoAwayID(0),
+ 84549:     mMaxConcurrent(kDefaultMaxConcurrent),
+ 84549:     mConcurrent(0),
+ 84549:     mServerPushedResources(0),
+ 84549:     mOutputQueueSize(kDefaultQueueSize),
+ 84549:     mOutputQueueUsed(0),
+ 90872:     mOutputQueueSent(0),
+ 90872:     mLastReadEpoch(PR_IntervalNow()),
+ 90872:     mPingSentEpoch(0),
+ 91115:     mNextPingID(1),
+ 91115:     mPingThresholdExperiment(false)
+ 84549: {
+ 84549:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 84549: 
+ 99497:   LOG3(("SpdySession2::SpdySession2 %p transaction 1 = %p",
+ 84549:         this, aHttpTransaction));
+ 84549:   
+ 84549:   mStreamIDHash.Init();
+ 84549:   mStreamTransactionHash.Init();
+ 84549:   mConnection = aHttpTransaction->Connection();
+ 88247:   mInputFrameBuffer = new char[mInputFrameBufferSize];
+ 84549:   mDecompressBuffer = new char[mDecompressBufferSize];
+ 84549:   mOutputQueueBuffer = new char[mOutputQueueSize];
+ 84549:   zlibInit();
+ 84549:   
+ 88247:   mSendingChunkSize = gHttpHandler->SpdySendingChunkSize();
+ 84549:   AddStream(aHttpTransaction, firstPriority);
+ 90872:   mLastDataReadEpoch = mLastReadEpoch;
+ 91115:   
+ 91115:   DeterminePingThreshold();
+ 91115: }
+ 91115: 
+ 91115: void
+ 99497: SpdySession2::DeterminePingThreshold()
+ 91115: {
+ 91115:   mPingThreshold = gHttpHandler->SpdyPingThreshold();
+ 91115: 
+ 91115:   if (!mPingThreshold || !gHttpHandler->AllowExperiments())
+ 91115:     return;
+ 91115: 
+ 91115:   PRUint32 randomVal = gHttpHandler->Get32BitsOfPseudoRandom();
+ 91115:   
+ 91115:   // Use the lower 10 bits to select 1 in 1024 sessions for the
+ 91115:   // ping threshold experiment. Somewhat less than that will actually be
+ 91115:   // used because random values greater than the total http idle timeout
+ 91115:   // for the session are discarded.
+ 91115:   if ((randomVal & 0x3ff) != 1)  // lottery
+ 91115:     return;
+ 91115:   
+ 91115:   randomVal = randomVal >> 10; // those bits are used up
+ 91115: 
+ 91115:   // This session has been selected - use a random ping threshold of 10 +
+ 91115:   // a random number from 0 to 255, based on the next 8 bits of the
+ 91115:   // random buffer
+ 91115:   PRIntervalTime randomThreshold =
+ 91115:     PR_SecondsToInterval((randomVal & 0xff) + 10);
+ 91115:   if (randomThreshold > gHttpHandler->IdleTimeout())
+ 91115:     return;
+ 91115:   
+ 91115:   mPingThreshold = randomThreshold;
+ 91115:   mPingThresholdExperiment = true;
+ 99497:   LOG3(("SpdySession2 %p Ping Threshold Experimental Selection : %dsec\n",
+ 91115:         this, PR_IntervalToSeconds(mPingThreshold)));
+ 84549: }
+ 84549: 
+ 84549: PLDHashOperator
+ 99497: SpdySession2::ShutdownEnumerator(nsAHttpTransaction *key,
+ 99497:                                 nsAutoPtr<SpdyStream2> &stream,
+ 84549:                                 void *closure)
+ 84549: {
+ 99497:   SpdySession2 *self = static_cast<SpdySession2 *>(closure);
+ 84549:  
+ 88247:   // On a clean server hangup the server sets the GoAwayID to be the ID of
+ 88247:   // the last transaction it processed. If the ID of stream in the
+ 88247:   // local session is greater than that it can safely be restarted because the
+ 88247:   // server guarantees it was not partially processed.
+ 88247:   if (self->mCleanShutdown && (stream->StreamID() > self->mGoAwayID))
+100224:     self->CloseStream(stream, NS_ERROR_NET_RESET); // can be restarted
+ 84549:   else
+100224:     self->CloseStream(stream, NS_ERROR_ABORT);
+ 84549: 
+ 84549:   return PL_DHASH_NEXT;
+ 84549: }
+ 84549: 
+ 99497: SpdySession2::~SpdySession2()
+ 84549: {
+ 99497:   LOG3(("SpdySession2::~SpdySession2 %p mDownstreamState=%X",
+ 84549:         this, mDownstreamState));
+ 84549: 
+ 84549:   inflateEnd(&mDownstreamZlib);
+ 84549:   deflateEnd(&mUpstreamZlib);
+ 84549:   
+ 88247:   mStreamTransactionHash.Enumerate(ShutdownEnumerator, this);
+ 84549:   Telemetry::Accumulate(Telemetry::SPDY_PARALLEL_STREAMS, mConcurrentHighWater);
+ 84549:   Telemetry::Accumulate(Telemetry::SPDY_REQUEST_PER_CONN, (mNextStreamID - 1) / 2);
+ 84549:   Telemetry::Accumulate(Telemetry::SPDY_SERVER_INITIATED_STREAMS,
+ 84549:                         mServerPushedResources);
+ 84549: }
+ 84549: 
+ 84549: void
+ 99497: SpdySession2::LogIO(SpdySession2 *self, SpdyStream2 *stream, const char *label,
+ 84549:                    const char *data, PRUint32 datalen)
+ 84549: {
+ 84549:   if (!LOG4_ENABLED())
+ 84549:     return;
+ 84549:   
+ 99497:   LOG4(("SpdySession2::LogIO %p stream=%p id=0x%X [%s]",
+ 84549:         self, stream, stream ? stream->StreamID() : 0, label));
+ 84549: 
+ 84549:   // Max line is (16 * 3) + 10(prefix) + newline + null
+ 84549:   char linebuf[128];
+ 84549:   PRUint32 index;
+ 84549:   char *line = linebuf;
+ 84549: 
+ 84549:   linebuf[127] = 0;
+ 84549: 
+ 84549:   for (index = 0; index < datalen; ++index) {
+ 84549:     if (!(index % 16)) {
+ 84549:       if (index) {
+ 84549:         *line = 0;
+ 84549:         LOG4(("%s", linebuf));
+ 84549:       }
+ 84549:       line = linebuf;
+ 84549:       PR_snprintf(line, 128, "%08X: ", index);
+ 84549:       line += 10;
+ 84549:     }
+ 84549:     PR_snprintf(line, 128 - (line - linebuf), "%02X ",
+ 84549:                 ((unsigned char *)data)[index]);
+ 84549:     line += 3;
+ 84549:   }
+ 84549:   if (index) {
+ 84549:     *line = 0;
+ 84549:     LOG4(("%s", linebuf));
+ 84549:   }
+ 84549: }
+ 84549: 
+ 99497: typedef nsresult  (*Control_FX) (SpdySession2 *self);
+ 84549: static Control_FX sControlFunctions[] = 
+ 84549: {
+ 84549:   nsnull,
+ 99497:   SpdySession2::HandleSynStream,
+ 99497:   SpdySession2::HandleSynReply,
+ 99497:   SpdySession2::HandleRstStream,
+ 99497:   SpdySession2::HandleSettings,
+ 99497:   SpdySession2::HandleNoop,
+ 99497:   SpdySession2::HandlePing,
+ 99497:   SpdySession2::HandleGoAway,
+ 99497:   SpdySession2::HandleHeaders,
+ 99497:   SpdySession2::HandleWindowUpdate
+ 84549: };
+ 84549: 
+ 84549: bool
+ 99497: SpdySession2::RoomForMoreConcurrent()
+ 84549: {
+ 88247:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 88247: 
+ 84549:   return (mConcurrent < mMaxConcurrent);
+ 84549: }
+ 84549: 
+ 84549: bool
+ 99497: SpdySession2::RoomForMoreStreams()
+ 84549: {
+ 84549:   if (mNextStreamID + mStreamTransactionHash.Count() * 2 > kMaxStreamID)
+ 84549:     return false;
+ 84549: 
+ 84549:   return !mShouldGoAway;
+ 84549: }
+ 84549: 
+ 90872: PRIntervalTime
+ 99497: SpdySession2::IdleTime()
+ 90872: {
+ 90872:   return PR_IntervalNow() - mLastDataReadEpoch;
+ 90872: }
+ 90872: 
+ 90871: void
+ 99497: SpdySession2::ReadTimeoutTick(PRIntervalTime now)
+ 90871: {
+ 90871:     NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 90872:     NS_ABORT_IF_FALSE(mNextPingID & 1, "Ping Counter Not Odd");
+ 90872: 
+ 91115:     if (!mPingThreshold)
+ 90872:       return;
+ 90872: 
+ 99497:     LOG(("SpdySession2::ReadTimeoutTick %p delta since last read %ds\n",
+ 90872:          this, PR_IntervalToSeconds(now - mLastReadEpoch)));
+ 90872: 
+ 91115:     if ((now - mLastReadEpoch) < mPingThreshold) {
+ 90872:       // recent activity means ping is not an issue
+ 91115:       if (mPingSentEpoch)
+ 91115:         ClearPing(true);
+ 90872:       return;
+ 90872:     }
+ 90872: 
+ 90872:     if (mPingSentEpoch) {
+ 99497:       LOG(("SpdySession2::ReadTimeoutTick %p handle outstanding ping\n"));
+ 90872:       if ((now - mPingSentEpoch) >= gHttpHandler->SpdyPingTimeout()) {
+ 99497:         LOG(("SpdySession2::ReadTimeoutTick %p Ping Timer Exhaustion\n",
+ 90872:              this));
+ 91115:         ClearPing(false);
+ 90872:         Close(NS_ERROR_NET_TIMEOUT);
+ 90872:       }
+ 90872:       return;
+ 90872:     }
+ 90872:     
+ 99497:     LOG(("SpdySession2::ReadTimeoutTick %p generating ping 0x%x\n",
+ 90872:          this, mNextPingID));
+ 90872: 
+ 90872:     if (mNextPingID == 0xffffffff) {
+ 99497:       LOG(("SpdySession2::ReadTimeoutTick %p cannot form ping - ids exhausted\n",
+ 90872:            this));
+ 90872:       return;
+ 90872:     }
+ 90872: 
+ 90872:     mPingSentEpoch = PR_IntervalNow();
+ 90872:     if (!mPingSentEpoch)
+ 90872:       mPingSentEpoch = 1; // avoid the 0 sentinel value
+ 90872:     GeneratePing(mNextPingID);
+ 90872:     mNextPingID += 2;
+ 90872: 
+ 90872:     if (mNextPingID == 0xffffffff) {
+ 99497:       LOG(("SpdySession2::ReadTimeoutTick %p "
+ 90872:            "ping ids exhausted marking goaway\n", this));
+ 90872:       mShouldGoAway = true;
+ 90872:     }
+ 90871: }
+ 90871: 
+ 91115: void
+ 99497: SpdySession2::ClearPing(bool pingOK)
+ 91115: {
+ 91115:   mPingSentEpoch = 0;
+ 91115: 
+ 91115:   if (mPingThresholdExperiment) {
+ 99497:     LOG3(("SpdySession2::ClearPing %p mPingThresholdExperiment %dsec %s\n",
+ 91115:           this, PR_IntervalToSeconds(mPingThreshold),
+ 91115:           pingOK ? "pass" :"fail"));
+ 91115: 
+ 91115:     if (pingOK)
+ 91115:       Telemetry::Accumulate(Telemetry::SPDY_PING_EXPERIMENT_PASS,
+ 91115:                             PR_IntervalToSeconds(mPingThreshold));
+ 91115:     else
+ 91115:       Telemetry::Accumulate(Telemetry::SPDY_PING_EXPERIMENT_FAIL,
+ 91115:                             PR_IntervalToSeconds(mPingThreshold));
+ 91115:     mPingThreshold = gHttpHandler->SpdyPingThreshold();
+ 91115:     mPingThresholdExperiment = false;
+ 91115:   }
+ 91115: }
+ 91115: 
+ 84549: PRUint32
+ 99497: SpdySession2::RegisterStreamID(SpdyStream2 *stream)
+ 84549: {
+ 88247:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 88247: 
+ 99497:   LOG3(("SpdySession2::RegisterStreamID session=%p stream=%p id=0x%X "
+ 84549:         "concurrent=%d",this, stream, mNextStreamID, mConcurrent));
+ 84549: 
+ 84549:   NS_ABORT_IF_FALSE(mNextStreamID < 0xfffffff0,
+ 84549:                     "should have stopped admitting streams");
+ 84549:   
+ 84549:   PRUint32 result = mNextStreamID;
+ 84549:   mNextStreamID += 2;
+ 84549: 
+ 84549:   // We've used up plenty of ID's on this session. Start
+ 84549:   // moving to a new one before there is a crunch involving
+ 84549:   // server push streams or concurrent non-registered submits
+ 84549:   if (mNextStreamID >= kMaxStreamID)
+ 84549:     mShouldGoAway = true;
+ 84549: 
+ 98989:   // integrity check
+ 98989:   if (mStreamIDHash.Get(result)) {
+ 98989:     LOG3(("   New ID already present\n"));
+ 98989:     NS_ABORT_IF_FALSE(false, "New ID already present in mStreamIDHash");
+ 98989:     mShouldGoAway = true;
+ 98989:     return kDeadStreamID;
+ 98989:   }
+ 98989: 
+ 84549:   mStreamIDHash.Put(result, stream);
+ 84549:   return result;
+ 84549: }
+ 84549: 
+ 84549: bool
+ 99497: SpdySession2::AddStream(nsAHttpTransaction *aHttpTransaction,
+ 84549:                        PRInt32 aPriority)
+ 84549: {
+ 84549:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 84549:   NS_ABORT_IF_FALSE(!mStreamTransactionHash.Get(aHttpTransaction),
+ 84549:                     "AddStream duplicate transaction pointer");
+ 84549: 
+ 98989:   // integrity check
+ 98989:   if (mStreamTransactionHash.Get(aHttpTransaction)) {
+ 98989:     LOG3(("   New transaction already present\n"));
+ 98989:     NS_ABORT_IF_FALSE(false, "New transaction already present in hash");
+ 98989:     return false;
+ 98989:   }
+ 98989: 
+ 84549:   aHttpTransaction->SetConnection(this);
+ 99497:   SpdyStream2 *stream = new SpdyStream2(aHttpTransaction,
+ 84549:                                       this,
+ 84549:                                       mSocketTransport,
+ 84549:                                       mSendingChunkSize,
+ 84549:                                       &mUpstreamZlib,
+ 84549:                                       aPriority);
+ 84549: 
+ 84549:   
+ 99497:   LOG3(("SpdySession2::AddStream session=%p stream=%p NextID=0x%X (tentative)",
+ 84549:         this, stream, mNextStreamID));
+ 84549: 
+ 84549:   mStreamTransactionHash.Put(aHttpTransaction, stream);
+ 84549: 
+ 84549:   if (RoomForMoreConcurrent()) {
+ 99497:     LOG3(("SpdySession2::AddStream %p stream %p activated immediately.",
+ 84549:           this, stream));
+ 84549:     ActivateStream(stream);
+ 84549:   }
+ 84549:   else {
+ 99497:     LOG3(("SpdySession2::AddStream %p stream %p queued.",
+ 84549:           this, stream));
+ 84549:     mQueuedStreams.Push(stream);
+ 84549:   }
+ 84549:   
+ 84549:   return true;
+ 84549: }
+ 84549: 
+ 84549: void
+ 99497: SpdySession2::ActivateStream(SpdyStream2 *stream)
+ 84549: {
+ 88247:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 88247: 
+ 84549:   mConcurrent++;
+ 84549:   if (mConcurrent > mConcurrentHighWater)
+ 84549:     mConcurrentHighWater = mConcurrent;
+ 99497:   LOG3(("SpdySession2::AddStream %p activating stream %p Currently %d "
+ 84549:         "streams in session, high water mark is %d",
+ 84549:         this, stream, mConcurrent, mConcurrentHighWater));
+ 84549: 
+ 84549:   mReadyForWrite.Push(stream);
+ 88247:   SetWriteCallbacks();
+ 84549: 
+ 84549:   // Kick off the SYN transmit without waiting for the poll loop
+ 98639:   // This won't work for stream id=1 because there is no segment reader
+ 98639:   // yet.
+ 98639:   if (mSegmentReader) {
+ 84549:     PRUint32 countRead;
+ 84549:     ReadSegments(nsnull, kDefaultBufferSize, &countRead);
+ 84549:   }
+ 98639: }
+ 84549: 
+ 84549: void
+ 99497: SpdySession2::ProcessPending()
+ 84549: {
+ 88247:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 88247: 
+ 84549:   while (RoomForMoreConcurrent()) {
+ 99497:     SpdyStream2 *stream = static_cast<SpdyStream2 *>(mQueuedStreams.PopFront());
+ 84549:     if (!stream)
+ 84549:       return;
+ 99497:     LOG3(("SpdySession2::ProcessPending %p stream %p activated from queue.",
+ 84549:           this, stream));
+ 84549:     ActivateStream(stream);
+ 84549:   }
+ 84549: }
+ 84549: 
+ 90872: nsresult
+ 99497: SpdySession2::NetworkRead(nsAHttpSegmentWriter *writer, char *buf,
+ 90872:                          PRUint32 count, PRUint32 *countWritten)
+ 90872: {
+ 90872:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 90872: 
+ 90872:   nsresult rv = writer->OnWriteSegment(buf, count, countWritten);
+ 90872:   if (NS_SUCCEEDED(rv) && *countWritten > 0)
+ 90872:     mLastReadEpoch = PR_IntervalNow();
+ 90872:   return rv;
+ 90872: }
+ 90872: 
+ 84549: void
+ 99497: SpdySession2::SetWriteCallbacks()
+ 84549: {
+ 88247:   if (mConnection && (GetWriteQueueSize() || mOutputQueueUsed))
+ 88247:       mConnection->ResumeSend();
+ 84549: }
+ 84549: 
+ 84549: void
+ 99497: SpdySession2::FlushOutputQueue()
+ 84549: {
+ 84549:   if (!mSegmentReader || !mOutputQueueUsed)
+ 84549:     return;
+ 84549:   
+ 84549:   nsresult rv;
+ 84549:   PRUint32 countRead;
+ 84549:   PRUint32 avail = mOutputQueueUsed - mOutputQueueSent;
+ 84549: 
+ 84549:   rv = mSegmentReader->
+ 84549:     OnReadSegment(mOutputQueueBuffer.get() + mOutputQueueSent, avail,
+ 84549:                                      &countRead);
+ 99497:   LOG3(("SpdySession2::FlushOutputQueue %p sz=%d rv=%x actual=%d",
+ 84549:         this, avail, rv, countRead));
+ 84549:   
+ 84549:   // Dont worry about errors on write, we will pick this up as a read error too
+ 84549:   if (NS_FAILED(rv))
+ 84549:     return;
+ 84549:   
+ 84549:   if (countRead == avail) {
+ 84549:     mOutputQueueUsed = 0;
+ 84549:     mOutputQueueSent = 0;
+ 84549:     return;
+ 84549:   }
+ 84549: 
+ 84549:   mOutputQueueSent += countRead;
+ 84549: 
+ 88247:   // If the output queue is close to filling up and we have sent out a good
+ 88247:   // chunk of data from the beginning then realign it.
+ 88247:   
+ 88247:   if ((mOutputQueueSent >= kQueueMinimumCleanup) &&
+ 88247:       ((mOutputQueueSize - mOutputQueueUsed) < kQueueTailRoom)) {
+ 84549:     mOutputQueueUsed -= mOutputQueueSent;
+ 84549:     memmove(mOutputQueueBuffer.get(),
+ 84549:             mOutputQueueBuffer.get() + mOutputQueueSent,
+ 84549:             mOutputQueueUsed);
+ 84549:     mOutputQueueSent = 0;
+ 84549:   }
+ 84549: }
+ 84549: 
+ 84549: void
+ 99497: SpdySession2::DontReuse()
+ 84549: {
+ 84549:   mShouldGoAway = true;
+ 84549:   if (!mStreamTransactionHash.Count())
+ 84549:     Close(NS_OK);
+ 84549: }
+ 84549: 
+ 84549: PRUint32
+ 99497: SpdySession2::GetWriteQueueSize()
+ 84549: {
+ 84549:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 84549: 
+ 88248:   return mUrgentForWrite.GetSize() + mReadyForWrite.GetSize();
+ 84549: }
+ 84549: 
+ 84549: void
+ 99497: SpdySession2::ChangeDownstreamState(enum stateType newState)
+ 84549: {
+ 88247:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 88247: 
+ 99497:   LOG3(("SpdyStream2::ChangeDownstreamState() %p from %X to %X",
+ 84549:         this, mDownstreamState, newState));
+ 84549:   mDownstreamState = newState;
+ 88247: }
+ 84549: 
+ 88247: void
+ 99497: SpdySession2::ResetDownstreamState()
+ 88247: {
+ 88247:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 88247: 
+ 99497:   LOG3(("SpdyStream2::ResetDownstreamState() %p", this));
+ 88247:   ChangeDownstreamState(BUFFERING_FRAME_HEADER);
+ 88247: 
+ 88247:   if (mInputFrameDataLast && mInputFrameDataStream) {
+ 88247:     mInputFrameDataLast = false;
+ 88247:     if (!mInputFrameDataStream->RecvdFin()) {
+ 88247:       mInputFrameDataStream->SetRecvdFin(true);
+ 84549:       --mConcurrent;
+ 84549:       ProcessPending();
+ 84549:     }
+ 84549:   }
+ 88247:   mInputFrameBufferUsed = 0;
+ 88247:   mInputFrameDataStream = nsnull;
+ 84549: }
+ 84549: 
+ 84549: void
+ 99497: SpdySession2::EnsureBuffer(nsAutoArrayPtr<char> &buf,
+ 84549:                           PRUint32 newSize,
+ 84549:                           PRUint32 preserve,
+ 84549:                           PRUint32 &objSize)
+ 84549: {
+ 84549:   if (objSize >= newSize)
+ 84549:       return;
+ 84549:   
+ 88247:   // Leave a little slop on the new allocation - add 2KB to
+ 88247:   // what we need and then round the result up to a 4KB (page)
+ 88247:   // boundary.
+ 88247: 
+ 88247:   objSize = (newSize + 2048 + 4095) & ~4095;
+ 88247:   
+ 84549:   nsAutoArrayPtr<char> tmp(new char[objSize]);
+ 84549:   memcpy(tmp, buf, preserve);
+ 84549:   buf = tmp;
+ 84549: }
+ 84549: 
+ 84549: void
+ 99497: SpdySession2::zlibInit()
+ 84549: {
+ 99497:   mDownstreamZlib.zalloc = SpdyStream2::zlib_allocator;
+ 99497:   mDownstreamZlib.zfree = SpdyStream2::zlib_destructor;
+ 84549:   mDownstreamZlib.opaque = Z_NULL;
+ 84549: 
+ 84549:   inflateInit(&mDownstreamZlib);
+ 84549: 
+ 99497:   mUpstreamZlib.zalloc = SpdyStream2::zlib_allocator;
+ 99497:   mUpstreamZlib.zfree = SpdyStream2::zlib_destructor;
+ 84549:   mUpstreamZlib.opaque = Z_NULL;
+ 84549: 
+ 84549:   deflateInit(&mUpstreamZlib, Z_DEFAULT_COMPRESSION);
+ 84549:   deflateSetDictionary(&mUpstreamZlib,
+ 84549:                        reinterpret_cast<const unsigned char *>
+ 99497:                        (SpdyStream2::kDictionary),
+ 99497:                        strlen(SpdyStream2::kDictionary) + 1);
+ 84549: 
+ 84549: }
+ 84549: 
+ 84549: nsresult
+ 99497: SpdySession2::DownstreamUncompress(char *blockStart, PRUint32 blockLen)
+ 84549: {
+ 84549:   mDecompressBufferUsed = 0;
+ 84549: 
+ 84549:   mDownstreamZlib.avail_in = blockLen;
+ 84549:   mDownstreamZlib.next_in = reinterpret_cast<unsigned char *>(blockStart);
+ 84549: 
+ 84549:   do {
+ 84549:     mDownstreamZlib.next_out =
+ 84549:       reinterpret_cast<unsigned char *>(mDecompressBuffer.get()) +
+ 84549:       mDecompressBufferUsed;
+ 84549:     mDownstreamZlib.avail_out = mDecompressBufferSize - mDecompressBufferUsed;
+ 84549:     int zlib_rv = inflate(&mDownstreamZlib, Z_NO_FLUSH);
+ 84549: 
+ 84549:     if (zlib_rv == Z_NEED_DICT)
+ 84549:       inflateSetDictionary(&mDownstreamZlib,
+ 84549:                            reinterpret_cast<const unsigned char *>
+ 99497:                            (SpdyStream2::kDictionary),
+ 99497:                            strlen(SpdyStream2::kDictionary) + 1);
+ 84549:     
+ 84549:     if (zlib_rv == Z_DATA_ERROR || zlib_rv == Z_MEM_ERROR)
+ 84549:       return NS_ERROR_FAILURE;
+ 84549: 
+ 84549:     mDecompressBufferUsed += mDecompressBufferSize - mDecompressBufferUsed -
+ 84549:       mDownstreamZlib.avail_out;
+ 84549:     
+ 84549:     // When there is no more output room, but input still available then
+ 84549:     // increase the output space
+ 84549:     if (zlib_rv == Z_OK &&
+ 84549:         !mDownstreamZlib.avail_out && mDownstreamZlib.avail_in) {
+ 99497:       LOG3(("SpdySession2::DownstreamUncompress %p Large Headers - so far %d",
+ 84549:             this, mDecompressBufferSize));
+ 84549:       EnsureBuffer(mDecompressBuffer,
+ 84549:                    mDecompressBufferSize + 4096,
+ 84549:                    mDecompressBufferUsed,
+ 84549:                    mDecompressBufferSize);
+ 84549:     }
+ 84549:   }
+ 84549:   while (mDownstreamZlib.avail_in);
+ 84549:   return NS_OK;
+ 84549: }
+ 84549: 
+ 84549: nsresult
+ 99497: SpdySession2::FindHeader(nsCString name,
+ 84549:                         nsDependentCSubstring &value)
+ 84549: {
+ 84549:   const unsigned char *nvpair = reinterpret_cast<unsigned char *>
+ 84549:     (mDecompressBuffer.get()) + 2;
+ 84549:   const unsigned char *lastHeaderByte = reinterpret_cast<unsigned char *>
+ 84549:     (mDecompressBuffer.get()) + mDecompressBufferUsed;
+ 84549:   if (lastHeaderByte < nvpair)
+ 84549:     return NS_ERROR_ILLEGAL_VALUE;
+ 84549:   PRUint16 numPairs =
+ 84549:     PR_ntohs(reinterpret_cast<PRUint16 *>(mDecompressBuffer.get())[0]);
+ 84549:   for (PRUint16 index = 0; index < numPairs; ++index) {
+ 84549:     if (lastHeaderByte < nvpair + 2)
+ 84549:       return NS_ERROR_ILLEGAL_VALUE;
+ 84549:     PRUint32 nameLen = (nvpair[0] << 8) + nvpair[1];
+ 84549:     if (lastHeaderByte < nvpair + 2 + nameLen)
+ 84549:       return NS_ERROR_ILLEGAL_VALUE;
+ 84549:     nsDependentCSubstring nameString =
+ 84549:       Substring(reinterpret_cast<const char *>(nvpair) + 2,
+ 84549:                 reinterpret_cast<const char *>(nvpair) + 2 + nameLen);
+ 84549:     if (lastHeaderByte < nvpair + 4 + nameLen)
+ 84549:       return NS_ERROR_ILLEGAL_VALUE;
+ 84549:     PRUint16 valueLen = (nvpair[2 + nameLen] << 8) + nvpair[3 + nameLen];
+ 84549:     if (lastHeaderByte < nvpair + 4 + nameLen + valueLen)
+ 84549:       return NS_ERROR_ILLEGAL_VALUE;
+ 84549:     if (nameString.Equals(name)) {
+ 84549:       value.Assign(((char *)nvpair) + 4 + nameLen, valueLen);
+ 84549:       return NS_OK;
+ 84549:     }
+ 84549:     nvpair += 4 + nameLen + valueLen;
+ 84549:   }
+ 84549:   return NS_ERROR_NOT_AVAILABLE;
+ 84549: }
+ 84549: 
+ 84549: nsresult
+ 99497: SpdySession2::ConvertHeaders(nsDependentCSubstring &status,
+ 84549:                             nsDependentCSubstring &version)
+ 84549: {
+ 84549:   mFlatHTTPResponseHeaders.Truncate();
+ 84549:   mFlatHTTPResponseHeadersOut = 0;
+ 84549:   mFlatHTTPResponseHeaders.SetCapacity(mDecompressBufferUsed + 64);
+ 84549: 
+ 84549:   // Connection, Keep-Alive and chunked transfer encodings are to be
+ 84549:   // removed.
+ 84549: 
+ 84549:   // Content-Length is 'advisory'.. we will not strip it because it can
+ 84549:   // create UI feedback.
+ 84549:   
+ 84549:   mFlatHTTPResponseHeaders.Append(version);
+ 84549:   mFlatHTTPResponseHeaders.Append(NS_LITERAL_CSTRING(" "));
+ 84549:   mFlatHTTPResponseHeaders.Append(status);
+ 84549:   mFlatHTTPResponseHeaders.Append(NS_LITERAL_CSTRING("\r\n"));
+ 84549: 
+ 84549:   const unsigned char *nvpair = reinterpret_cast<unsigned char *>
+ 84549:     (mDecompressBuffer.get()) + 2;
+ 84549:   const unsigned char *lastHeaderByte = reinterpret_cast<unsigned char *>
+ 84549:     (mDecompressBuffer.get()) + mDecompressBufferUsed;
+ 84549: 
+ 84549:   if (lastHeaderByte < nvpair)
+ 84549:     return NS_ERROR_ILLEGAL_VALUE;
+ 84549: 
+ 84549:   PRUint16 numPairs =
+ 84549:     PR_ntohs(reinterpret_cast<PRUint16 *>(mDecompressBuffer.get())[0]);
+ 84549: 
+ 84549:   for (PRUint16 index = 0; index < numPairs; ++index) {
+ 84549:     if (lastHeaderByte < nvpair + 2)
+ 84549:       return NS_ERROR_ILLEGAL_VALUE;
+ 84549: 
+ 84549:     PRUint32 nameLen = (nvpair[0] << 8) + nvpair[1];
+ 84549:     if (lastHeaderByte < nvpair + 2 + nameLen)
+ 84549:       return NS_ERROR_ILLEGAL_VALUE;
+ 84549: 
+ 84549:     nsDependentCSubstring nameString =
+ 84549:       Substring(reinterpret_cast<const char *>(nvpair) + 2,
+ 84549:                 reinterpret_cast<const char *>(nvpair) + 2 + nameLen);
+ 84549: 
+ 88247:     if (lastHeaderByte < nvpair + 4 + nameLen)
+ 84549:       return NS_ERROR_ILLEGAL_VALUE;
+ 84549: 
+ 88247:     // Look for illegal characters in the nameString.
+ 88247:     // This includes upper case characters and nulls (as they will
+ 88247:     // break the fixup-nulls-in-value-string algorithm)
+ 84549:     // Look for upper case characters in the name. They are illegal.
+ 84549:     for (char *cPtr = nameString.BeginWriting();
+ 84549:          cPtr && cPtr < nameString.EndWriting();
+ 84549:          ++cPtr) {
+ 84549:       if (*cPtr <= 'Z' && *cPtr >= 'A') {
+ 84549:         nsCString toLog(nameString);
+ 84549: 
+ 99497:         LOG3(("SpdySession2::ConvertHeaders session=%p stream=%p "
+ 84549:               "upper case response header found. [%s]\n",
+ 88247:               this, mInputFrameDataStream, toLog.get()));
+ 84549: 
+ 84549:         return NS_ERROR_ILLEGAL_VALUE;
+ 84549:       }
+ 88247: 
+ 88247:       // check for null characters
+ 88247:       if (*cPtr == '\0')
+ 88247:         return NS_ERROR_ILLEGAL_VALUE;
+ 84549:     }
+ 84549: 
+ 84549:     // HTTP Chunked responses are not legal over spdy. We do not need
+ 84549:     // to look for chunked specifically because it is the only HTTP
+ 84549:     // allowed default encoding and we did not negotiate further encodings
+ 84549:     // via TE
+ 84549:     if (nameString.Equals(NS_LITERAL_CSTRING("transfer-encoding"))) {
+ 99497:       LOG3(("SpdySession2::ConvertHeaders session=%p stream=%p "
+ 84549:             "transfer-encoding found. Chunked is invalid and no TE sent.",
+ 88247:             this, mInputFrameDataStream));
+ 84549: 
+ 84549:       return NS_ERROR_ILLEGAL_VALUE;
+ 84549:     }
+ 84549: 
+ 88247:     PRUint16 valueLen = (nvpair[2 + nameLen] << 8) + nvpair[3 + nameLen];
+ 88247:     if (lastHeaderByte < nvpair + 4 + nameLen + valueLen)
+ 88247:       return NS_ERROR_ILLEGAL_VALUE;
+ 88247: 
+ 84549:     if (!nameString.Equals(NS_LITERAL_CSTRING("version")) &&
+ 84549:         !nameString.Equals(NS_LITERAL_CSTRING("status")) &&
+ 84549:         !nameString.Equals(NS_LITERAL_CSTRING("connection")) &&
+ 84549:         !nameString.Equals(NS_LITERAL_CSTRING("keep-alive"))) {
+ 84549:       nsDependentCSubstring valueString =
+ 84549:         Substring(reinterpret_cast<const char *>(nvpair) + 4 + nameLen,
+ 84549:                   reinterpret_cast<const char *>(nvpair) + 4 + nameLen +
+ 84549:                   valueLen);
+ 84549:       
+ 84549:       mFlatHTTPResponseHeaders.Append(nameString);
+ 84549:       mFlatHTTPResponseHeaders.Append(NS_LITERAL_CSTRING(": "));
+ 84549: 
+ 88247:       // expand NULL bytes in the value string
+ 88247:       for (char *cPtr = valueString.BeginWriting();
+ 88247:            cPtr && cPtr < valueString.EndWriting();
+ 88247:            ++cPtr) {
+ 88247:         if (*cPtr != 0) {
+ 88247:           mFlatHTTPResponseHeaders.Append(*cPtr);
+ 88247:           continue;
+ 84549:         }
+ 84549: 
+ 88247:         // NULLs are really "\r\nhdr: "
+ 88247:         mFlatHTTPResponseHeaders.Append(NS_LITERAL_CSTRING("\r\n"));
+ 88247:         mFlatHTTPResponseHeaders.Append(nameString);
+ 88247:         mFlatHTTPResponseHeaders.Append(NS_LITERAL_CSTRING(": "));
+ 88247:       }
+ 88247: 
+ 84549:       mFlatHTTPResponseHeaders.Append(NS_LITERAL_CSTRING("\r\n"));
+ 84549:     }
+ 84549:     nvpair += 4 + nameLen + valueLen;
+ 84549:   }
+ 84549: 
+ 84549:   mFlatHTTPResponseHeaders.Append(
+ 99497:     NS_LITERAL_CSTRING("X-Firefox-Spdy: 2\r\n\r\n"));
+ 84549:   LOG (("decoded response headers are:\n%s",
+ 84549:         mFlatHTTPResponseHeaders.get()));
+ 84549:   
+ 84549:   return NS_OK;
+ 84549: }
+ 84549: 
+ 84549: void
+ 99497: SpdySession2::GeneratePing(PRUint32 aID)
+ 84549: {
+ 84549:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 99497:   LOG3(("SpdySession2::GeneratePing %p 0x%X\n", this, aID));
+ 84549: 
+ 84549:   EnsureBuffer(mOutputQueueBuffer, mOutputQueueUsed + 12,
+ 84549:                mOutputQueueUsed, mOutputQueueSize);
+ 84549:   char *packet = mOutputQueueBuffer.get() + mOutputQueueUsed;
+ 84549:   mOutputQueueUsed += 12;
+ 84549: 
+ 84549:   packet[0] = kFlag_Control;
+ 84549:   packet[1] = 2;                                  /* version 2 */
+ 84549:   packet[2] = 0;
+ 84549:   packet[3] = CONTROL_TYPE_PING;
+ 84549:   packet[4] = 0;                                  /* flags */
+ 84549:   packet[5] = 0;
+ 84549:   packet[6] = 0;
+ 84549:   packet[7] = 4;                                  /* length */
+ 84549:   
+ 84549:   aID = PR_htonl(aID);
+ 84549:   memcpy(packet + 8, &aID, 4);
+ 84549: 
+ 84549:   FlushOutputQueue();
+ 84549: }
+ 84549: 
+ 84549: void
+ 99497: SpdySession2::GenerateRstStream(PRUint32 aStatusCode, PRUint32 aID)
+ 84549: {
+ 84549:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 99497:   LOG3(("SpdySession2::GenerateRst %p 0x%X %d\n", this, aID, aStatusCode));
+ 84549: 
+ 84549:   EnsureBuffer(mOutputQueueBuffer, mOutputQueueUsed + 16,
+ 84549:                mOutputQueueUsed, mOutputQueueSize);
+ 84549:   char *packet = mOutputQueueBuffer.get() + mOutputQueueUsed;
+ 84549:   mOutputQueueUsed += 16;
+ 84549: 
+ 84549:   packet[0] = kFlag_Control;
+ 84549:   packet[1] = 2;                                  /* version 2 */
+ 84549:   packet[2] = 0;
+ 84549:   packet[3] = CONTROL_TYPE_RST_STREAM;
+ 84549:   packet[4] = 0;                                  /* flags */
+ 84549:   packet[5] = 0;
+ 84549:   packet[6] = 0;
+ 84549:   packet[7] = 8;                                  /* length */
+ 84549:   
+ 84549:   aID = PR_htonl(aID);
+ 84549:   memcpy(packet + 8, &aID, 4);
+ 84549:   aStatusCode = PR_htonl(aStatusCode);
+ 84549:   memcpy(packet + 12, &aStatusCode, 4);
+ 84549: 
+ 84549:   FlushOutputQueue();
+ 84549: }
+ 84549: 
+ 84549: void
+ 99497: SpdySession2::GenerateGoAway()
+ 84549: {
+ 84549:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 99497:   LOG3(("SpdySession2::GenerateGoAway %p\n", this));
+ 84549: 
+ 84549:   EnsureBuffer(mOutputQueueBuffer, mOutputQueueUsed + 12,
+ 84549:                mOutputQueueUsed, mOutputQueueSize);
+ 84549:   char *packet = mOutputQueueBuffer.get() + mOutputQueueUsed;
+ 84549:   mOutputQueueUsed += 12;
+ 84549: 
+ 84549:   memset(packet, 0, 12);
+ 84549:   packet[0] = kFlag_Control;
+ 84549:   packet[1] = 2;                                  /* version 2 */
+ 84549:   packet[3] = CONTROL_TYPE_GOAWAY;
+ 84549:   packet[7] = 4;                                  /* data length */
+ 84549:   
+ 84549:   // last-good-stream-id are bytes 8-11, when we accept server push this will
+ 84549:   // need to be set non zero
+ 84549: 
+ 84549:   FlushOutputQueue();
+ 84549: }
+ 84549: 
+ 98989: // perform a bunch of integrity checks on the stream.
+ 98989: // returns true if passed, false (plus LOG and ABORT) if failed.
+ 98989: bool
+ 99497: SpdySession2::VerifyStream(SpdyStream2 *aStream, PRUint32 aOptionalID = 0)
+ 98989: {
+ 98989:   // This is annoying, but at least it is O(1)
+ 98989:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 98989: 
+ 98989:   if (!aStream)
+ 98989:     return true;
+ 98989: 
+ 98989:   PRUint32 test = 0;
+ 98989:   
+ 98989:   do {
+ 98989:     if (aStream->StreamID() == kDeadStreamID)
+ 98989:       break;
+ 98989: 
+ 98989:     nsAHttpTransaction *trans = aStream->Transaction();
+ 98989: 
+ 98989:     test++;  
+ 98989:     if (!trans)
+ 98989:       break;
+ 98989: 
+ 98989:     test++;
+ 98989:     if (mStreamTransactionHash.Get(trans) != aStream)
+ 98989:       break;
+ 98989:     
+ 98989:     if (aStream->StreamID()) {
+ 99497:       SpdyStream2 *idStream = mStreamIDHash.Get(aStream->StreamID());
+ 98989: 
+ 98989:       test++;
+ 98989:       if (idStream != aStream)
+ 98989:         break;
+ 98989: 
+ 98989:       if (aOptionalID) {
+ 98989:         test++;
+ 98989:         if (idStream->StreamID() != aOptionalID)
+ 98989:           break;
+ 98989:       }
+ 98989:     }
+ 98989: 
+ 98989:     // tests passed
+ 98989:     return true;
+ 98989:   } while (0);
+ 98989: 
+ 98989:   LOG(("SpdySession %p VerifyStream Failure %p stream->id=0x%x "
+ 98989:        "optionalID=0x%x trans=%p test=%d\n",
+ 98989:        this, aStream, aStream->StreamID(),
+ 98989:        aOptionalID, aStream->Transaction(), test));
+ 98989:   NS_ABORT_IF_FALSE(false, "VerifyStream");
+ 98989:   return false;
+ 98989: }
+ 98989: 
+ 84549: void
+ 99497: SpdySession2::CleanupStream(SpdyStream2 *aStream, nsresult aResult,
+ 90452:                            rstReason aResetCode)
+ 84549: {
+ 84549:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 99497:   LOG3(("SpdySession2::CleanupStream %p %p 0x%x %X\n",
+ 84549:         this, aStream, aStream->StreamID(), aResult));
+ 84549: 
+ 98989:   if (!VerifyStream(aStream)) {
+ 99497:     LOG(("SpdySession2::CleanupStream failed to verify stream\n"));
+ 98989:     return;
+ 98989:   }
+ 98989: 
+ 84549:   if (!aStream->RecvdFin() && aStream->StreamID()) {
+ 90452:     LOG3(("Stream had not processed recv FIN, sending RST code %X\n",
+ 90452:           aResetCode));
+ 90452:     GenerateRstStream(aResetCode, aStream->StreamID());
+ 84549:     --mConcurrent;
+ 84549:     ProcessPending();
+ 84549:   }
+ 84549:   
+100224:   CloseStream(aStream, aResult);
+100224: 
+100224:   // Remove the stream from the ID hash table. (this one isn't short, which is
+100224:   // why it is hashed.)
+100224:   mStreamIDHash.Remove(aStream->StreamID());
+100224: 
+100224:   // removing from the stream transaction hash will
+100224:   // delete the SpdyStream2 and drop the reference to
+100224:   // its transaction
+100224:   mStreamTransactionHash.Remove(aStream->Transaction());
+100224: 
+100224:   if (mShouldGoAway && !mStreamTransactionHash.Count())
+100224:     Close(NS_OK);
+100224: }
+100224: 
+100224: void
+100224: SpdySession2::CloseStream(SpdyStream2 *aStream, nsresult aResult)
+100224: {
+100224:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+100224:   LOG3(("SpdySession2::CloseStream %p %p 0x%x %X\n",
+100224:         this, aStream, aStream->StreamID(), aResult));
+100224: 
+ 84549:   // Check if partial frame reader
+ 88247:   if (aStream == mInputFrameDataStream) {
+ 84549:     LOG3(("Stream had active partial read frame on close"));
+ 88247:     ChangeDownstreamState(DISCARDING_DATA_FRAME);
+ 88247:     mInputFrameDataStream = nsnull;
+ 84549:   }
+ 84549: 
+ 84549:   // check the streams blocked on write, this is linear but the list
+ 84549:   // should be pretty short.
+ 84549:   PRUint32 size = mReadyForWrite.GetSize();
+ 84549:   for (PRUint32 count = 0; count < size; ++count) {
+ 99497:     SpdyStream2 *stream = static_cast<SpdyStream2 *>(mReadyForWrite.PopFront());
+ 84549:     if (stream != aStream)
+ 84549:       mReadyForWrite.Push(stream);
+ 84549:   }
+ 84549: 
+ 84549:   // Check the streams blocked on urgent (i.e. window update) writing.
+ 84549:   // This should also be short.
+ 84549:   size = mUrgentForWrite.GetSize();
+ 84549:   for (PRUint32 count = 0; count < size; ++count) {
+ 99497:     SpdyStream2 *stream = static_cast<SpdyStream2 *>(mUrgentForWrite.PopFront());
+ 84549:     if (stream != aStream)
+ 84549:       mUrgentForWrite.Push(stream);
+ 84549:   }
+ 84549: 
+ 85056:   // Check the streams queued for activation. Because we normally accept a high
+ 85056:   // level of parallelization this should also be short.
+ 85056:   size = mQueuedStreams.GetSize();
+ 85056:   for (PRUint32 count = 0; count < size; ++count) {
+ 99497:     SpdyStream2 *stream = static_cast<SpdyStream2 *>(mQueuedStreams.PopFront());
+ 85056:     if (stream != aStream)
+ 85056:       mQueuedStreams.Push(stream);
+ 85056:   }
+ 85056: 
+ 84549:   // Send the stream the close() indication
+ 84549:   aStream->Close(aResult);
+ 84549: }
+ 84549: 
+ 84549: nsresult
+ 99497: SpdySession2::HandleSynStream(SpdySession2 *self)
+ 84549: {
+ 84549:   NS_ABORT_IF_FALSE(self->mFrameControlType == CONTROL_TYPE_SYN_STREAM,
+ 84549:                     "wrong control type");
+ 84549:   
+ 88247:   if (self->mInputFrameDataSize < 18) {
+ 99497:     LOG3(("SpdySession2::HandleSynStream %p SYN_STREAM too short data=%d",
+ 88247:           self, self->mInputFrameDataSize));
+ 84549:     return NS_ERROR_ILLEGAL_VALUE;
+ 84549:   }
+ 84549: 
+ 84549:   PRUint32 streamID =
+ 88247:     PR_ntohl(reinterpret_cast<PRUint32 *>(self->mInputFrameBuffer.get())[2]);
+ 87331:   PRUint32 associatedID =
+ 88247:     PR_ntohl(reinterpret_cast<PRUint32 *>(self->mInputFrameBuffer.get())[3]);
+ 84549: 
+ 99497:   LOG3(("SpdySession2::HandleSynStream %p recv SYN_STREAM (push) "
+ 87331:         "for ID 0x%X associated with 0x%X.",
+ 87331:         self, streamID, associatedID));
+ 84549:     
+ 84549:   if (streamID & 0x01) {                   // test for odd stream ID
+ 99497:     LOG3(("SpdySession2::HandleSynStream %p recvd SYN_STREAM id must be even.",
+ 84549:           self));
+ 84549:     return NS_ERROR_ILLEGAL_VALUE;
+ 84549:   }
+ 84549: 
+ 84549:   ++(self->mServerPushedResources);
+ 84549: 
+ 84549:   // Anytime we start using the high bit of stream ID (either client or server)
+ 84549:   // begin to migrate to a new session.
+ 84549:   if (streamID >= kMaxStreamID)
+ 84549:     self->mShouldGoAway = true;
+ 84549: 
+ 87331:   // Need to decompress the headers even though we aren't using them yet in
+ 87331:   // order to keep the compression context consistent for other syn_reply frames
+ 88247:   nsresult rv = self->DownstreamUncompress(self->mInputFrameBuffer + 18,
+ 88247:                                            self->mInputFrameDataSize - 10);
+ 87331:   if (NS_FAILED(rv)) {
+ 99497:     LOG(("SpdySession2::HandleSynStream uncompress failed\n"));
+ 87331:     return rv;
+ 87331:   }
+ 87331: 
+ 84549:   // todo populate cache. For now, just reject server push p3
+ 84549:   self->GenerateRstStream(RST_REFUSED_STREAM, streamID);
+ 88247:   self->ResetDownstreamState();
+ 84549:   return NS_OK;
+ 84549: }
+ 84549: 
+ 84549: nsresult
+ 99497: SpdySession2::SetInputFrameDataStream(PRUint32 streamID)
+ 98989: {
+ 98989:   mInputFrameDataStream = mStreamIDHash.Get(streamID);
+ 98989:   if (VerifyStream(mInputFrameDataStream, streamID))
+ 98989:     return NS_OK;
+ 98989: 
+ 99497:   LOG(("SpdySession2::SetInputFrameDataStream failed to verify 0x%X\n",
+ 98989:        streamID));
+ 98989:   mInputFrameDataStream = nsnull;
+ 98989:   return NS_ERROR_UNEXPECTED;
+ 98989: }
+ 98989: 
+ 98989: nsresult
+ 99497: SpdySession2::HandleSynReply(SpdySession2 *self)
+ 84549: {
+ 84549:   NS_ABORT_IF_FALSE(self->mFrameControlType == CONTROL_TYPE_SYN_REPLY,
+ 84549:                     "wrong control type");
+ 84549: 
+ 88247:   if (self->mInputFrameDataSize < 8) {
+ 99497:     LOG3(("SpdySession2::HandleSynReply %p SYN REPLY too short data=%d",
+ 88247:           self, self->mInputFrameDataSize));
+ 90452:     // A framing error is a session wide error that cannot be recovered
+ 84549:     return NS_ERROR_ILLEGAL_VALUE;
+ 84549:   }
+ 84549:   
+ 90452:   // Uncompress the headers into mDecompressBuffer, leaving them in
+ 90452:   // spdy format for the time being. Make certain to do this
+ 90452:   // step before any error handling that might abort the stream but not
+ 90452:   // the session becuase the session compression context will become
+ 90452:   // inconsistent if all of the compressed data is not processed.
+ 90452:   if (NS_FAILED(self->DownstreamUncompress(self->mInputFrameBuffer + 14,
+ 90452:                                            self->mInputFrameDataSize - 6))) {
+ 99497:     LOG(("SpdySession2::HandleSynReply uncompress failed\n"));
+ 90452:     return NS_ERROR_FAILURE;
+ 90452:   }
+ 90452: 
+ 99497:   LOG3(("SpdySession2::HandleSynReply %p lookup via streamID in syn_reply.\n",
+ 98989:         self));
+ 84549:   PRUint32 streamID =
+ 88247:     PR_ntohl(reinterpret_cast<PRUint32 *>(self->mInputFrameBuffer.get())[2]);
+ 98989:   nsresult rv = self->SetInputFrameDataStream(streamID);
+ 98989:   if (NS_FAILED(rv))
+ 98989:     return rv;
+ 98989: 
+ 88247:   if (!self->mInputFrameDataStream) {
+ 99497:     LOG3(("SpdySession2::HandleSynReply %p lookup streamID in syn_reply "
+ 84549:           "0x%X failed. NextStreamID = 0x%x", self, streamID,
+ 84549:           self->mNextStreamID));
+ 84549:     if (streamID >= self->mNextStreamID)
+ 84549:       self->GenerateRstStream(RST_INVALID_STREAM, streamID);
+ 84549: 
+ 88247:     self->ResetDownstreamState();
+ 84549:     return NS_OK;
+ 84549:   }
+ 84549: 
+ 98989:   rv = self->HandleSynReplyForValidStream();
+ 90452:   if (rv == NS_ERROR_ILLEGAL_VALUE) {
+ 99497:     LOG3(("SpdySession2::HandleSynReply %p PROTOCOL_ERROR detected 0x%X\n",
+ 90452:           self, streamID));
+ 90452:     self->CleanupStream(self->mInputFrameDataStream, rv, RST_PROTOCOL_ERROR);
+ 90452:     self->ResetDownstreamState();
+ 90452:     rv = NS_OK;
+ 90452:   }
+ 88189: 
+ 90452:   return rv;
+ 90452: }
+ 90452: 
+ 90452: // HandleSynReplyForValidStream() returns NS_ERROR_ILLEGAL_VALUE when the stream
+ 90452: // should be reset with a PROTOCOL_ERROR, NS_OK when the SYN_REPLY was
+ 90452: // fine, and any other error is fatal to the session.
+ 90452: nsresult
+ 99497: SpdySession2::HandleSynReplyForValidStream()
+ 90452: {
+ 90452:   if (mInputFrameDataStream->GetFullyOpen()) {
+ 84549:     // "If an endpoint receives multiple SYN_REPLY frames for the same active
+ 84549:     // stream ID, it must drop the stream, and send a RST_STREAM for the
+ 84549:     // stream with the error PROTOCOL_ERROR."
+ 84549:     //
+ 90452:     // If the stream is open then just RST_STREAM and move on, otherwise
+ 90452:     // abort the session
+ 90452:     return mInputFrameDataStream->RecvdFin() ?
+ 90452:       NS_ERROR_ALREADY_OPENED : NS_ERROR_ILLEGAL_VALUE;
+ 90452:   }
+ 90452:   mInputFrameDataStream->SetFullyOpen();
+ 84549: 
+ 90452:   mInputFrameDataLast = mInputFrameBuffer[4] & kFlag_Data_FIN;
+ 84549: 
+ 90452:   if (mInputFrameBuffer[4] & kFlag_Data_UNI) {
+ 84549:     LOG3(("SynReply had unidirectional flag set on it - nonsensical"));
+ 84549:     return NS_ERROR_ILLEGAL_VALUE;
+ 84549:   }
+ 84549: 
+ 99497:   LOG3(("SpdySession2::HandleSynReplyForValidStream %p SYN_REPLY for 0x%X "
+ 90452:         "fin=%d",
+ 90452:         this, mInputFrameDataStream->StreamID(), mInputFrameDataLast));
+ 84549:   
+ 84549:   Telemetry::Accumulate(Telemetry::SPDY_SYN_REPLY_SIZE,
+ 90452:                         mInputFrameDataSize - 6);
+ 90452:   if (mDecompressBufferUsed) {
+ 84549:     PRUint32 ratio =
+ 90452:       (mInputFrameDataSize - 6) * 100 / mDecompressBufferUsed;
+ 84549:     Telemetry::Accumulate(Telemetry::SPDY_SYN_REPLY_RATIO, ratio);
+ 87987:   }
+ 84549: 
+ 84549:   // status and version are required.
+ 84549:   nsDependentCSubstring status, version;
+ 90452:   nsresult rv = FindHeader(NS_LITERAL_CSTRING("status"), status);
+ 90452:   if (NS_FAILED(rv))
+ 90452:     return (rv == NS_ERROR_NOT_AVAILABLE) ? NS_ERROR_ILLEGAL_VALUE : rv;
+ 90452: 
+ 90452:   rv = FindHeader(NS_LITERAL_CSTRING("version"), version);
+ 90452:   if (NS_FAILED(rv))
+ 90452:     return (rv == NS_ERROR_NOT_AVAILABLE) ? NS_ERROR_ILLEGAL_VALUE : rv;
+ 90452: 
+ 90452:   // The spdystream needs to see flattened http headers
+ 90452:   // Uncompressed spdy format headers currently live in
+ 90452:   // mDeccompressBuffer - convert that to HTTP format in
+ 90452:   // mFlatHTTPResponseHeaders in ConvertHeaders()
+ 90452: 
+ 90452:   rv = ConvertHeaders(status, version);
+ 84549:   if (NS_FAILED(rv))
+ 84549:     return rv;
+ 84549: 
+ 90452:   mInputFrameDataStream->UpdateTransportReadEvents(mInputFrameDataSize);
+ 90872:   mLastDataReadEpoch = mLastReadEpoch;
+ 90452:   ChangeDownstreamState(PROCESSING_CONTROL_SYN_REPLY);
+ 84549:   return NS_OK;
+ 84549: }
+ 84549: 
+ 84549: nsresult
+ 99497: SpdySession2::HandleRstStream(SpdySession2 *self)
+ 84549: {
+ 84549:   NS_ABORT_IF_FALSE(self->mFrameControlType == CONTROL_TYPE_RST_STREAM,
+ 84549:                     "wrong control type");
+ 84549: 
+ 88247:   if (self->mInputFrameDataSize != 8) {
+ 99497:     LOG3(("SpdySession2::HandleRstStream %p RST_STREAM wrong length data=%d",
+ 88247:           self, self->mInputFrameDataSize));
+ 84549:     return NS_ERROR_ILLEGAL_VALUE;
+ 84549:   }
+ 84549: 
+ 88247:   PRUint8 flags = reinterpret_cast<PRUint8 *>(self->mInputFrameBuffer.get())[4];
+ 88247: 
+ 84549:   PRUint32 streamID =
+ 88247:     PR_ntohl(reinterpret_cast<PRUint32 *>(self->mInputFrameBuffer.get())[2]);
+ 84549: 
+ 84549:   self->mDownstreamRstReason =
+ 88247:     PR_ntohl(reinterpret_cast<PRUint32 *>(self->mInputFrameBuffer.get())[3]);
+ 84549: 
+ 99497:   LOG3(("SpdySession2::HandleRstStream %p RST_STREAM Reason Code %u ID %x "
+ 88247:         "flags %x", self, self->mDownstreamRstReason, streamID, flags));
+ 88247: 
+ 88247:   if (flags != 0) {
+ 99497:     LOG3(("SpdySession2::HandleRstStream %p RST_STREAM with flags is illegal",
+ 88247:           self));
+ 88247:     return NS_ERROR_ILLEGAL_VALUE;
+ 88247:   }
+ 84549:   
+ 84549:   if (self->mDownstreamRstReason == RST_INVALID_STREAM ||
+ 84549:       self->mDownstreamRstReason == RST_FLOW_CONTROL_ERROR) {
+ 84549:     // basically just ignore this
+ 88247:     self->ResetDownstreamState();
+ 84549:     return NS_OK;
+ 84549:   }
+ 84549: 
+ 98989:   nsresult rv = self->SetInputFrameDataStream(streamID);
+ 98989:   
+ 88247:   if (!self->mInputFrameDataStream) {
+ 98989:     if (NS_FAILED(rv))
+ 99497:       LOG(("SpdySession2::HandleRstStream %p lookup streamID for RST Frame "
+ 98989:            "0x%X failed reason = %d :: VerifyStream Failed\n", self, streamID,
+ 98989:            self->mDownstreamRstReason));
+ 98989: 
+ 99497:     LOG3(("SpdySession2::HandleRstStream %p lookup streamID for RST Frame "
+ 98989:           "0x%X failed reason = %d", self, streamID,
+ 98989:           self->mDownstreamRstReason));
+ 99497: 
+ 84549:     return NS_ERROR_ILLEGAL_VALUE;
+ 84549:   }
+ 84549: 
+ 84549:   self->ChangeDownstreamState(PROCESSING_CONTROL_RST_STREAM);
+ 84549:   return NS_OK;
+ 84549: }
+ 84549: 
+ 84549: nsresult
+ 99497: SpdySession2::HandleSettings(SpdySession2 *self)
+ 84549: {
+ 84549:   NS_ABORT_IF_FALSE(self->mFrameControlType == CONTROL_TYPE_SETTINGS,
+ 84549:                     "wrong control type");
+ 84549: 
+ 88247:   if (self->mInputFrameDataSize < 4) {
+ 99497:     LOG3(("SpdySession2::HandleSettings %p SETTINGS wrong length data=%d",
+ 88247:           self, self->mInputFrameDataSize));
+ 84549:     return NS_ERROR_ILLEGAL_VALUE;
+ 84549:   }
+ 84549: 
+ 84549:   PRUint32 numEntries =
+ 88247:     PR_ntohl(reinterpret_cast<PRUint32 *>(self->mInputFrameBuffer.get())[2]);
+ 84549: 
+ 84549:   // Ensure frame is large enough for supplied number of entries
+ 84549:   // Each entry is 8 bytes, frame data is reduced by 4 to account for
+ 84549:   // the NumEntries value.
+ 88247:   if ((self->mInputFrameDataSize - 4) < (numEntries * 8)) {
+ 99497:     LOG3(("SpdySession2::HandleSettings %p SETTINGS wrong length data=%d",
+ 88247:           self, self->mInputFrameDataSize));
+ 84549:     return NS_ERROR_ILLEGAL_VALUE;
+ 84549:   }
+ 84549: 
+ 99497:   LOG3(("SpdySession2::HandleSettings %p SETTINGS Control Frame with %d entries",
+ 84549:         self, numEntries));
+ 84549: 
+ 84549:   for (PRUint32 index = 0; index < numEntries; ++index) {
+ 84549:     // To clarify the v2 spec:
+ 84549:     // Each entry is a 24 bits of a little endian id
+ 84549:     // followed by 8 bits of flags
+ 84549:     // followed by a 32 bit big endian value
+ 84549:     
+ 84549:     unsigned char *setting = reinterpret_cast<unsigned char *>
+ 88247:       (self->mInputFrameBuffer.get()) + 12 + index * 8;
+ 84549: 
+ 84549:     PRUint32 id = (setting[2] << 16) + (setting[1] << 8) + setting[0];
+ 84549:     PRUint32 flags = setting[3];
+ 84549:     PRUint32 value =  PR_ntohl(reinterpret_cast<PRUint32 *>(setting)[1]);
+ 84549: 
+ 84549:     LOG3(("Settings ID %d, Flags %X, Value %d", id, flags, value));
+ 84549: 
+ 84549:     switch (id)
+ 84549:     {
+ 84549:     case SETTINGS_TYPE_UPLOAD_BW:
+ 84549:       Telemetry::Accumulate(Telemetry::SPDY_SETTINGS_UL_BW, value);
+ 84549:       break;
+ 84549:       
+ 84549:     case SETTINGS_TYPE_DOWNLOAD_BW:
+ 84549:       Telemetry::Accumulate(Telemetry::SPDY_SETTINGS_DL_BW, value);
+ 84549:       break;
+ 84549:       
+ 84549:     case SETTINGS_TYPE_RTT:
+ 84549:       Telemetry::Accumulate(Telemetry::SPDY_SETTINGS_RTT, value);
+ 84549:       break;
+ 84549:       
+ 84549:     case SETTINGS_TYPE_MAX_CONCURRENT:
+ 84549:       self->mMaxConcurrent = value;
+ 84549:       Telemetry::Accumulate(Telemetry::SPDY_SETTINGS_MAX_STREAMS, value);
+ 84549:       break;
+ 84549:       
+ 84549:     case SETTINGS_TYPE_CWND:
+ 84549:       Telemetry::Accumulate(Telemetry::SPDY_SETTINGS_CWND, value);
+ 84549:       break;
+ 84549:       
+ 84549:     case SETTINGS_TYPE_DOWNLOAD_RETRANS_RATE:
+ 84549:       Telemetry::Accumulate(Telemetry::SPDY_SETTINGS_RETRANS, value);
+ 84549:       break;
+ 84549:       
+ 84549:     case SETTINGS_TYPE_INITIAL_WINDOW:
+ 84549:       Telemetry::Accumulate(Telemetry::SPDY_SETTINGS_IW, value >> 10);
+ 84549:       break;
+ 84549:       
+ 84549:     default:
+ 84549:       break;
+ 84549:     }
+ 84549:     
+ 84549:   }
+ 84549:   
+ 88247:   self->ResetDownstreamState();
+ 84549:   return NS_OK;
+ 84549: }
+ 84549: 
+ 84549: nsresult
+ 99497: SpdySession2::HandleNoop(SpdySession2 *self)
+ 84549: {
+ 84549:   NS_ABORT_IF_FALSE(self->mFrameControlType == CONTROL_TYPE_NOOP,
+ 84549:                     "wrong control type");
+ 84549: 
+ 88247:   if (self->mInputFrameDataSize != 0) {
+ 99497:     LOG3(("SpdySession2::HandleNoop %p NOP had data %d",
+ 88247:           self, self->mInputFrameDataSize));
+ 84549:     return NS_ERROR_ILLEGAL_VALUE;
+ 84549:   }
+ 84549: 
+ 99497:   LOG3(("SpdySession2::HandleNoop %p NOP.", self));
+ 84549: 
+ 88247:   self->ResetDownstreamState();
+ 84549:   return NS_OK;
+ 84549: }
+ 84549: 
+ 84549: nsresult
+ 99497: SpdySession2::HandlePing(SpdySession2 *self)
+ 84549: {
+ 84549:   NS_ABORT_IF_FALSE(self->mFrameControlType == CONTROL_TYPE_PING,
+ 84549:                     "wrong control type");
+ 84549: 
+ 88247:   if (self->mInputFrameDataSize != 4) {
+ 99497:     LOG3(("SpdySession2::HandlePing %p PING had wrong amount of data %d",
+ 88247:           self, self->mInputFrameDataSize));
+ 84549:     return NS_ERROR_ILLEGAL_VALUE;
+ 84549:   }
+ 84549: 
+ 84549:   PRUint32 pingID =
+ 88247:     PR_ntohl(reinterpret_cast<PRUint32 *>(self->mInputFrameBuffer.get())[2]);
+ 84549: 
+ 99497:   LOG3(("SpdySession2::HandlePing %p PING ID 0x%X.", self, pingID));
+ 84549: 
+ 84549:   if (pingID & 0x01) {
+ 90872:     // presumably a reply to our timeout ping
+ 91115:     self->ClearPing(true);
+ 84549:   }
+ 84549:   else {
+ 90872:     // Servers initiate even numbered pings, go ahead and echo it back
+ 84549:     self->GeneratePing(pingID);
+ 84549:   }
+ 84549:     
+ 88247:   self->ResetDownstreamState();
+ 84549:   return NS_OK;
+ 84549: }
+ 84549: 
+ 84549: nsresult
+ 99497: SpdySession2::HandleGoAway(SpdySession2 *self)
+ 84549: {
+ 84549:   NS_ABORT_IF_FALSE(self->mFrameControlType == CONTROL_TYPE_GOAWAY,
+ 84549:                     "wrong control type");
+ 84549: 
+ 88247:   if (self->mInputFrameDataSize != 4) {
+ 99497:     LOG3(("SpdySession2::HandleGoAway %p GOAWAY had wrong amount of data %d",
+ 88247:           self, self->mInputFrameDataSize));
+ 84549:     return NS_ERROR_ILLEGAL_VALUE;
+ 84549:   }
+ 84549: 
+ 84549:   self->mShouldGoAway = true;
+ 84549:   self->mGoAwayID =
+ 88247:     PR_ntohl(reinterpret_cast<PRUint32 *>(self->mInputFrameBuffer.get())[2]);
+ 84549:   self->mCleanShutdown = true;
+ 84549:   
+ 99497:   LOG3(("SpdySession2::HandleGoAway %p GOAWAY Last-Good-ID 0x%X.",
+ 84549:         self, self->mGoAwayID));
+ 88247:   self->ResumeRecv();
+ 88247:   self->ResetDownstreamState();
+ 84549:   return NS_OK;
+ 84549: }
+ 84549: 
+ 84549: nsresult
+ 99497: SpdySession2::HandleHeaders(SpdySession2 *self)
+ 84549: {
+ 84549:   NS_ABORT_IF_FALSE(self->mFrameControlType == CONTROL_TYPE_HEADERS,
+ 84549:                     "wrong control type");
+ 84549: 
+ 88247:   if (self->mInputFrameDataSize < 10) {
+ 99497:     LOG3(("SpdySession2::HandleHeaders %p HEADERS had wrong amount of data %d",
+ 88247:           self, self->mInputFrameDataSize));
+ 84549:     return NS_ERROR_ILLEGAL_VALUE;
+ 84549:   }
+ 84549: 
+ 84549:   PRUint32 streamID =
+ 88247:     PR_ntohl(reinterpret_cast<PRUint32 *>(self->mInputFrameBuffer.get())[2]);
+ 84549: 
+ 84549:   // this is actually not legal in the HTTP mapping of SPDY. All
+ 84549:   // headers are in the syn or syn reply. Log and ignore it.
+ 84549: 
+ 88189:   // in v3 this will be legal and we must remember to note
+ 88189:   // NS_NET_STATUS_RECEIVING_FROM from it
+ 88189: 
+ 99497:   LOG3(("SpdySession2::HandleHeaders %p HEADERS for Stream 0x%X. "
+ 84549:         "They are ignored in the HTTP/SPDY mapping.",
+ 84549:         self, streamID));
+ 90872:   self->mLastDataReadEpoch = self->mLastReadEpoch;
+ 88247:   self->ResetDownstreamState();
+ 84549:   return NS_OK;
+ 84549: }
+ 84549: 
+ 84549: nsresult
+ 99497: SpdySession2::HandleWindowUpdate(SpdySession2 *self)
+ 84549: {
+ 84549:   NS_ABORT_IF_FALSE(self->mFrameControlType == CONTROL_TYPE_WINDOW_UPDATE,
+ 84549:                     "wrong control type");
+ 99497:   LOG3(("SpdySession2::HandleWindowUpdate %p WINDOW UPDATE was "
+ 84549:         "received. WINDOW UPDATE is no longer defined in v2. Ignoring.",
+ 84549:         self));
+ 84549: 
+ 88247:   self->ResetDownstreamState();
+ 84549:   return NS_OK;
+ 84549: }
+ 84549: 
+ 84549: //-----------------------------------------------------------------------------
+ 84549: // nsAHttpTransaction. It is expected that nsHttpConnection is the caller
+ 84549: // of these methods
+ 84549: //-----------------------------------------------------------------------------
+ 84549: 
+ 84549: void
+ 99497: SpdySession2::OnTransportStatus(nsITransport* aTransport,
+ 84549:                                nsresult aStatus,
+ 84549:                                PRUint64 aProgress)
+ 84549: {
+ 84549:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 84549: 
+ 88189:   switch (aStatus) {
+ 88189:     // These should appear only once, deliver to the first
+ 88189:     // transaction on the session.
+ 88189:   case NS_NET_STATUS_RESOLVING_HOST:
+ 88189:   case NS_NET_STATUS_RESOLVED_HOST:
+ 88189:   case NS_NET_STATUS_CONNECTING_TO:
+ 88189:   case NS_NET_STATUS_CONNECTED_TO:
+ 88189:   {
+ 99497:     SpdyStream2 *target = mStreamIDHash.Get(1);
+ 88189:     if (target)
+ 88189:       target->Transaction()->OnTransportStatus(aTransport, aStatus, aProgress);
+ 88189:     break;
+ 88189:   }
+ 84549: 
+ 88189:   default:
+ 88189:     // The other transport events are ignored here because there is no good
+ 88189:     // way to map them to the right transaction in spdy. Instead, the events
+ 88189:     // are generated again from the spdy code and passed directly to the
+ 88189:     // correct transaction.
+ 84549: 
+ 88189:     // NS_NET_STATUS_SENDING_TO:
+ 88189:     // This is generated by the socket transport when (part) of
+ 88189:     // a transaction is written out
+ 88189:     //
+ 88189:     // There is no good way to map it to the right transaction in spdy,
+ 88189:     // so it is ignored here and generated separately when the SYN_STREAM
+ 99497:     // is sent from SpdyStream2::TransmitFrame
+ 84549: 
+ 88189:     // NS_NET_STATUS_WAITING_FOR:
+ 88189:     // Created by nsHttpConnection when the request has been totally sent.
+ 88189:     // There is no good way to map it to the right transaction in spdy,
+ 88189:     // so it is ignored here and generated separately when the same
+ 99497:     // condition is complete in SpdyStream2 when there is no more
+ 88189:     // request body left to be transmitted.
+ 84549: 
+ 88189:     // NS_NET_STATUS_RECEIVING_FROM
+ 88189:     // Generated in spdysession whenever we read a data frame or a syn_reply
+ 88189:     // that can be attributed to a particular stream/transaction
+ 88189: 
+ 88189:     break;
+ 88189:   }
+ 84549: }
+ 84549: 
+ 84549: // ReadSegments() is used to write data to the network. Generally, HTTP
+ 84549: // request data is pulled from the approriate transaction and
+ 84549: // converted to SPDY data. Sometimes control data like window-update are
+ 84549: // generated instead.
+ 84549: 
+ 84549: nsresult
+ 99497: SpdySession2::ReadSegments(nsAHttpSegmentReader *reader,
+ 84549:                           PRUint32 count,
+ 84549:                           PRUint32 *countRead)
+ 84549: {
+ 84549:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 84549:   
+ 98638:   NS_ABORT_IF_FALSE(!mSegmentReader || !reader || (mSegmentReader == reader),
+ 98638:                     "Inconsistent Write Function Callback");
+ 98638: 
+ 98638:   if (reader)
+ 98638:     mSegmentReader = reader;
+ 98638: 
+ 84549:   nsresult rv;
+ 84549:   *countRead = 0;
+ 84549: 
+ 84549:   // First priority goes to frames that were writing to the network but were
+ 84549:   // blocked part way through. Then to frames that have no streams (e.g ping
+ 84549:   // reply) and then third to streams marked urgent (generally they have
+ 84549:   // window updates), and finally to streams generally
+ 84549:   // ready to send data frames (http requests).
+ 84549: 
+ 99497:   LOG3(("SpdySession2::ReadSegments %p", this));
+ 99497: 
+ 99497:   SpdyStream2 *stream;
+ 99497:   
+ 99497:   stream = static_cast<SpdyStream2 *>(mUrgentForWrite.PopFront());
+ 84549:   if (!stream)
+ 99497:     stream = static_cast<SpdyStream2 *>(mReadyForWrite.PopFront());
+ 84549:   if (!stream) {
+ 99497:     LOG3(("SpdySession2 %p could not identify a stream to write; suspending.",
+ 84549:           this));
+ 84549:     FlushOutputQueue();
+ 88247:     SetWriteCallbacks();
+ 84549:     return NS_BASE_STREAM_WOULD_BLOCK;
+ 84549:   }
+ 84549:   
+ 99497:   LOG3(("SpdySession2 %p will write from SpdyStream2 %p", this, stream));
+ 84549: 
+ 84549:   rv = stream->ReadSegments(this, count, countRead);
+ 84549: 
+ 88247:   // Not every permutation of stream->ReadSegents produces data (and therefore
+ 88247:   // tries to flush the output queue) - SENDING_FIN_STREAM can be an example
+ 88247:   // of that. But we might still have old data buffered that would be good
+ 88247:   // to flush.
+ 84549:   FlushOutputQueue();
+ 84549: 
+ 84549:   if (stream->RequestBlockedOnRead()) {
+ 84549:     
+ 84549:     // We are blocked waiting for input - either more http headers or
+ 84549:     // any request body data. When more data from the request stream
+ 84549:     // becomes available the httptransaction will call conn->ResumeSend().
+ 84549:     
+ 99497:     LOG3(("SpdySession2::ReadSegments %p dealing with block on read", this));
+ 84549: 
+ 84549:     // call readsegments again if there are other streams ready
+ 84549:     // to run in this session
+ 88247:     if (GetWriteQueueSize())
+ 84549:       rv = NS_OK;
+ 84549:     else
+ 84549:       rv = NS_BASE_STREAM_WOULD_BLOCK;
+ 88247:     SetWriteCallbacks();
+ 84549:     return rv;
+ 84549:   }
+ 84549:   
+ 84549:   if (NS_FAILED(rv)) {
+ 99497:     LOG3(("SpdySession2::ReadSegments %p returning FAIL code %X",
+ 84549:           this, rv));
+ 98639:     if (rv != NS_BASE_STREAM_WOULD_BLOCK)
+ 98639:       CleanupStream(stream, rv, RST_CANCEL);
+ 84549:     return rv;
+ 84549:   }
+ 84549:   
+ 84549:   if (*countRead > 0) {
+ 99497:     LOG3(("SpdySession2::ReadSegments %p stream=%p generated end of frame %d",
+ 84549:           this, stream, *countRead));
+ 84549:     mReadyForWrite.Push(stream);
+ 88247:     SetWriteCallbacks();
+ 84549:     return rv;
+ 84549:   }
+ 84549:   
+ 99497:   LOG3(("SpdySession2::ReadSegments %p stream=%p stream send complete",
+ 84549:         this, stream));
+ 84549:   
+ 84549:   /* we now want to recv data */
+ 88247:   ResumeRecv();
+ 84549: 
+ 84549:   // call readsegments again if there are other streams ready
+ 84549:   // to go in this session
+ 88247:   SetWriteCallbacks();
+ 84549: 
+ 84549:   return rv;
+ 84549: }
+ 84549: 
+ 84549: // WriteSegments() is used to read data off the socket. Generally this is
+ 84549: // just the SPDY frame header and from there the appropriate SPDYStream
+ 84549: // is identified from the Stream-ID. The http transaction associated with
+ 84549: // that read then pulls in the data directly, which it will feed to
+ 84549: // OnWriteSegment(). That function will gateway it into http and feed
+ 84549: // it to the appropriate transaction.
+ 84549: 
+ 90872: // we call writer->OnWriteSegment via NetworkRead() to get a spdy header.. 
+ 90872: // and decide if it is data or control.. if it is control, just deal with it.
+ 84549: // if it is data, identify the spdy stream
+ 84549: // call stream->WriteSegemnts which can call this::OnWriteSegment to get the
+ 84549: // data. It always gets full frames if they are part of the stream
+ 84549: 
+ 84549: nsresult
+ 99497: SpdySession2::WriteSegments(nsAHttpSegmentWriter *writer,
+ 84549:                            PRUint32 count,
+ 84549:                            PRUint32 *countWritten)
+ 84549: {
+ 84549:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 84549:   
+ 84549:   nsresult rv;
+ 84549:   *countWritten = 0;
+ 84549: 
+ 84549:   if (mClosed)
+ 84549:     return NS_ERROR_FAILURE;
+ 84549: 
+ 88247:   SetWriteCallbacks();
+ 84549:   
+ 84549:   // We buffer all control frames and act on them in this layer.
+ 84549:   // We buffer the first 8 bytes of data frames (the header) but
+ 84549:   // the actual data is passed through unprocessed.
+ 84549:   
+ 84549:   if (mDownstreamState == BUFFERING_FRAME_HEADER) {
+ 84549:     // The first 8 bytes of every frame is header information that
+ 84549:     // we are going to want to strip before passing to http. That is
+ 84549:     // true of both control and data packets.
+ 84549:     
+ 88247:     NS_ABORT_IF_FALSE(mInputFrameBufferUsed < 8,
+ 84549:                       "Frame Buffer Used Too Large for State");
+ 84549: 
+ 90872:     rv = NetworkRead(writer, mInputFrameBuffer + mInputFrameBufferUsed,
+ 90872:                      8 - mInputFrameBufferUsed, countWritten);
+ 90872: 
+ 84549:     if (NS_FAILED(rv)) {
+ 99497:       LOG3(("SpdySession2 %p buffering frame header read failure %x\n",
+ 84549:             this, rv));
+ 84549:       // maybe just blocked reading from network
+ 84549:       if (rv == NS_BASE_STREAM_WOULD_BLOCK)
+ 88247:         ResumeRecv();
+ 84549:       return rv;
+ 84549:     }
+ 84549: 
+ 84549:     LogIO(this, nsnull, "Reading Frame Header",
+ 88247:           mInputFrameBuffer + mInputFrameBufferUsed, *countWritten);
+ 84549: 
+ 88247:     mInputFrameBufferUsed += *countWritten;
+ 84549: 
+ 88247:     if (mInputFrameBufferUsed < 8)
+ 84549:     {
+ 99497:       LOG3(("SpdySession2::WriteSegments %p "
+ 84549:             "BUFFERING FRAME HEADER incomplete size=%d",
+ 88247:             this, mInputFrameBufferUsed));
+ 84549:       return rv;
+ 84549:     }
+ 84549: 
+ 84549:     // For both control and data frames the second 32 bit word of the header
+ 84549:     // is 8-flags, 24-length. (network byte order)
+ 88247:     mInputFrameDataSize =
+ 88247:       PR_ntohl(reinterpret_cast<PRUint32 *>(mInputFrameBuffer.get())[1]);
+ 88247:     mInputFrameDataSize &= 0x00ffffff;
+ 88247:     mInputFrameDataRead = 0;
+ 84549:     
+ 88247:     if (mInputFrameBuffer[0] & kFlag_Control) {
+ 88247:       EnsureBuffer(mInputFrameBuffer, mInputFrameDataSize + 8, 8,
+ 88247:                    mInputFrameBufferSize);
+ 84549:       ChangeDownstreamState(BUFFERING_CONTROL_FRAME);
+ 84549:       
+ 84549:       // The first 32 bit word of the header is
+ 84549:       // 1 ctrl - 15 version - 16 type
+ 84549:       PRUint16 version =
+ 88247:         PR_ntohs(reinterpret_cast<PRUint16 *>(mInputFrameBuffer.get())[0]);
+ 84549:       version &= 0x7fff;
+ 84549:       
+ 84549:       mFrameControlType =
+ 88247:         PR_ntohs(reinterpret_cast<PRUint16 *>(mInputFrameBuffer.get())[1]);
+ 84549:       
+ 99497:       LOG3(("SpdySession2::WriteSegments %p - Control Frame Identified "
+ 84549:             "type %d version %d data len %d",
+ 88247:             this, mFrameControlType, version, mInputFrameDataSize));
+ 84549: 
+ 84549:       if (mFrameControlType >= CONTROL_TYPE_LAST ||
+ 84549:           mFrameControlType <= CONTROL_TYPE_FIRST)
+ 84549:         return NS_ERROR_ILLEGAL_VALUE;
+ 84549: 
+ 84549:       // The protocol document says this value must be 1 even though this
+ 84549:       // is known as version 2.. Testing interop indicates that is a typo
+ 84549:       // in the protocol document
+ 84549:       if (version != 2) {
+ 84549:         return NS_ERROR_ILLEGAL_VALUE;
+ 84549:       }
+ 84549:     }
+ 84549:     else {
+ 84549:       ChangeDownstreamState(PROCESSING_DATA_FRAME);
+ 84549: 
+ 84549:       PRUint32 streamID =
+ 88247:         PR_ntohl(reinterpret_cast<PRUint32 *>(mInputFrameBuffer.get())[0]);
+ 98989:       rv = SetInputFrameDataStream(streamID);
+ 98989:       if (NS_FAILED(rv)) {
+ 99497:         LOG(("SpdySession2::WriteSegments %p lookup streamID 0x%X failed. "
+ 98989:               "probably due to verification.\n", this, streamID));
+ 98989:         return rv;
+ 98989:       }
+ 88247:       if (!mInputFrameDataStream) {
+ 99497:         LOG3(("SpdySession2::WriteSegments %p lookup streamID 0x%X failed. "
+ 84549:               "Next = 0x%x", this, streamID, mNextStreamID));
+ 84549:         if (streamID >= mNextStreamID)
+ 84549:           GenerateRstStream(RST_INVALID_STREAM, streamID);
+ 88247:         ChangeDownstreamState(DISCARDING_DATA_FRAME);
+ 84549:       }
+ 88247:       mInputFrameDataLast = (mInputFrameBuffer[4] & kFlag_Data_FIN);
+ 88247:       Telemetry::Accumulate(Telemetry::SPDY_CHUNK_RECVD,
+ 88247:                             mInputFrameDataSize >> 10);
+ 84549:       LOG3(("Start Processing Data Frame. "
+ 84549:             "Session=%p Stream ID 0x%x Stream Ptr %p Fin=%d Len=%d",
+ 88247:             this, streamID, mInputFrameDataStream, mInputFrameDataLast,
+ 88247:             mInputFrameDataSize));
+ 90872:       mLastDataReadEpoch = mLastReadEpoch;
+ 84549: 
+ 88247:       if (mInputFrameBuffer[4] & kFlag_Data_ZLIB) {
+ 84549:         LOG3(("Data flag has ZLIB flag set which is not valid >=2 spdy"));
+ 84549:         return NS_ERROR_ILLEGAL_VALUE;
+ 84549:       }
+ 84549:     }
+ 84549:   }
+ 84549: 
+ 84549:   if (mDownstreamState == PROCESSING_CONTROL_RST_STREAM) {
+ 84549:     if (mDownstreamRstReason == RST_REFUSED_STREAM)
+ 84549:       rv = NS_ERROR_NET_RESET;            //we can retry this 100% safely
+ 84549:     else if (mDownstreamRstReason == RST_CANCEL ||
+ 84549:              mDownstreamRstReason == RST_PROTOCOL_ERROR ||
+ 84549:              mDownstreamRstReason == RST_INTERNAL_ERROR ||
+ 84549:              mDownstreamRstReason == RST_UNSUPPORTED_VERSION)
+ 84549:       rv = NS_ERROR_NET_INTERRUPT;
+ 84549:     else
+ 84549:       rv = NS_ERROR_ILLEGAL_VALUE;
+ 84549: 
+ 84549:     if (mDownstreamRstReason != RST_REFUSED_STREAM &&
+ 84549:         mDownstreamRstReason != RST_CANCEL)
+ 84549:       mShouldGoAway = true;
+ 84549: 
+ 88247:     // mInputFrameDataStream is reset by ChangeDownstreamState
+ 99497:     SpdyStream2 *stream = mInputFrameDataStream;
+ 88247:     ResetDownstreamState();
+ 99497:     LOG3(("SpdySession2::WriteSegments cleanup stream on recv of rst "
+ 98989:           "session=%p stream=%p 0x%X\n", this, stream,
+ 98989:           stream ? stream->StreamID() : 0));
+ 90452:     CleanupStream(stream, rv, RST_CANCEL);
+ 84549:     return NS_OK;
+ 84549:   }
+ 84549: 
+ 84549:   if (mDownstreamState == PROCESSING_DATA_FRAME ||
+ 84549:       mDownstreamState == PROCESSING_CONTROL_SYN_REPLY) {
+ 84549: 
+ 98990:     // The cleanup stream should only be set while stream->WriteSegments is
+ 98990:     // on the stack and then cleaned up in this code block afterwards.
+ 98990:     NS_ABORT_IF_FALSE(!mNeedsCleanup, "cleanup stream set unexpectedly");
+ 98990:     mNeedsCleanup = nsnull;                     /* just in case */
+ 98990: 
+ 84549:     mSegmentWriter = writer;
+ 88247:     rv = mInputFrameDataStream->WriteSegments(this, count, countWritten);
+ 84549:     mSegmentWriter = nsnull;
+ 84549: 
+ 90872:     mLastDataReadEpoch = mLastReadEpoch;
+ 90872: 
+ 84549:     if (rv == NS_BASE_STREAM_CLOSED) {
+ 84549:       // This will happen when the transaction figures out it is EOF, generally
+ 84549:       // due to a content-length match being made
+ 99497:       SpdyStream2 *stream = mInputFrameDataStream;
+ 88247:       if (mInputFrameDataRead == mInputFrameDataSize)
+ 88247:         ResetDownstreamState();
+ 99497:       LOG3(("SpdySession2::WriteSegments session=%p stream=%p 0x%X "
+ 98989:             "needscleanup=%p. cleanup stream based on "
+ 98989:             "stream->writeSegments returning BASE_STREAM_CLOSED\n",
+ 98989:             this, stream, stream ? stream->StreamID() : 0,
+ 98989:             mNeedsCleanup));
+ 90452:       CleanupStream(stream, NS_OK, RST_CANCEL);
+ 84549:       NS_ABORT_IF_FALSE(!mNeedsCleanup, "double cleanup out of data frame");
+ 98990:       mNeedsCleanup = nsnull;                     /* just in case */
+ 84549:       return NS_OK;
+ 84549:     }
+ 84549:     
+ 84549:     if (mNeedsCleanup) {
+ 99497:       LOG3(("SpdySession2::WriteSegments session=%p stream=%p 0x%X "
+ 98989:             "cleanup stream based on mNeedsCleanup.\n",
+ 98989:             this, mNeedsCleanup, mNeedsCleanup ? mNeedsCleanup->StreamID() : 0));
+ 90452:       CleanupStream(mNeedsCleanup, NS_OK, RST_CANCEL);
+ 84549:       mNeedsCleanup = nsnull;
+ 84549:     }
+ 84549: 
+ 84549:     // In v3 this is where we would generate a window update
+ 84549: 
+ 84549:     return rv;
+ 84549:   }
+ 84549: 
+ 88247:   if (mDownstreamState == DISCARDING_DATA_FRAME) {
+ 84549:     char trash[4096];
+ 88247:     PRUint32 count = NS_MIN(4096U, mInputFrameDataSize - mInputFrameDataRead);
+ 84549: 
+ 84549:     if (!count) {
+ 88247:       ResetDownstreamState();
+ 88247:       ResumeRecv();
+ 88247:       return NS_BASE_STREAM_WOULD_BLOCK;
+ 84549:     }
+ 84549: 
+ 90872:     rv = NetworkRead(writer, trash, count, countWritten);
+ 84549: 
+ 84549:     if (NS_FAILED(rv)) {
+ 99497:       LOG3(("SpdySession2 %p discard frame read failure %x\n", this, rv));
+ 84549:       // maybe just blocked reading from network
+ 84549:       if (rv == NS_BASE_STREAM_WOULD_BLOCK)
+ 88247:         ResumeRecv();
+ 84549:       return rv;
+ 84549:     }
+ 84549: 
+ 84549:     LogIO(this, nsnull, "Discarding Frame", trash, *countWritten);
+ 84549: 
+ 88247:     mInputFrameDataRead += *countWritten;
+ 84549: 
+ 88247:     if (mInputFrameDataRead == mInputFrameDataSize)
+ 88247:       ResetDownstreamState();
+ 84549:     return rv;
+ 84549:   }
+ 84549:   
+ 88247:   if (mDownstreamState != BUFFERING_CONTROL_FRAME) {
+ 88247:     // this cannot happen
+ 88247:     NS_ABORT_IF_FALSE(false, "Not in Bufering Control Frame State");
+ 88247:     return NS_ERROR_UNEXPECTED;
+ 88247:   }
+ 88247: 
+ 88247:   NS_ABORT_IF_FALSE(mInputFrameBufferUsed == 8,
+ 84549:                     "Frame Buffer Header Not Present");
+ 84549: 
+ 90872:   rv = NetworkRead(writer, mInputFrameBuffer + 8 + mInputFrameDataRead,
+ 90872:                    mInputFrameDataSize - mInputFrameDataRead, countWritten);
+ 90872: 
+ 84549:   if (NS_FAILED(rv)) {
+ 99497:     LOG3(("SpdySession2 %p buffering control frame read failure %x\n",
+ 84549:           this, rv));
+ 84549:     // maybe just blocked reading from network
+ 84549:     if (rv == NS_BASE_STREAM_WOULD_BLOCK)
+ 88247:       ResumeRecv();
+ 84549:     return rv;
+ 84549:   }
+ 84549: 
+ 84549:   LogIO(this, nsnull, "Reading Control Frame",
+ 88247:         mInputFrameBuffer + 8 + mInputFrameDataRead, *countWritten);
+ 84549: 
+ 88247:   mInputFrameDataRead += *countWritten;
+ 84549: 
+ 88247:   if (mInputFrameDataRead != mInputFrameDataSize)
+ 84549:     return NS_OK;
+ 84549: 
+ 88247:   // This check is actually redundant, the control type was previously
+ 88247:   // checked to make sure it was in range, but we will check it again
+ 88247:   // at time of use to make sure a regression doesn't creep in.
+ 88247:   if (mFrameControlType >= CONTROL_TYPE_LAST ||
+ 88247:       mFrameControlType <= CONTROL_TYPE_FIRST) 
+ 88247:   {
+ 88247:     NS_ABORT_IF_FALSE(false, "control type out of range");
+ 88247:     return NS_ERROR_ILLEGAL_VALUE;
+ 88247:   }
+ 84549:   rv = sControlFunctions[mFrameControlType](this);
+ 84549: 
+ 84549:   NS_ABORT_IF_FALSE(NS_FAILED(rv) ||
+ 84549:                     mDownstreamState != BUFFERING_CONTROL_FRAME,
+ 84549:                     "Control Handler returned OK but did not change state");
+ 84549: 
+ 84549:   if (mShouldGoAway && !mStreamTransactionHash.Count())
+ 84549:     Close(NS_OK);
+ 84549:   return rv;
+ 84549: }
+ 84549: 
+ 84549: void
+ 99497: SpdySession2::Close(nsresult aReason)
+ 84549: {
+ 84549:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 84549: 
+ 84549:   if (mClosed)
+ 84549:     return;
+ 84549: 
+ 99497:   LOG3(("SpdySession2::Close %p %X", this, aReason));
+ 84549: 
+ 84549:   mClosed = true;
+100224: 
+100224:   NS_ABORT_IF_FALSE(mStreamTransactionHash.Count() ==
+100224:                     mStreamIDHash.Count(),
+100224:                     "index corruption");
+ 88247:   mStreamTransactionHash.Enumerate(ShutdownEnumerator, this);
+100224:   mStreamIDHash.Clear();
+100224:   mStreamTransactionHash.Clear();
+100224: 
+ 88247:   if (NS_SUCCEEDED(aReason))
+ 84549:     GenerateGoAway();
+ 84549:   mConnection = nsnull;
+ 88247:   mSegmentReader = nsnull;
+ 88247:   mSegmentWriter = nsnull;
+ 84549: }
+ 84549: 
+ 84549: void
+ 99497: SpdySession2::CloseTransaction(nsAHttpTransaction *aTransaction,
+ 84549:                               nsresult aResult)
+ 84549: {
+ 84549:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 99497:   LOG3(("SpdySession2::CloseTransaction %p %p %x", this, aTransaction, aResult));
+ 84549: 
+ 84549:   // Generally this arrives as a cancel event from the connection manager.
+ 84549: 
+ 84549:   // need to find the stream and call CleanupStream() on it.
+ 99497:   SpdyStream2 *stream = mStreamTransactionHash.Get(aTransaction);
+ 84549:   if (!stream) {
+ 99497:     LOG3(("SpdySession2::CloseTransaction %p %p %x - not found.",
+ 84549:           this, aTransaction, aResult));
+ 84549:     return;
+ 84549:   }
+ 99497:   LOG3(("SpdySession2::CloseTranscation probably a cancel. "
+ 84549:         "this=%p, trans=%p, result=%x, streamID=0x%X stream=%p",
+ 84549:         this, aTransaction, aResult, stream->StreamID(), stream));
+ 90452:   CleanupStream(stream, aResult, RST_CANCEL);
+ 88247:   ResumeRecv();
+ 84549: }
+ 84549: 
+ 84549: 
+ 84549: //-----------------------------------------------------------------------------
+ 84549: // nsAHttpSegmentReader
+ 84549: //-----------------------------------------------------------------------------
+ 84549: 
+ 84549: nsresult
+ 99497: SpdySession2::OnReadSegment(const char *buf,
+ 84549:                            PRUint32 count,
+ 84549:                            PRUint32 *countRead)
+ 84549: {
+ 84549:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 84549:   
+ 84549:   nsresult rv;
+ 84549:   
+ 88247:   // If we can release old queued data then we can try and write the new
+ 88247:   // data directly to the network without using the output queue at all
+ 88247:   if (mOutputQueueUsed)
+ 88247:     FlushOutputQueue();
+ 88247: 
+ 84549:   if (!mOutputQueueUsed && mSegmentReader) {
+ 84549:     // try and write directly without output queue
+ 84549:     rv = mSegmentReader->OnReadSegment(buf, count, countRead);
+ 88248: 
+ 88248:     if (rv == NS_BASE_STREAM_WOULD_BLOCK)
+ 88248:       *countRead = 0;
+ 88248:     else if (NS_FAILED(rv))
+ 84549:       return rv;
+ 88248:     
+ 88248:     if (*countRead < count) {
+ 88248:       PRUint32 required = count - *countRead;
+ 88248:       // assuming a commitment() happened, this ensurebuffer is a nop
+ 88248:       // but just in case the queuesize is too small for the required data
+ 88248:       // call ensurebuffer().
+ 88248:       EnsureBuffer(mOutputQueueBuffer, required, 0, mOutputQueueSize);
+ 88248:       memcpy(mOutputQueueBuffer.get(), buf + *countRead, required);
+ 88248:       mOutputQueueUsed = required;
+ 84549:     }
+ 84549:     
+ 88248:     *countRead = count;
+ 88248:     return NS_OK;
+ 88248:   }
+ 88248: 
+ 88248:   // At this point we are going to buffer the new data in the output
+ 88248:   // queue if it fits. By coalescing multiple small submissions into one larger
+ 88247:   // buffer we can get larger writes out to the network later on.
+ 84549: 
+ 88247:   // This routine should not be allowed to fill up the output queue
+ 88247:   // all on its own - at least kQueueReserved bytes are always left
+ 88248:   // for other routines to use - but this is an all-or-nothing function,
+ 88248:   // so if it will not all fit just return WOULD_BLOCK
+ 88247: 
+ 88248:   if ((mOutputQueueUsed + count) > (mOutputQueueSize - kQueueReserved))
+ 84549:     return NS_BASE_STREAM_WOULD_BLOCK;
+ 84549:   
+ 84549:   memcpy(mOutputQueueBuffer.get() + mOutputQueueUsed, buf, count);
+ 84549:   mOutputQueueUsed += count;
+ 84549:   *countRead = count;
+ 84549: 
+ 84549:   FlushOutputQueue();
+ 84549: 
+ 84549:   return NS_OK;
+ 84549: }
+ 84549: 
+ 88248: nsresult
+ 99497: SpdySession2::CommitToSegmentSize(PRUint32 count)
+ 88248: {
+ 88248:   if (mOutputQueueUsed)
+ 88248:     FlushOutputQueue();
+ 88248: 
+ 88248:   // would there be enough room to buffer this if needed?
+ 88248:   if ((mOutputQueueUsed + count) <= (mOutputQueueSize - kQueueReserved))
+ 88248:     return NS_OK;
+ 88248:   
+ 88248:   // if we are using part of our buffers already, try again later
+ 88248:   if (mOutputQueueUsed)
+ 88248:     return NS_BASE_STREAM_WOULD_BLOCK;
+ 88248: 
+ 88248:   // not enough room to buffer even with completely empty buffers.
+ 88248:   // normal frames are max 4kb, so the only case this can really happen
+ 88248:   // is a SYN_STREAM with technically unbounded headers. That is highly
+ 88248:   // unlikely, but possible. Create enough room for it because the buffers
+ 88248:   // will be necessary - SSL does not absorb writes of very large sizes
+ 88248:   // in single sends.
+ 88248: 
+ 88248:   EnsureBuffer(mOutputQueueBuffer, count + kQueueReserved, 0, mOutputQueueSize);
+ 88248: 
+ 88248:   NS_ABORT_IF_FALSE((mOutputQueueUsed + count) <=
+ 88248:                     (mOutputQueueSize - kQueueReserved),
+ 88248:                     "buffer not as large as expected");
+ 88248: 
+ 88248:   return NS_OK;
+ 88248: }
+ 88248: 
+ 84549: //-----------------------------------------------------------------------------
+ 84549: // nsAHttpSegmentWriter
+ 84549: //-----------------------------------------------------------------------------
+ 84549: 
+ 84549: nsresult
+ 99497: SpdySession2::OnWriteSegment(char *buf,
+ 84549:                             PRUint32 count,
+ 84549:                             PRUint32 *countWritten)
+ 84549: {
+ 84549:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 84549:   nsresult rv;
+ 84549: 
+ 88247:   if (!mSegmentWriter) {
+ 88247:     // the only way this could happen would be if Close() were called on the
+ 88247:     // stack with WriteSegments()
+ 88247:     return NS_ERROR_FAILURE;
+ 88247:   }
+ 88247:   
+ 84549:   if (mDownstreamState == PROCESSING_DATA_FRAME) {
+ 84549: 
+ 88247:     if (mInputFrameDataLast &&
+ 88247:         mInputFrameDataRead == mInputFrameDataSize) {
+ 84549:       *countWritten = 0;
+ 99496:       SetNeedsCleanup();
+ 84549:       return NS_BASE_STREAM_CLOSED;
+ 84549:     }
+ 84549:     
+ 88247:     count = NS_MIN(count, mInputFrameDataSize - mInputFrameDataRead);
+ 90872:     rv = NetworkRead(mSegmentWriter, buf, count, countWritten);
+ 84549:     if (NS_FAILED(rv))
+ 84549:       return rv;
+ 84549: 
+ 88247:     LogIO(this, mInputFrameDataStream, "Reading Data Frame",
+ 88247:           buf, *countWritten);
+ 84549: 
+ 88247:     mInputFrameDataRead += *countWritten;
+ 84549:     
+ 88247:     mInputFrameDataStream->UpdateTransportReadEvents(*countWritten);
+ 88247:     if ((mInputFrameDataRead == mInputFrameDataSize) && !mInputFrameDataLast)
+ 88247:       ResetDownstreamState();
+ 84549: 
+ 84549:     return rv;
+ 84549:   }
+ 84549:   
+ 84549:   if (mDownstreamState == PROCESSING_CONTROL_SYN_REPLY) {
+ 84549:     
+ 84549:     if (mFlatHTTPResponseHeaders.Length() == mFlatHTTPResponseHeadersOut &&
+ 88247:         mInputFrameDataLast) {
+ 84549:       *countWritten = 0;
+ 99496:       SetNeedsCleanup();
+ 84549:       return NS_BASE_STREAM_CLOSED;
+ 84549:     }
+ 84549:       
+ 84549:     count = NS_MIN(count,
+ 84549:                    mFlatHTTPResponseHeaders.Length() -
+ 84549:                    mFlatHTTPResponseHeadersOut);
+ 84549:     memcpy(buf,
+ 84549:            mFlatHTTPResponseHeaders.get() + mFlatHTTPResponseHeadersOut,
+ 84549:            count);
+ 84549:     mFlatHTTPResponseHeadersOut += count;
+ 84549:     *countWritten = count;
+ 84549: 
+ 84549:     if (mFlatHTTPResponseHeaders.Length() == mFlatHTTPResponseHeadersOut &&
+ 88247:         !mInputFrameDataLast)
+ 88247:       ResetDownstreamState();
+ 84549:     return NS_OK;
+ 84549:   }
+ 84549: 
+ 84549:   return NS_ERROR_UNEXPECTED;
+ 84549: }
+ 84549: 
+ 99496: void
+ 99497: SpdySession2::SetNeedsCleanup()
+ 99496: {
+ 99497:   LOG3(("SpdySession2::SetNeedsCleanup %p - recorded downstream fin of "
+ 99496:         "stream %p 0x%X", this, mInputFrameDataStream,
+ 99496:         mInputFrameDataStream->StreamID()));
+ 99496: 
+ 99496:   // This will result in Close() being called
+ 99496:   NS_ABORT_IF_FALSE(!mNeedsCleanup, "mNeedsCleanup unexpectedly set");
+ 99496:   mNeedsCleanup = mInputFrameDataStream;
+ 99496:   ResetDownstreamState();
+ 99496: }
+ 99496: 
+ 84549: //-----------------------------------------------------------------------------
+ 84549: // Modified methods of nsAHttpConnection
+ 84549: //-----------------------------------------------------------------------------
+ 84549: 
+ 88247: void
+ 99497: SpdySession2::TransactionHasDataToWrite(nsAHttpTransaction *caller)
+ 88247: {
+ 88247:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 99497:   LOG3(("SpdySession2::TransactionHasDataToWrite %p trans=%p", this, caller));
+ 84549: 
+ 84549:   // a trapped signal from the http transaction to the connection that
+ 84549:   // it is no longer blocked on read.
+ 84549: 
+ 99497:   SpdyStream2 *stream = mStreamTransactionHash.Get(caller);
+ 98989:   if (!stream || !VerifyStream(stream)) {
+ 99497:     LOG3(("SpdySession2::TransactionHasDataToWrite %p caller %p not found",
+ 88247:           this, caller));
+ 88247:     return;
+ 88247:   }
+ 84549:   
+ 99497:   LOG3(("SpdySession2::TransactionHasDataToWrite %p ID is %x",
+ 88247:         this, stream->StreamID()));
+ 88247: 
+ 84549:   mReadyForWrite.Push(stream);
+ 84549: }
+ 84549: 
+ 88248: void
+ 99497: SpdySession2::TransactionHasDataToWrite(SpdyStream2 *stream)
+ 88248: {
+ 88248:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 99497:   LOG3(("SpdySession2::TransactionHasDataToWrite %p stream=%p ID=%x",
+ 88248:         this, stream, stream->StreamID()));
+ 88248: 
+ 88248:   mReadyForWrite.Push(stream);
+ 88248:   SetWriteCallbacks();
+ 88248: }
+ 88248: 
+ 84549: bool
+ 99497: SpdySession2::IsPersistent()
+ 84549: {
+ 84549:   return true;
+ 84549: }
+ 84549: 
+ 84549: nsresult
+ 99497: SpdySession2::TakeTransport(nsISocketTransport **,
+ 84549:                            nsIAsyncInputStream **,
+ 84549:                            nsIAsyncOutputStream **)
+ 84549: {
+ 99497:   NS_ABORT_IF_FALSE(false, "TakeTransport of SpdySession2");
+ 84549:   return NS_ERROR_UNEXPECTED;
+ 84549: }
+ 84549: 
+ 84549: nsHttpConnection *
+ 99497: SpdySession2::TakeHttpConnection()
+ 84549: {
+ 99497:   NS_ABORT_IF_FALSE(false, "TakeHttpConnection of SpdySession2");
+ 84549:   return nsnull;
+ 84549: }
+ 84549: 
+ 93843: PRUint32
+ 99497: SpdySession2::CancelPipeline(nsresult reason)
+ 93843: {
+ 93843:   // we don't pipeline inside spdy, so this isn't an issue
+ 93843:   return 0;
+ 93843: }
+ 93843: 
+ 93843: nsAHttpTransaction::Classifier
+ 99497: SpdySession2::Classification()
+ 93843: {
+ 93843:   if (!mConnection)
+ 93843:     return nsAHttpTransaction::CLASS_GENERAL;
+ 93843:   return mConnection->Classification();
+ 93843: }
+ 93843: 
+ 84549: //-----------------------------------------------------------------------------
+ 84549: // unused methods of nsAHttpTransaction
+ 99497: // We can be sure of this because SpdySession2 is only constructed in
+ 84549: // nsHttpConnection and is never passed out of that object
+ 84549: //-----------------------------------------------------------------------------
+ 84549: 
+ 84549: void
+ 99497: SpdySession2::SetConnection(nsAHttpConnection *)
+ 84549: {
+ 84549:   // This is unexpected
+ 99497:   NS_ABORT_IF_FALSE(false, "SpdySession2::SetConnection()");
+ 84549: }
+ 84549: 
+ 84549: void
+ 99497: SpdySession2::GetSecurityCallbacks(nsIInterfaceRequestor **,
+ 84549:                                   nsIEventTarget **)
+ 84549: {
+ 84549:   // This is unexpected
+ 99497:   NS_ABORT_IF_FALSE(false, "SpdySession2::GetSecurityCallbacks()");
+ 84549: }
+ 84549: 
+ 84549: void
+ 99497: SpdySession2::SetSSLConnectFailed()
+ 84549: {
+ 99497:   NS_ABORT_IF_FALSE(false, "SpdySession2::SetSSLConnectFailed()");
+ 84549: }
+ 84549: 
+ 84549: bool
+ 99497: SpdySession2::IsDone()
+ 84549: {
+ 93840:   return !mStreamTransactionHash.Count();
+ 84549: }
+ 84549: 
+ 84549: nsresult
+ 99497: SpdySession2::Status()
+ 84549: {
+ 99497:   NS_ABORT_IF_FALSE(false, "SpdySession2::Status()");
+ 84549:   return NS_ERROR_UNEXPECTED;
+ 84549: }
+ 84549: 
+ 93838: PRUint8
+ 99497: SpdySession2::Caps()
+ 93838: {
+ 99497:   NS_ABORT_IF_FALSE(false, "SpdySession2::Caps()");
+ 93838:   return 0;
+ 93838: }
+ 93838: 
+ 84549: PRUint32
+ 99497: SpdySession2::Available()
+ 84549: {
+ 99497:   NS_ABORT_IF_FALSE(false, "SpdySession2::Available()");
+ 84549:   return 0;
+ 84549: }
+ 84549: 
+ 84549: nsHttpRequestHead *
+ 99497: SpdySession2::RequestHead()
+ 84549: {
+ 84549:   NS_ABORT_IF_FALSE(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 84549:   NS_ABORT_IF_FALSE(false,
+ 99497:                     "SpdySession2::RequestHead() "
+ 84549:                     "should not be called after SPDY is setup");
+ 84549:   return NULL;
+ 84549: }
+ 84549: 
+ 84549: PRUint32
+ 99497: SpdySession2::Http1xTransactionCount()
+ 84549: {
+ 84549:   return 0;
+ 84549: }
+ 84549: 
+ 90199: // used as an enumerator by TakeSubTransactions()
+ 90199: static PLDHashOperator
+ 90199: TakeStream(nsAHttpTransaction *key,
+ 99497:            nsAutoPtr<SpdyStream2> &stream,
+ 90199:            void *closure)
+ 90199: {
+ 90199:   nsTArray<nsRefPtr<nsAHttpTransaction> > *list =
+ 90199:     static_cast<nsTArray<nsRefPtr<nsAHttpTransaction> > *>(closure);
+ 90199: 
+ 90199:   list->AppendElement(key);
+ 90199: 
+ 90199:   // removing the stream from the hash will delete the stream
+ 90199:   // and drop the transaction reference the hash held
+ 90199:   return PL_DHASH_REMOVE;
+ 90199: }
+ 90199: 
+ 90199: nsresult
+ 99497: SpdySession2::TakeSubTransactions(
+ 90199:     nsTArray<nsRefPtr<nsAHttpTransaction> > &outTransactions)
+ 90199: {
+ 90199:   // Generally this cannot be done with spdy as transactions are
+ 90199:   // started right away.
+ 90199: 
+ 99497:   LOG3(("SpdySession2::TakeSubTransactions %p\n", this));
+ 90199: 
+ 90199:   if (mConcurrentHighWater > 0)
+ 90199:     return NS_ERROR_ALREADY_OPENED;
+ 90199: 
+ 90199:   LOG3(("   taking %d\n", mStreamTransactionHash.Count()));
+ 90199: 
+ 90199:   mStreamTransactionHash.Enumerate(TakeStream, &outTransactions);
+ 90199:   return NS_OK;
+ 90199: }
+ 90199: 
+ 93838: nsresult
+ 99497: SpdySession2::AddTransaction(nsAHttpTransaction *)
+ 93838: {
+ 99497:   // This API is meant for pipelining, SpdySession2's should be
+ 93838:   // extended with AddStream()
+ 93838: 
+ 93838:   NS_ABORT_IF_FALSE(false,
+ 99497:                     "SpdySession2::AddTransaction() should not be called");
+ 93838: 
+ 93838:   return NS_ERROR_NOT_IMPLEMENTED;
+ 93838: }
+ 93838: 
+ 93840: PRUint32
+ 99497: SpdySession2::PipelineDepth()
+ 93838: {
+ 93840:   return IsDone() ? 0 : 1;
+ 93838: }
+ 93838: 
+ 93839: nsresult
+ 99497: SpdySession2::SetPipelinePosition(PRInt32 position)
+ 93839: {
+ 99497:   // This API is meant for pipelining, SpdySession2's should be
+ 93839:   // extended with AddStream()
+ 93839: 
+ 93839:   NS_ABORT_IF_FALSE(false,
+ 99497:                     "SpdySession2::SetPipelinePosition() should not be called");
+ 93839: 
+ 93839:   return NS_ERROR_NOT_IMPLEMENTED;
+ 93839: }
+ 93839: 
+ 93839: PRInt32
+ 99497: SpdySession2::PipelinePosition()
+ 93839: {
+ 93839:     return 0;
+ 93839: }
+ 93839: 
+ 84549: //-----------------------------------------------------------------------------
+ 84549: // Pass through methods of nsAHttpConnection
+ 84549: //-----------------------------------------------------------------------------
+ 84549: 
+ 84549: nsAHttpConnection *
+ 99497: SpdySession2::Connection()
+ 84549: {
+ 84549:   NS_ASSERTION(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 84549:   return mConnection;
+ 84549: }
+ 84549: 
+ 84549: nsresult
+ 99497: SpdySession2::OnHeadersAvailable(nsAHttpTransaction *transaction,
+ 84549:                                 nsHttpRequestHead *requestHead,
+ 84549:                                 nsHttpResponseHead *responseHead,
+ 84549:                                 bool *reset)
+ 84549: {
+ 84549:   return mConnection->OnHeadersAvailable(transaction,
+ 84549:                                          requestHead,
+ 84549:                                          responseHead,
+ 84549:                                          reset);
+ 84549: }
+ 84549: 
+ 84549: bool
+ 99497: SpdySession2::IsReused()
+ 84549: {
+ 84549:   return mConnection->IsReused();
+ 84549: }
+ 84549: 
+ 84549: nsresult
+ 99497: SpdySession2::PushBack(const char *buf, PRUint32 len)
+ 84549: {
+ 84549:   return mConnection->PushBack(buf, len);
+ 84549: }
+ 84549: 
+ 84549: } // namespace mozilla::net
+ 84549: } // namespace mozilla
+ 84549: 

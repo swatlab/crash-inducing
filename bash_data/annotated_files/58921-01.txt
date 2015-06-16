@@ -1,0 +1,592 @@
+43113: /* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
+43113: /* ***** BEGIN LICENSE BLOCK *****
+43113:  * Version: MPL 1.1/GPL 2.0/LGPL 2.1
+43113:  *
+43113:  * The contents of this file are subject to the Mozilla Public License Version
+43113:  * 1.1 (the "License"); you may not use this file except in compliance with
+43113:  * the License. You may obtain a copy of the License at
+43113:  * http://www.mozilla.org/MPL/
+43113:  *
+43113:  * Software distributed under the License is distributed on an "AS IS" basis,
+43113:  * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+43113:  * for the specific language governing rights and limitations under the
+43113:  * License.
+43113:  *
+43113:  * The Original Code is Mozilla.
+43113:  *
+43113:  * The Initial Developer of the Original Code is
+43113:  * Netscape Communications.
+43113:  * Portions created by the Initial Developer are Copyright (C) 2001
+43113:  * the Initial Developer. All Rights Reserved.
+43113:  *
+43113:  * Contributor(s):
+43113:  *   Darin Fisher <darin@netscape.com> (original author)
+43113:  *
+43113:  * Alternatively, the contents of this file may be used under the terms of
+43113:  * either the GNU General Public License Version 2 or later (the "GPL"), or
+43113:  * the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+43113:  * in which case the provisions of the GPL or the LGPL are applicable instead
+43113:  * of those above. If you wish to allow use of your version of this file only
+43113:  * under the terms of either the GPL or the LGPL, and not to allow others to
+43113:  * use your version of this file under the terms of the MPL, indicate your
+43113:  * decision by deleting the provisions above and replace them with the notice
+43113:  * and other provisions required by the GPL or the LGPL. If you do not delete
+43113:  * the provisions above, a recipient may use your version of this file under
+43113:  * the terms of any one of the MPL, the GPL or the LGPL.
+43113:  *
+43113:  * ***** END LICENSE BLOCK ***** */
+43113: 
+43113: #include <stdlib.h>
+43113: #include "nsHttp.h"
+43113: #include "nsHttpPipeline.h"
+43113: #include "nsHttpHandler.h"
+43113: #include "nsIOService.h"
+43113: #include "nsIRequest.h"
+43113: #include "nsISocketTransport.h"
+43113: #include "nsIStringStream.h"
+43113: #include "nsIPipe.h"
+43113: #include "nsCOMPtr.h"
+43113: #include "nsComponentManagerUtils.h"
+43113: #include "nsAutoLock.h"
+43113: 
+43113: #ifdef DEBUG
+43113: #include "prthread.h"
+43113: // defined by the socket transport service while active
+43113: extern PRThread *gSocketThread;
+43113: #endif
+43113: 
+43113: //-----------------------------------------------------------------------------
+43113: // nsHttpPushBackWriter
+43113: //-----------------------------------------------------------------------------
+43113: 
+43113: class nsHttpPushBackWriter : public nsAHttpSegmentWriter
+43113: {
+43113: public:
+43113:     nsHttpPushBackWriter(const char *buf, PRUint32 bufLen)
+43113:         : mBuf(buf)
+43113:         , mBufLen(bufLen)
+43113:         { }
+43113:     virtual ~nsHttpPushBackWriter() {}
+43113: 
+43113:     nsresult OnWriteSegment(char *buf, PRUint32 count, PRUint32 *countWritten)
+43113:     {
+43113:         if (mBufLen == 0)
+43113:             return NS_BASE_STREAM_CLOSED;
+43113: 
+43113:         if (count > mBufLen)
+43113:             count = mBufLen;
+43113: 
+43113:         memcpy(buf, mBuf, count);
+43113: 
+43113:         mBuf += count;
+43113:         mBufLen -= count;
+43113:         *countWritten = count;
+43113:         return NS_OK;
+43113:     }
+43113: 
+43113: private:
+43113:     const char *mBuf;
+43113:     PRUint32    mBufLen;
+43113: };
+43113: 
+43113: //-----------------------------------------------------------------------------
+43113: // nsHttpPipeline <public>
+43113: //-----------------------------------------------------------------------------
+43113: 
+43113: nsHttpPipeline::nsHttpPipeline()
+43113:     : mConnection(nsnull)
+43113:     , mStatus(NS_OK)
+43113:     , mRequestIsPartial(PR_FALSE)
+43113:     , mResponseIsPartial(PR_FALSE)
+43113:     , mClosed(PR_FALSE)
+43113:     , mPushBackBuf(nsnull)
+43113:     , mPushBackLen(0)
+43113:     , mPushBackMax(0)
+43113: {
+43113: }
+43113: 
+43113: nsHttpPipeline::~nsHttpPipeline()
+43113: {
+43113:     // make sure we aren't still holding onto any transactions!
+43113:     Close(NS_ERROR_ABORT);
+43113: 
+43113:     if (mPushBackBuf)
+43113:         free(mPushBackBuf);
+43113: }
+43113: 
+43113: nsresult
+43113: nsHttpPipeline::AddTransaction(nsAHttpTransaction *trans)
+43113: {
+43113:     LOG(("nsHttpPipeline::AddTransaction [this=%x trans=%x]\n", this, trans));
+43113: 
+43113:     NS_ADDREF(trans);
+43113:     mRequestQ.AppendElement(trans);
+43113: 
+43113:     if (mConnection) {
+43113:         trans->SetConnection(this);
+43113: 
+43113:         if (mRequestQ.Length() == 1)
+43113:             mConnection->ResumeSend();
+43113:     }
+43113: 
+43113:     return NS_OK;
+43113: }
+43113: 
+43113: //-----------------------------------------------------------------------------
+43113: // nsHttpPipeline::nsISupports
+43113: //-----------------------------------------------------------------------------
+43113: 
+43113: NS_IMPL_THREADSAFE_ADDREF(nsHttpPipeline)
+43113: NS_IMPL_THREADSAFE_RELEASE(nsHttpPipeline)
+43113: 
+43113: // multiple inheritance fun :-)
+43113: NS_INTERFACE_MAP_BEGIN(nsHttpPipeline)
+43113:     NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsAHttpConnection)
+43113: NS_INTERFACE_MAP_END
+43113: 
+43113: 
+43113: //-----------------------------------------------------------------------------
+43113: // nsHttpPipeline::nsAHttpConnection
+43113: //-----------------------------------------------------------------------------
+43113: 
+43113: nsresult
+43113: nsHttpPipeline::OnHeadersAvailable(nsAHttpTransaction *trans,
+43113:                                    nsHttpRequestHead *requestHead,
+43113:                                    nsHttpResponseHead *responseHead,
+43113:                                    PRBool *reset)
+43113: {
+43113:     LOG(("nsHttpPipeline::OnHeadersAvailable [this=%x]\n", this));
+43113: 
+43113:     NS_ASSERTION(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+43113:     NS_ASSERTION(mConnection, "no connection");
+43113: 
+43113:     // trans has now received its response headers; forward to the real connection
+43113:     return mConnection->OnHeadersAvailable(trans, requestHead, responseHead, reset);
+43113: }
+43113: 
+43113: nsresult
+43113: nsHttpPipeline::ResumeSend()
+43113: {
+43113:     NS_NOTREACHED("nsHttpPipeline::ResumeSend");
+43113:     return NS_ERROR_UNEXPECTED;
+43113: }
+43113: 
+43113: nsresult
+43113: nsHttpPipeline::ResumeRecv()
+43113: {
+43113:     NS_ASSERTION(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+43113:     NS_ASSERTION(mConnection, "no connection");
+43113:     return mConnection->ResumeRecv();
+43113: }
+43113: 
+43113: void
+43113: nsHttpPipeline::CloseTransaction(nsAHttpTransaction *trans, nsresult reason)
+43113: {
+43113:     LOG(("nsHttpPipeline::CloseTransaction [this=%x trans=%x reason=%x]\n",
+43113:         this, trans, reason));
+43113: 
+43113:     NS_ASSERTION(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+43113:     NS_ASSERTION(NS_FAILED(reason), "expecting failure code");
+43113: 
+43113:     // the specified transaction is to be closed with the given "reason"
+43113:     
+43113:     PRInt32 index;
+43113:     PRBool killPipeline = PR_FALSE;
+43113: 
+43113:     index = mRequestQ.IndexOf(trans);
+43113:     if (index >= 0) {
+43113:         if (index == 0 && mRequestIsPartial) {
+43113:             // the transaction is in the request queue.  check to see if any of
+43113:             // its data has been written out yet.
+43113:             killPipeline = PR_TRUE;
+43113:         }
+43113:         mRequestQ.RemoveElementAt(index);
+43113:     }
+43113:     else {
+43113:         index = mResponseQ.IndexOf(trans);
+43113:         if (index >= 0)
+43113:             mResponseQ.RemoveElementAt(index);
+43113:         // while we could avoid killing the pipeline if this transaction is the
+43113:         // last transaction in the pipeline, there doesn't seem to be that much
+43113:         // value in doing so.  most likely if this transaction is going away,
+43113:         // the others will be shortly as well.
+43113:         killPipeline = PR_TRUE;
+43113:     }
+43113: 
+43113:     trans->Close(reason);
+43113:     NS_RELEASE(trans);
+43113: 
+43113:     if (killPipeline) {
+43113:         if (mConnection)
+43113:             mConnection->CloseTransaction(this, reason);
+43113:         else
+43113:             Close(reason);
+43113:     }
+43113: }
+43113: 
+43113: void
+43113: nsHttpPipeline::GetConnectionInfo(nsHttpConnectionInfo **result)
+43113: {
+43113:     NS_ASSERTION(mConnection, "no connection");
+43113:     mConnection->GetConnectionInfo(result);
+43113: }
+43113: 
+43113: void
+43113: nsHttpPipeline::GetSecurityInfo(nsISupports **result)
+43113: {
+43113:     NS_ASSERTION(mConnection, "no connection");
+43113:     mConnection->GetSecurityInfo(result);
+43113: }
+43113: 
+43113: PRBool
+43113: nsHttpPipeline::IsPersistent()
+43113: {
+43113:     return PR_TRUE; // pipelining requires this
+43113: }
+43113: 
+43113: PRBool
+43113: nsHttpPipeline::IsReused()
+43113: {
+43113:     return PR_TRUE; // pipelining requires this
+43113: }
+43113: 
+43113: nsresult
+43113: nsHttpPipeline::PushBack(const char *data, PRUint32 length)
+43113: {
+43113:     LOG(("nsHttpPipeline::PushBack [this=%x len=%u]\n", this, length));
+43113:     
+43113:     NS_ASSERTION(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+43113:     NS_ASSERTION(mPushBackLen == 0, "push back buffer already has data!");
+43113: 
+43113:     // PushBack is called recursively from WriteSegments
+43113: 
+43113:     // XXX we have a design decision to make here.  either we buffer the data
+43113:     // and process it when we return to WriteSegments, or we attempt to move
+43113:     // onto the next transaction from here.  doing so adds complexity with the
+43113:     // benefit of eliminating the extra buffer copy.  the buffer is at most
+43113:     // 4096 bytes, so it is really unclear if there is any value in the added
+43113:     // complexity.  besides simplicity, buffering this data has the advantage
+43113:     // that we'll call close on the transaction sooner, which will wake up
+43113:     // the HTTP channel sooner to continue with its work.
+43113: 
+43113:     if (!mPushBackBuf) {
+43113:         mPushBackMax = length;
+43113:         mPushBackBuf = (char *) malloc(mPushBackMax);
+43113:         if (!mPushBackBuf)
+43113:             return NS_ERROR_OUT_OF_MEMORY;
+43113:     }
+43113:     else if (length > mPushBackMax) {
+43113:         // grow push back buffer as necessary.
+43113:         NS_ASSERTION(length <= nsIOService::gDefaultSegmentSize, "too big");
+43113:         mPushBackMax = length;
+43113:         mPushBackBuf = (char *) realloc(mPushBackBuf, mPushBackMax);
+43113:         if (!mPushBackBuf)
+43113:             return NS_ERROR_OUT_OF_MEMORY;
+43113:     }
+43113:  
+43113:     memcpy(mPushBackBuf, data, length);
+43113:     mPushBackLen = length;
+43113: 
+43113:     return NS_OK;
+43113: }
+43113: 
+43113: //-----------------------------------------------------------------------------
+43113: // nsHttpPipeline::nsAHttpConnection
+43113: //-----------------------------------------------------------------------------
+43113: 
+43113: void
+43113: nsHttpPipeline::SetConnection(nsAHttpConnection *conn)
+43113: {
+43113:     LOG(("nsHttpPipeline::SetConnection [this=%x conn=%x]\n", this, conn));
+43113: 
+43113:     NS_ASSERTION(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+43113:     NS_ASSERTION(!mConnection, "already have a connection");
+43113: 
+43113:     NS_IF_ADDREF(mConnection = conn);
+43113: 
+43113:     PRInt32 i, count = mRequestQ.Length();
+43113:     for (i=0; i<count; ++i)
+43113:         Request(i)->SetConnection(this);
+43113: }
+43113: 
+43113: void
+43113: nsHttpPipeline::GetSecurityCallbacks(nsIInterfaceRequestor **result)
+43113: {
+43113:     NS_ASSERTION(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+43113: 
+43113:     // return security callbacks from first request
+43113:     nsAHttpTransaction *trans = Request(0);
+43113:     if (trans)
+43113:         trans->GetSecurityCallbacks(result);
+43113:     else
+43113:         *result = nsnull;
+43113: }
+43113: 
+43113: void
+43113: nsHttpPipeline::OnTransportStatus(nsresult status, PRUint64 progress)
+43113: {
+43113:     LOG(("nsHttpPipeline::OnStatus [this=%x status=%x progress=%llu]\n",
+43113:         this, status, progress));
+43113: 
+43113:     NS_ASSERTION(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+43113: 
+43113:     nsAHttpTransaction *trans;
+43113:     switch (status) {
+43113:     case NS_NET_STATUS_RECEIVING_FROM:
+43113:         // forward this only to the transaction currently recieving data 
+43113:         trans = Response(0);
+43113:         if (trans)
+43113:             trans->OnTransportStatus(status, progress);
+43113:         break;
+43113:     default:
+43113:         // forward other notifications to all transactions
+43113:         PRInt32 i, count = mRequestQ.Length();
+43113:         for (i=0; i<count; ++i) {
+43113:             trans = Request(i);
+43113:             if (trans)
+43113:                 trans->OnTransportStatus(status, progress);
+43113:         }
+43113:         break;
+43113:     }
+43113: }
+43113: 
+43113: PRBool
+43113: nsHttpPipeline::IsDone()
+43113: {
+43113:     return (mRequestQ.Length() == 0) && (mResponseQ.Length() == 0);
+43113: }
+43113: 
+43113: nsresult
+43113: nsHttpPipeline::Status()
+43113: {
+43113:     return mStatus;
+43113: }
+43113: 
+43113: PRUint32
+43113: nsHttpPipeline::Available()
+43113: {
+43113:     PRUint32 result = 0;
+43113: 
+43113:     PRInt32 i, count = mRequestQ.Length();
+43113:     for (i=0; i<count; ++i)
+43113:         result += Request(i)->Available();
+43113:     return result;
+43113: }
+43113: 
+43113: NS_METHOD
+43113: nsHttpPipeline::ReadFromPipe(nsIInputStream *stream,
+43113:                              void *closure,
+43113:                              const char *buf,
+43113:                              PRUint32 offset,
+43113:                              PRUint32 count,
+43113:                              PRUint32 *countRead)
+43113: {
+43113:     nsHttpPipeline *self = (nsHttpPipeline *) closure;
+43113:     return self->mReader->OnReadSegment(buf, count, countRead);
+43113: }
+43113: 
+43113: nsresult
+43113: nsHttpPipeline::ReadSegments(nsAHttpSegmentReader *reader,
+43113:                              PRUint32 count,
+43113:                              PRUint32 *countRead)
+43113: {
+43113:     LOG(("nsHttpPipeline::ReadSegments [this=%x count=%u]\n", this, count));
+43113: 
+43113:     NS_ASSERTION(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+43113: 
+43113:     if (mClosed) {
+43113:         *countRead = 0;
+43113:         return mStatus;
+43113:     }
+43113: 
+43113:     nsresult rv;
+43113:     PRUint32 avail = 0;
+43113:     if (mSendBufIn) {
+43113:         rv = mSendBufIn->Available(&avail);
+43113:         if (NS_FAILED(rv)) return rv;
+43113:     }
+43113: 
+43113:     if (avail == 0) {
+43113:         rv = FillSendBuf();
+43113:         if (NS_FAILED(rv)) return rv;
+43113: 
+43113:         rv = mSendBufIn->Available(&avail);
+43113:         if (NS_FAILED(rv)) return rv;
+43113: 
+43113:         // return EOF if send buffer is empty
+43113:         if (avail == 0) {
+43113:             *countRead = 0;
+43113:             return NS_OK;
+43113:         }
+43113:     }
+43113: 
+43113:     // read no more than what was requested
+43113:     if (avail > count)
+43113:         avail = count;
+43113: 
+43113:     mReader = reader;
+43113: 
+43113:     rv = mSendBufIn->ReadSegments(ReadFromPipe, this, avail, countRead);
+43113: 
+43113:     mReader = nsnull;
+43113:     return rv;
+43113: }
+43113: 
+43113: nsresult
+43113: nsHttpPipeline::WriteSegments(nsAHttpSegmentWriter *writer,
+43113:                               PRUint32 count,
+43113:                               PRUint32 *countWritten)
+43113: {
+43113:     LOG(("nsHttpPipeline::WriteSegments [this=%x count=%u]\n", this, count));
+43113: 
+43113:     NS_ASSERTION(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+43113: 
+43113:     if (mClosed)
+43113:         return NS_SUCCEEDED(mStatus) ? NS_BASE_STREAM_CLOSED : mStatus;
+43113: 
+43113:     nsAHttpTransaction *trans; 
+43113:     nsresult rv;
+43113: 
+43113:     trans = Response(0);
+43113:     if (!trans) {
+43113:         if (mRequestQ.Length() > 0)
+43113:             rv = NS_BASE_STREAM_WOULD_BLOCK;
+43113:         else
+43113:             rv = NS_BASE_STREAM_CLOSED;
+43113:     }
+43113:     else {
+43113:         // 
+43113:         // ask the transaction to consume data from the connection.
+43113:         // PushBack may be called recursively.
+43113:         //
+43113:         rv = trans->WriteSegments(writer, count, countWritten);
+43113: 
+43113:         if (rv == NS_BASE_STREAM_CLOSED || trans->IsDone()) {
+43113:             trans->Close(NS_OK);
+43113:             NS_RELEASE(trans);
+43113:             mResponseQ.RemoveElementAt(0);
+43113:             mResponseIsPartial = PR_FALSE;
+43113: 
+43113:             // ask the connection manager to add additional transactions
+43113:             // to our pipeline.
+43113:             gHttpHandler->ConnMgr()->AddTransactionToPipeline(this);
+43113:         }
+43113:         else
+43113:             mResponseIsPartial = PR_TRUE;
+43113:     }
+43113: 
+43113:     if (mPushBackLen) {
+43113:         nsHttpPushBackWriter writer(mPushBackBuf, mPushBackLen);
+43113:         PRUint32 len = mPushBackLen, n;
+43113:         mPushBackLen = 0;
+43113:         // the push back buffer is never larger than NS_HTTP_SEGMENT_SIZE,
+43113:         // so we are guaranteed that the next response will eat the entire
+43113:         // push back buffer (even though it might again call PushBack).
+43113:         rv = WriteSegments(&writer, len, &n);
+43113:     }
+43113: 
+43113:     return rv;
+43113: }
+43113: 
+43113: void
+43113: nsHttpPipeline::Close(nsresult reason)
+43113: {
+43113:     LOG(("nsHttpPipeline::Close [this=%x reason=%x]\n", this, reason));
+43113: 
+43113:     if (mClosed) {
+43113:         LOG(("  already closed\n"));
+43113:         return;
+43113:     }
+43113: 
+43113:     // the connection is going away!
+43113:     mStatus = reason;
+43113:     mClosed = PR_TRUE;
+43113: 
+43113:     PRUint32 i, count;
+43113:     nsAHttpTransaction *trans;
+43113: 
+43113:     // any pending requests can ignore this error and be restarted
+43113:     count = mRequestQ.Length();
+43113:     for (i=0; i<count; ++i) {
+43113:         trans = Request(i);
+43113:         trans->Close(NS_ERROR_NET_RESET);
+43113:         NS_RELEASE(trans);
+43113:     }
+43113:     mRequestQ.Clear();
+43113: 
+43113:     trans = Response(0);
+43113:     if (trans) {
+43113:         // if the current response is partially complete, then it cannot be
+43113:         // restarted and will have to fail with the status of the connection.
+43113:         if (mResponseIsPartial)
+43113:             trans->Close(reason);
+43113:         else
+43113:             trans->Close(NS_ERROR_NET_RESET);
+43113:         NS_RELEASE(trans);
+43113:         
+43113:         // any remaining pending responses can be restarted
+43113:         count = mResponseQ.Length();
+43113:         for (i=1; i<count; ++i) {
+43113:             trans = Response(i);
+43113:             trans->Close(NS_ERROR_NET_RESET);
+43113:             NS_RELEASE(trans);
+43113:         }
+43113:         mResponseQ.Clear();
+43113:     }
+58921: 
+58921:     // we must no longer reference the connection!
+58921:     NS_IF_RELEASE(mConnection);
+43113: }
+43113: 
+43113: nsresult
+43113: nsHttpPipeline::OnReadSegment(const char *segment,
+43113:                               PRUint32 count,
+43113:                               PRUint32 *countRead)
+43113: {
+43113:     return mSendBufOut->Write(segment, count, countRead);
+43113: }
+43113: 
+43113: nsresult
+43113: nsHttpPipeline::FillSendBuf()
+43113: {
+43113:     // reads from request queue, moving transactions to response queue
+43113:     // when they have been completely read.
+43113: 
+43113:     nsresult rv;
+43113:     
+43113:     if (!mSendBufIn) {
+43113:         // allocate a single-segment pipe
+43113:         rv = NS_NewPipe(getter_AddRefs(mSendBufIn),
+43113:                         getter_AddRefs(mSendBufOut),
+43113:                         nsIOService::gDefaultSegmentSize,  /* segment size */
+43113:                         nsIOService::gDefaultSegmentSize,  /* max size */
+43113:                         PR_TRUE, PR_TRUE,
+43113:                         nsIOService::gBufferCache);
+43113:         if (NS_FAILED(rv)) return rv;
+43113:     }
+43113: 
+43113:     PRUint32 n, avail;
+43113:     nsAHttpTransaction *trans;
+43113:     while ((trans = Request(0)) != nsnull) {
+43113:         avail = trans->Available();
+43113:         if (avail) {
+43113:             rv = trans->ReadSegments(this, avail, &n);
+43113:             if (NS_FAILED(rv)) return rv;
+43113:             
+43113:             if (n == 0) {
+43113:                 LOG(("send pipe is full"));
+43113:                 break;
+43113:             }
+43113:         }
+43113:         avail = trans->Available();
+43113:         if (avail == 0) {
+43113:             // move transaction from request queue to response queue
+43113:             mRequestQ.RemoveElementAt(0);
+43113:             mResponseQ.AppendElement(trans);
+43113:             mRequestIsPartial = PR_FALSE;
+43113:         }
+43113:         else
+43113:             mRequestIsPartial = PR_TRUE;
+43113:     }
+43113:     return NS_OK;
+43113: }

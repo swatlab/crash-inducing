@@ -1,0 +1,791 @@
+115189: /* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+115189: /* vim:set ts=2 sw=2 sts=2 et cindent: */
+115189: /* This Source Code Form is subject to the terms of the Mozilla Public
+115189:  * License, v. 2.0. If a copy of the MPL was not distributed with this
+115189:  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+115189: 
+115189: #include "ProxyAutoConfig.h"
+115189: #include "nsICancelable.h"
+115189: #include "nsIDNSListener.h"
+115189: #include "nsIDNSRecord.h"
+115189: #include "nsIDNSService.h"
+115189: #include "nsNetUtil.h"
+115189: #include "nsThreadUtils.h"
+115189: #include "nsIConsoleService.h"
+115189: #include "nsJSUtils.h"
+115191: #include "prnetdb.h"
+115191: #include "nsITimer.h"
+115189: 
+115189: namespace mozilla {
+115189: namespace net {
+115189: 
+115189: // These are some global helper symbols the PAC format requires that we provide that
+115189: // are initialized as part of the global javascript context used for PAC evaluations.
+115189: // Additionally dnsResolve(host) and myIpAddress() are supplied in the same context
+115189: // but are implemented as c++ helpers. proxyAlert(msg) is similarly defined, but that
+115189: // is a gecko specific extension.
+115189: 
+115189: static const char *sPacUtils =
+115189:   "function dnsDomainIs(host, domain) {\n"
+115189:   "    return (host.length >= domain.length &&\n"
+115189:   "            host.substring(host.length - domain.length) == domain);\n"
+115189:   "}\n"
+115189:   ""
+115189:   "function dnsDomainLevels(host) {\n"
+115189:   "    return host.split('.').length - 1;\n"
+115189:   "}\n"
+115189:   ""
+115189:   "function convert_addr(ipchars) {\n"
+115189:   "    var bytes = ipchars.split('.');\n"
+115189:   "    var result = ((bytes[0] & 0xff) << 24) |\n"
+115189:   "                 ((bytes[1] & 0xff) << 16) |\n"
+115189:   "                 ((bytes[2] & 0xff) <<  8) |\n"
+115189:   "                  (bytes[3] & 0xff);\n"
+115189:   "    return result;\n"
+115189:   "}\n"
+115189:   ""
+115189:   "function isInNet(ipaddr, pattern, maskstr) {\n"
+115189:   "    var test = /^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$/.exec(ipaddr);\n"
+115189:   "    if (test == null) {\n"
+115189:   "        ipaddr = dnsResolve(ipaddr);\n"
+115189:   "        if (ipaddr == null)\n"
+115189:   "            return false;\n"
+115189:   "    } else if (test[1] > 255 || test[2] > 255 || \n"
+115189:   "               test[3] > 255 || test[4] > 255) {\n"
+115189:   "        return false;    // not an IP address\n"
+115189:   "    }\n"
+115189:   "    var host = convert_addr(ipaddr);\n"
+115189:   "    var pat  = convert_addr(pattern);\n"
+115189:   "    var mask = convert_addr(maskstr);\n"
+115189:   "    return ((host & mask) == (pat & mask));\n"
+115189:   "    \n"
+115189:   "}\n"
+115189:   ""
+115189:   "function isPlainHostName(host) {\n"
+115189:   "    return (host.search('\\\\.') == -1);\n"
+115189:   "}\n"
+115189:   ""
+115189:   "function isResolvable(host) {\n"
+115189:   "    var ip = dnsResolve(host);\n"
+115189:   "    return (ip != null);\n"
+115189:   "}\n"
+115189:   ""
+115189:   "function localHostOrDomainIs(host, hostdom) {\n"
+115189:   "    return (host == hostdom) ||\n"
+115189:   "           (hostdom.lastIndexOf(host + '.', 0) == 0);\n"
+115189:   "}\n"
+115189:   ""
+115189:   "function shExpMatch(url, pattern) {\n"
+115189:   "   pattern = pattern.replace(/\\./g, '\\\\.');\n"
+115189:   "   pattern = pattern.replace(/\\*/g, '.*');\n"
+115189:   "   pattern = pattern.replace(/\\?/g, '.');\n"
+115189:   "   var newRe = new RegExp('^'+pattern+'$');\n"
+115189:   "   return newRe.test(url);\n"
+115189:   "}\n"
+115189:   ""
+115189:   "var wdays = {SUN: 0, MON: 1, TUE: 2, WED: 3, THU: 4, FRI: 5, SAT: 6};\n"
+115189:   "var months = {JAN: 0, FEB: 1, MAR: 2, APR: 3, MAY: 4, JUN: 5, JUL: 6, AUG: 7, SEP: 8, OCT: 9, NOV: 10, DEC: 11};\n"
+115189:   ""
+115189:   "function weekdayRange() {\n"
+115189:   "    function getDay(weekday) {\n"
+115189:   "        if (weekday in wdays) {\n"
+115189:   "            return wdays[weekday];\n"
+115189:   "        }\n"
+115189:   "        return -1;\n"
+115189:   "    }\n"
+115189:   "    var date = new Date();\n"
+115189:   "    var argc = arguments.length;\n"
+115189:   "    var wday;\n"
+115189:   "    if (argc < 1)\n"
+115189:   "        return false;\n"
+115189:   "    if (arguments[argc - 1] == 'GMT') {\n"
+115189:   "        argc--;\n"
+115189:   "        wday = date.getUTCDay();\n"
+115189:   "    } else {\n"
+115189:   "        wday = date.getDay();\n"
+115189:   "    }\n"
+115189:   "    var wd1 = getDay(arguments[0]);\n"
+115189:   "    var wd2 = (argc == 2) ? getDay(arguments[1]) : wd1;\n"
+115189:   "    return (wd1 == -1 || wd2 == -1) ? false\n"
+115189:   "                                    : (wd1 <= wday && wday <= wd2);\n"
+115189:   "}\n"
+115189:   ""
+115189:   "function dateRange() {\n"
+115189:   "    function getMonth(name) {\n"
+115189:   "        if (name in months) {\n"
+115189:   "            return months[name];\n"
+115189:   "        }\n"
+115189:   "        return -1;\n"
+115189:   "    }\n"
+115189:   "    var date = new Date();\n"
+115189:   "    var argc = arguments.length;\n"
+115189:   "    if (argc < 1) {\n"
+115189:   "        return false;\n"
+115189:   "    }\n"
+115189:   "    var isGMT = (arguments[argc - 1] == 'GMT');\n"
+115189:   "\n"
+115189:   "    if (isGMT) {\n"
+115189:   "        argc--;\n"
+115189:   "    }\n"
+115189:   "    // function will work even without explict handling of this case\n"
+115189:   "    if (argc == 1) {\n"
+115189:   "        var tmp = parseInt(arguments[0]);\n"
+115189:   "        if (isNaN(tmp)) {\n"
+115189:   "            return ((isGMT ? date.getUTCMonth() : date.getMonth()) ==\n"
+115189:   "                     getMonth(arguments[0]));\n"
+115189:   "        } else if (tmp < 32) {\n"
+115189:   "            return ((isGMT ? date.getUTCDate() : date.getDate()) == tmp);\n"
+115189:   "        } else { \n"
+115189:   "            return ((isGMT ? date.getUTCFullYear() : date.getFullYear()) ==\n"
+115189:   "                     tmp);\n"
+115189:   "        }\n"
+115189:   "    }\n"
+115189:   "    var year = date.getFullYear();\n"
+115189:   "    var date1, date2;\n"
+115189:   "    date1 = new Date(year,  0,  1,  0,  0,  0);\n"
+115189:   "    date2 = new Date(year, 11, 31, 23, 59, 59);\n"
+115189:   "    var adjustMonth = false;\n"
+115189:   "    for (var i = 0; i < (argc >> 1); i++) {\n"
+115189:   "        var tmp = parseInt(arguments[i]);\n"
+115189:   "        if (isNaN(tmp)) {\n"
+115189:   "            var mon = getMonth(arguments[i]);\n"
+115189:   "            date1.setMonth(mon);\n"
+115189:   "        } else if (tmp < 32) {\n"
+115189:   "            adjustMonth = (argc <= 2);\n"
+115189:   "            date1.setDate(tmp);\n"
+115189:   "        } else {\n"
+115189:   "            date1.setFullYear(tmp);\n"
+115189:   "        }\n"
+115189:   "    }\n"
+115189:   "    for (var i = (argc >> 1); i < argc; i++) {\n"
+115189:   "        var tmp = parseInt(arguments[i]);\n"
+115189:   "        if (isNaN(tmp)) {\n"
+115189:   "            var mon = getMonth(arguments[i]);\n"
+115189:   "            date2.setMonth(mon);\n"
+115189:   "        } else if (tmp < 32) {\n"
+115189:   "            date2.setDate(tmp);\n"
+115189:   "        } else {\n"
+115189:   "            date2.setFullYear(tmp);\n"
+115189:   "        }\n"
+115189:   "    }\n"
+115189:   "    if (adjustMonth) {\n"
+115189:   "        date1.setMonth(date.getMonth());\n"
+115189:   "        date2.setMonth(date.getMonth());\n"
+115189:   "    }\n"
+115189:   "    if (isGMT) {\n"
+115189:   "    var tmp = date;\n"
+115189:   "        tmp.setFullYear(date.getUTCFullYear());\n"
+115189:   "        tmp.setMonth(date.getUTCMonth());\n"
+115189:   "        tmp.setDate(date.getUTCDate());\n"
+115189:   "        tmp.setHours(date.getUTCHours());\n"
+115189:   "        tmp.setMinutes(date.getUTCMinutes());\n"
+115189:   "        tmp.setSeconds(date.getUTCSeconds());\n"
+115189:   "        date = tmp;\n"
+115189:   "    }\n"
+115189:   "    return ((date1 <= date) && (date <= date2));\n"
+115189:   "}\n"
+115189:   ""
+115189:   "function timeRange() {\n"
+115189:   "    var argc = arguments.length;\n"
+115189:   "    var date = new Date();\n"
+115189:   "    var isGMT= false;\n"
+115189:   ""
+115189:   "    if (argc < 1) {\n"
+115189:   "        return false;\n"
+115189:   "    }\n"
+115189:   "    if (arguments[argc - 1] == 'GMT') {\n"
+115189:   "        isGMT = true;\n"
+115189:   "        argc--;\n"
+115189:   "    }\n"
+115189:   "\n"
+115189:   "    var hour = isGMT ? date.getUTCHours() : date.getHours();\n"
+115189:   "    var date1, date2;\n"
+115189:   "    date1 = new Date();\n"
+115189:   "    date2 = new Date();\n"
+115189:   "\n"
+115189:   "    if (argc == 1) {\n"
+115189:   "        return (hour == arguments[0]);\n"
+115189:   "    } else if (argc == 2) {\n"
+115189:   "        return ((arguments[0] <= hour) && (hour <= arguments[1]));\n"
+115189:   "    } else {\n"
+115189:   "        switch (argc) {\n"
+115189:   "        case 6:\n"
+115189:   "            date1.setSeconds(arguments[2]);\n"
+115189:   "            date2.setSeconds(arguments[5]);\n"
+115189:   "        case 4:\n"
+115189:   "            var middle = argc >> 1;\n"
+115189:   "            date1.setHours(arguments[0]);\n"
+115189:   "            date1.setMinutes(arguments[1]);\n"
+115189:   "            date2.setHours(arguments[middle]);\n"
+115189:   "            date2.setMinutes(arguments[middle + 1]);\n"
+115189:   "            if (middle == 2) {\n"
+115189:   "                date2.setSeconds(59);\n"
+115189:   "            }\n"
+115189:   "            break;\n"
+115189:   "        default:\n"
+115189:   "          throw 'timeRange: bad number of arguments'\n"
+115189:   "        }\n"
+115189:   "    }\n"
+115189:   "\n"
+115189:   "    if (isGMT) {\n"
+115189:   "        date.setFullYear(date.getUTCFullYear());\n"
+115189:   "        date.setMonth(date.getUTCMonth());\n"
+115189:   "        date.setDate(date.getUTCDate());\n"
+115189:   "        date.setHours(date.getUTCHours());\n"
+115189:   "        date.setMinutes(date.getUTCMinutes());\n"
+115189:   "        date.setSeconds(date.getUTCSeconds());\n"
+115189:   "    }\n"
+115189:   "    return ((date1 <= date) && (date <= date2));\n"
+115189:   "}\n"
+115189:   "";
+115189: 
+115191: // sRunning is defined for the helper functions only while the
+115191: // Javascript engine is running and the PAC object cannot be deleted
+115191: // or reset.
+115191: static ProxyAutoConfig *sRunning = nullptr;
+115191: 
+115189: // The PACResolver is used for dnsResolve()
+115189: class PACResolver MOZ_FINAL : public nsIDNSListener
+115191:                             , public nsITimerCallback
+115189: {
+115189: public:
+115189:   NS_DECL_ISUPPORTS
+115189: 
+115189:   PACResolver()
+115189:     : mStatus(NS_ERROR_FAILURE)
+115189:   {
+115189:   }
+115189: 
+115191:   // nsIDNSListener
+115189:   NS_IMETHODIMP OnLookupComplete(nsICancelable *request,
+115189:                                  nsIDNSRecord *record,
+115189:                                  nsresult status)
+115189:   {
+115191:     if (mTimer) {
+115191:       mTimer->Cancel();
+115191:       mTimer = nullptr;
+115191:     }
+115191: 
+115189:     mRequest = nullptr;
+115189:     mStatus = status;
+115189:     mResponse = record;
+115189:     return NS_OK;
+115189:   }
+115189: 
+115191:   // nsITimerCallback
+115191:   NS_IMETHODIMP Notify(nsITimer *timer) 
+115191:   {
+115191:     if (mRequest)
+115191:       mRequest->Cancel(NS_ERROR_NET_TIMEOUT);
+115191:     mTimer = nullptr;
+115191:     return NS_OK;
+115191:   }
+115191: 
+115189:   nsresult                mStatus;
+115189:   nsCOMPtr<nsICancelable> mRequest;
+115189:   nsCOMPtr<nsIDNSRecord>  mResponse;
+115191:   nsCOMPtr<nsITimer>      mTimer;
+115189: };
+115191: NS_IMPL_THREADSAFE_ISUPPORTS2(PACResolver, nsIDNSListener, nsITimerCallback)
+115189: 
+115189: static
+115189: void PACLogToConsole(nsString &aMessage)
+115189: {
+115189:   nsCOMPtr<nsIConsoleService> consoleService =
+115189:     do_GetService(NS_CONSOLESERVICE_CONTRACTID);
+115189:   if (!consoleService)
+115189:     return;
+115189: 
+115189:   consoleService->LogStringMessage(aMessage.get());
+115189: }
+115189: 
+115189: // Javascript errors are logged to the main error console
+115189: static void
+115189: PACErrorReporter(JSContext *cx, const char *message, JSErrorReport *report)
+115189: {
+115189:   nsString formattedMessage(NS_LITERAL_STRING("PAC Execution Error: "));
+115189:   formattedMessage += report->ucmessage;
+115189:   formattedMessage += NS_LITERAL_STRING(" [");
+115189:   formattedMessage += report->uclinebuf;
+115189:   formattedMessage += NS_LITERAL_STRING("]");
+115189:   PACLogToConsole(formattedMessage);
+115189: }
+115189: 
+115191: // timeout of 0 means the normal necko timeout strategy, otherwise the dns request
+115191: // will be canceled after aTimeout milliseconds
+115189: static
+115191: JSBool PACResolve(const nsCString &aHostName, PRNetAddr *aNetAddr,
+115191:                   unsigned int aTimeout)
+115191: {
+115191:   if (!sRunning) {
+115191:     NS_WARNING("PACResolve without a running ProxyAutoConfig object");
+115191:     return false;
+115191:   }
+115191: 
+115191:   return sRunning->ResolveAddress(aHostName, aNetAddr, aTimeout);
+115191: }
+115191: 
+115191: bool
+115191: ProxyAutoConfig::ResolveAddress(const nsCString &aHostName,
+115191:                                 PRNetAddr *aNetAddr,
+115191:                                 unsigned int aTimeout)
+115189: {
+115189:   nsCOMPtr<nsIDNSService> dns = do_GetService(NS_DNSSERVICE_CONTRACTID);
+115191:   if (!dns)
+115191:     return false;
+115191: 
+115191:   nsRefPtr<PACResolver> helper = new PACResolver();
+115191: 
+115191:   if (NS_FAILED(dns->AsyncResolve(aHostName, 0, helper,
+115189:                                   NS_GetCurrentThread(),
+115189:                                   getter_AddRefs(helper->mRequest))))
+115189:     return false;
+115189: 
+115191:   if (aTimeout && helper->mRequest) {
+115191:     if (!mTimer)
+115191:       mTimer = do_CreateInstance(NS_TIMER_CONTRACTID);
+115191:     if (mTimer) {
+115191:       mTimer->InitWithCallback(helper, aTimeout, nsITimer::TYPE_ONE_SHOT);
+115191:       helper->mTimer = mTimer;
+115191:     }
+115191:   }
+115191: 
+115189:   // Spin the event loop of the pac thread until lookup is complete.
+115189:   // nsPACman is responsible for keeping a queue and only allowing
+115189:   // one PAC execution at a time even when it is called re-entrantly.
+115189:   while (helper->mRequest)
+115189:     NS_ProcessNextEvent(NS_GetCurrentThread());
+115189: 
+115189:   if (NS_FAILED(helper->mStatus) ||
+115191:       NS_FAILED(helper->mResponse->GetNextAddr(0, aNetAddr)))
+115189:     return false;
+115189:   return true;
+115189: }
+115189: 
+115191: static
+115191: bool PACResolveToString(const nsCString &aHostName,
+115191:                         nsCString &aDottedDecimal,
+115191:                         unsigned int aTimeout)
+115191: {
+115191:   PRNetAddr netAddr;
+115191:   if (!PACResolve(aHostName, &netAddr, aTimeout))
+115191:     return false;
+115191: 
+115191:   char dottedDecimal[128];
+115191:   if (PR_NetAddrToString(&netAddr, dottedDecimal, sizeof(dottedDecimal)) != PR_SUCCESS)
+115191:     return false;
+115191: 
+115191:   aDottedDecimal.Assign(dottedDecimal);
+115191:   return true;
+115191: }
+115191: 
+115189: // dnsResolve(host) javascript implementation
+115189: static
+115189: JSBool PACDnsResolve(JSContext *cx, unsigned int argc, jsval *vp)
+115189: {
+115189:   if (NS_IsMainThread()) {
+115189:     NS_WARNING("DNS Resolution From PAC on Main Thread. How did that happen?");
+115189:     return false;
+115189:   }
+115189: 
+115189:   JSString *arg1 = nullptr;
+115189:   if (!JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "S", &arg1))
+115189:     return false;
+115189: 
+115189:   nsDependentJSString hostName;
+115191:   nsAutoCString dottedDecimal;
+115189: 
+115189:   if (!hostName.init(cx, arg1))
+115189:     return false;
+115191:   if (!PACResolveToString(NS_ConvertUTF16toUTF8(hostName), dottedDecimal, 0))
+115189:     return false;
+115189: 
+115189:   JSString *dottedDecimalString = JS_NewStringCopyZ(cx, dottedDecimal.get());
+115189:   JS_SET_RVAL(cx, vp, STRING_TO_JSVAL(dottedDecimalString));
+115189:   return true;
+115189: }
+115189: 
+115189: // myIpAddress() javascript implementation
+115189: static
+115189: JSBool PACMyIpAddress(JSContext *cx, unsigned int argc, jsval *vp)
+115189: {
+115189:   if (NS_IsMainThread()) {
+115189:     NS_WARNING("DNS Resolution From PAC on Main Thread. How did that happen?");
+115189:     return false;
+115189:   }
+115189: 
+115191:   if (!sRunning) {
+115191:     NS_WARNING("PAC myIPAddress without a running ProxyAutoConfig object");
+115191:     return JS_FALSE;
+115189:   }
+115189: 
+115191:   return sRunning->MyIPAddress(vp);
+115189: }
+115189: 
+115189: // proxyAlert(msg) javascript implementation
+115189: static
+115189: JSBool PACProxyAlert(JSContext *cx, unsigned int argc, jsval *vp)
+115189: {
+115189:   JSString *arg1 = nullptr;
+115189:   if (!JS_ConvertArguments(cx, argc, JS_ARGV(cx, vp), "S", &arg1))
+115189:     return false;
+115189: 
+115189:   nsDependentJSString message;
+115189:   if (!message.init(cx, arg1))
+115189:     return false;
+115189: 
+115189:   nsString alertMessage;
+115189:   alertMessage.SetCapacity(32 + message.Length());
+115189:   alertMessage += NS_LITERAL_STRING("PAC-alert: ");
+115189:   alertMessage += message;
+115189:   PACLogToConsole(alertMessage);
+115189: 
+115189:   JS_SET_RVAL(cx, vp, JSVAL_VOID);  /* return undefined */
+115189:   return true;
+115189: }
+115189: 
+115189: static JSFunctionSpec PACGlobalFunctions[] = {
+115189:   JS_FS("dnsResolve", PACDnsResolve, 1, 0),
+115189:   JS_FS("myIpAddress", PACMyIpAddress, 0, 0),
+115189:   JS_FS("proxyAlert", PACProxyAlert, 1, 0),
+115189:   JS_FS_END
+115189: };
+115189: 
+115189: // JSRuntimeWrapper is a c++ object that manages the runtime and context
+115189: // for the JS engine used on the PAC thread. It is initialized and destroyed
+115189: // on the PAC thread.
+115189: class JSRuntimeWrapper
+115189: {
+115189:  public:
+115189:   static JSRuntimeWrapper *Create()
+115189:   {
+115189:     JSRuntimeWrapper *entry = new JSRuntimeWrapper();
+115189: 
+115189:     if (NS_FAILED(entry->Init())) {
+115189:       delete entry;
+115189:       return nullptr;
+115189:     }
+115189: 
+115189:     return entry;
+115189:   }
+115189: 
+115189:   JSContext *Context() const
+115189:   {
+115189:     return mContext;
+115189:   }
+115189: 
+115189:   JSObject *Global() const
+115189:   {
+115189:     return mGlobal;
+115189:   }
+115189: 
+115189:   ~JSRuntimeWrapper()
+115189:   {
+115189:     MOZ_COUNT_DTOR(JSRuntimeWrapper);
+115189:     if (mContext) {
+115189:       JS_DestroyContext(mContext);
+115189:     }
+115189: 
+115189:     if (mRuntime) {
+115189:       JS_DestroyRuntime(mRuntime);
+115189:     }
+115189:   }
+115189: 
+115189:   void SetOK()
+115189:   {
+115189:     mOK = true;
+115189:   }
+115189: 
+115189:   bool IsOK()
+115189:   {
+115189:     return mOK;
+115189:   }
+115189: 
+115189: private:
+115189:   static const unsigned sRuntimeHeapSize = 2 << 20;
+115189: 
+115189:   JSRuntime *mRuntime;
+115189:   JSContext *mContext;
+115189:   JSObject  *mGlobal;
+115189:   bool      mOK;
+115189: 
+115189:   static JSClass sGlobalClass;
+115189: 
+115189:   JSRuntimeWrapper()
+115189:     : mRuntime(nullptr), mContext(nullptr), mGlobal(nullptr), mOK(false)
+115189:   {
+115189:       MOZ_COUNT_CTOR(JSRuntimeWrapper);
+115189:   }
+115189: 
+115189:   nsresult Init()
+115189:   {
+115189:     mRuntime = JS_NewRuntime(sRuntimeHeapSize);
+115189:     NS_ENSURE_TRUE(mRuntime, NS_ERROR_OUT_OF_MEMORY);
+115189: 
+115189:     mContext = JS_NewContext(mRuntime, 0);
+115189:     NS_ENSURE_TRUE(mContext, NS_ERROR_OUT_OF_MEMORY);
+115189: 
+115189:     JSAutoRequest ar(mContext);
+115189: 
+115189:     mGlobal = JS_NewGlobalObject(mContext, &sGlobalClass, nullptr);
+115189:     NS_ENSURE_TRUE(mGlobal, NS_ERROR_OUT_OF_MEMORY);
+115189: 
+115189:     JS_SetGlobalObject(mContext, mGlobal);
+115189:     JS_InitStandardClasses(mContext, mGlobal);
+115189: 
+115189:     JS_SetVersion(mContext, JSVERSION_LATEST);
+115189:     JS_SetErrorReporter(mContext, PACErrorReporter);
+115189: 
+115189:     if (!JS_DefineFunctions(mContext, mGlobal, PACGlobalFunctions))
+115189:       return NS_ERROR_FAILURE;
+115189: 
+115189:     return NS_OK;
+115189:   }
+115189: };
+115189: 
+115189: JSClass JSRuntimeWrapper::sGlobalClass = {
+115189:   "PACResolutionThreadGlobal",
+115189:   JSCLASS_GLOBAL_FLAGS,
+115189:   JS_PropertyStub, JS_PropertyStub, JS_PropertyStub, JS_StrictPropertyStub,
+115189:   JS_EnumerateStub, JS_ResolveStub, JS_ConvertStub
+115189: };
+115189: 
+115189: nsresult
+115189: ProxyAutoConfig::Init(const nsCString &aPACURI,
+115189:                       const nsCString &aPACScript)
+115189: {
+115189:   mPACURI = aPACURI;
+115189:   mPACScript = sPacUtils;
+115189:   mPACScript.Append(aPACScript);
+115189: 
+115191:   if (!sRunning)
+115189:     return SetupJS();
+115189: 
+115189:   mJSNeedsSetup = true;
+115189:   return NS_OK;
+115189: }
+115189: 
+115189: nsresult
+115189: ProxyAutoConfig::SetupJS()
+115189: {
+115189:   mJSNeedsSetup = false;
+115191:   NS_ABORT_IF_FALSE(!sRunning, "JIT is running");
+115189: 
+115189:   delete mJSRuntime;
+115189:   mJSRuntime = nullptr;
+115189: 
+115189:   if (mPACScript.IsEmpty())
+115189:     return NS_ERROR_FAILURE;
+115189: 
+115189:   mJSRuntime = JSRuntimeWrapper::Create();
+115189:   if (!mJSRuntime)
+115189:     return NS_ERROR_FAILURE;
+115189: 
+115189:   JSAutoRequest ar(mJSRuntime->Context());
+115189: 
+115189:   JSScript *script = JS_CompileScript(mJSRuntime->Context(),
+115189:                                       mJSRuntime->Global(),
+115189:                                       mPACScript.get(), mPACScript.Length(),
+115189:                                       mPACURI.get(), 1);
+115192:   if (!script ||
+115192:       !JS_ExecuteScript(mJSRuntime->Context(), mJSRuntime->Global(), script, nullptr)) {
+115189:     nsString alertMessage(NS_LITERAL_STRING("PAC file failed to install from "));
+115189:     alertMessage += NS_ConvertUTF8toUTF16(mPACURI);
+115189:     PACLogToConsole(alertMessage);
+115189:     return NS_ERROR_FAILURE;
+115189:   }
+115189: 
+115189:   mJSRuntime->SetOK();
+115189:   nsString alertMessage(NS_LITERAL_STRING("PAC file installed from "));
+115189:   alertMessage += NS_ConvertUTF8toUTF16(mPACURI);
+115189:   PACLogToConsole(alertMessage);
+115189: 
+115189:   // we don't need these now
+115189:   mPACScript.Truncate();
+115189:   mPACURI.Truncate();
+115189: 
+115189:   return NS_OK;
+115189: }
+115189: 
+115189: nsresult
+115189: ProxyAutoConfig::GetProxyForURI(const nsCString &aTestURI,
+115189:                                 const nsCString &aTestHost,
+115189:                                 nsACString &result)
+115189: {
+115189:   if (mJSNeedsSetup)
+115189:     SetupJS();
+115189: 
+115189:   if (!mJSRuntime || !mJSRuntime->IsOK())
+115189:     return NS_ERROR_NOT_AVAILABLE;
+115189: 
+115189:   JSContext *cx = mJSRuntime->Context();
+115189:   JSAutoRequest ar(cx);
+115189: 
+115191:   // the sRunning flag keeps a new PAC file from being installed
+115189:   // while the event loop is spinning on a DNS function. Don't early return.
+115191:   sRunning = this;
+115191:   mRunningHost = aTestHost;
+115189: 
+115189:   nsresult rv = NS_ERROR_FAILURE;
+115189:   js::RootedString uriString(cx, JS_NewStringCopyZ(cx, aTestURI.get()));
+115189:   js::RootedString hostString(cx, JS_NewStringCopyZ(cx, aTestHost.get()));
+115189: 
+115189:   if (uriString && hostString) {
+115189:     js::RootedValue uriValue(cx, STRING_TO_JSVAL(uriString));
+115189:     js::RootedValue hostValue(cx, STRING_TO_JSVAL(hostString));
+115189: 
+115189:     jsval argv[2] = { uriValue, hostValue };
+115189:     jsval rval;
+115189:     JSBool ok = JS_CallFunctionName(cx, mJSRuntime->Global(),
+115189:                                     "FindProxyForURL", 2, argv, &rval);
+115189: 
+115189:     if (ok && rval.isString()) {
+115189:       nsDependentJSString pacString;
+115189:       if (pacString.init(cx, rval.toString())) {
+115189:         CopyUTF16toUTF8(pacString, result);
+115189:         rv = NS_OK;
+115189:       }
+115189:     }
+115189:   }
+115191: 
+115191:   mRunningHost.Truncate();
+115191:   sRunning = nullptr;
+115189:   return rv;
+115189: }
+115189: 
+115189: void
+115189: ProxyAutoConfig::GC()
+115189: {
+115189:   if (!mJSRuntime || !mJSRuntime->IsOK())
+115189:     return;
+115189: 
+115189:   JS_MaybeGC(mJSRuntime->Context());
+115189: }
+115189: 
+115189: ProxyAutoConfig::~ProxyAutoConfig()
+115189: {
+115189:   MOZ_COUNT_DTOR(ProxyAutoConfig);
+115189:   NS_ASSERTION(!mJSRuntime,
+115189:                "~ProxyAutoConfig leaking JS runtime that "
+115189:                "should have been deleted on pac thread");
+115189: }
+115189: 
+115189: void
+115189: ProxyAutoConfig::Shutdown()
+115189: {
+115189:   NS_ABORT_IF_FALSE(!NS_IsMainThread(), "wrong thread for shutdown");
+115189: 
+115191:   if (sRunning || mShutdown)
+115189:     return;
+115189: 
+115189:   mShutdown = true;
+115189:   delete mJSRuntime;
+115189:   mJSRuntime = nullptr;
+115189: }
+115189: 
+115191: bool
+115191: ProxyAutoConfig::SrcAddress(const PRNetAddr *remoteAddress, nsCString &localAddress)
+115191: {
+115191:   PRFileDesc *fd;
+115191:   fd = PR_OpenUDPSocket(remoteAddress->raw.family);
+115191:   if (!fd)
+115191:     return false;
+115191: 
+115191:   if (PR_Connect(fd, remoteAddress, 0) != PR_SUCCESS) {
+115191:     PR_Close(fd);
+115191:     return false;
+115191:   }
+115191: 
+115191:   PRNetAddr localName;
+115191:   if (PR_GetSockName(fd, &localName) != PR_SUCCESS) {
+115191:     PR_Close(fd);
+115191:     return false;
+115191:   }
+115191: 
+115191:   PR_Close(fd);
+115191:   
+115191:   char dottedDecimal[128];
+115191:   if (PR_NetAddrToString(&localName, dottedDecimal, sizeof(dottedDecimal)) != PR_SUCCESS)
+115191:     return false;
+115191:   
+115191:   localAddress.Assign(dottedDecimal);
+115191: 
+115191:   return true;
+115191: }
+115191: 
+115191: // hostName is run through a dns lookup and then a udp socket is connected
+115191: // to the result. If that all works, the local IP address of the socket is
+115191: // returned to the javascript caller and true is returned from this function.
+115191: // otherwise false is returned.
+115191: bool
+115191: ProxyAutoConfig::MyIPAddressTryHost(const nsCString &hostName,
+115191:                                     unsigned int timeout,
+115191:                                     jsval *vp)
+115191: {
+115191:   PRNetAddr remoteAddress;
+115191:   nsAutoCString localDottedDecimal;
+115191:   JSContext *cx = mJSRuntime->Context();
+115191: 
+115191:   if (PACResolve(hostName, &remoteAddress, timeout) &&
+115191:       SrcAddress(&remoteAddress, localDottedDecimal)) {
+115191:     JSString *dottedDecimalString =
+115191:       JS_NewStringCopyZ(cx, localDottedDecimal.get());
+115191:     JS_SET_RVAL(cx, vp, STRING_TO_JSVAL(dottedDecimalString));
+115191:     return true;
+115191:   }
+115191:   return false;
+115191: }
+115191: 
+115191: bool
+115191: ProxyAutoConfig::MyIPAddress(jsval *vp)
+115191: {
+115191:   nsAutoCString remoteDottedDecimal;
+115191:   nsAutoCString localDottedDecimal;
+115191:   JSContext *cx = mJSRuntime->Context();
+115191: 
+115191:   // first, lookup the local address of a socket connected
+115191:   // to the host of uri being resolved by the pac file. This is
+115191:   // v6 safe.. but is the last step like that
+115191:   if (MyIPAddressTryHost(mRunningHost, kTimeout, vp))
+115191:     return true;
+115191: 
+115191:   // next, look for a route to a public internet address that doesn't need DNS.
+115191:   // This is the google anycast dns address, but it doesn't matter if it
+115191:   // remains operable (as we don't contact it) as long as the address stays
+115191:   // in commonly routed IP address space.
+115191:   remoteDottedDecimal.AssignLiteral("8.8.8.8");
+115191:   if (MyIPAddressTryHost(remoteDottedDecimal, 0, vp))
+115191:     return true;
+115191:   
+115191:   // next, use the old algorithm based on the local hostname
+115191:   nsAutoCString hostName;
+115191:   nsCOMPtr<nsIDNSService> dns = do_GetService(NS_DNSSERVICE_CONTRACTID);
+115191:   if (dns && NS_SUCCEEDED(dns->GetMyHostName(hostName)) &&
+115191:       PACResolveToString(hostName, localDottedDecimal, kTimeout)) {
+115191:     JSString *dottedDecimalString =
+115191:       JS_NewStringCopyZ(cx, localDottedDecimal.get());
+115191:     JS_SET_RVAL(cx, vp, STRING_TO_JSVAL(dottedDecimalString));
+115191:     return true;
+115191:   }
+115191: 
+115191:   // next try a couple RFC 1918 variants.. maybe there is a
+115191:   // local route
+115191:   remoteDottedDecimal.AssignLiteral("192.168.0.1");
+115191:   if (MyIPAddressTryHost(remoteDottedDecimal, 0, vp))
+115191:     return true;
+115191: 
+115191:   // more RFC 1918
+115191:   remoteDottedDecimal.AssignLiteral("10.0.0.1");
+115191:   if (MyIPAddressTryHost(remoteDottedDecimal, 0, vp))
+115191:     return true;
+115191: 
+115191:   // who knows? let's fallback to localhost
+115191:   localDottedDecimal.AssignLiteral("127.0.0.1");
+115191:   JSString *dottedDecimalString =
+115191:     JS_NewStringCopyZ(cx, localDottedDecimal.get());
+115191:   JS_SET_RVAL(cx, vp, STRING_TO_JSVAL(dottedDecimalString));
+115191:   return true;
+115191: }
+115191: 
+115189: } // namespace mozilla
+115189: } // namespace mozilla::net

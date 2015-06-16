@@ -1,0 +1,404 @@
+180994: /* This Source Code Form is subject to the terms of the Mozilla Public
+180994:  * License, v. 2.0. If a copy of the MPL was not distributed with this
+180994:  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+180994: 'use strict';
+180994: 
+180994: module.metadata = {
+180994:   'stability': 'unstable'
+180994: };
+180994: 
+180994: const { Class } = require('../core/heritage');
+180994: const { EventTarget } = require('../event/target');
+180994: const { on, off, emit } = require('../event/core');
+180994: const {
+180994:   requiresAddonGlobal,
+180994:   attach, detach, destroy
+180994: } = require('./utils');
+180994: const { delay: async } = require('../lang/functional');
+180994: const { Ci, Cu, Cc } = require('chrome');
+180994: const timer = require('../timers');
+180994: const { URL } = require('../url');
+180994: const { sandbox, evaluate, load } = require('../loader/sandbox');
+180994: const { merge } = require('../util/object');
+180994: const xulApp = require('../system/xul-app');
+180994: const USE_JS_PROXIES = !xulApp.versionInRange(xulApp.platformVersion,
+180994:                                               '17.0a2', '*');
+180994: const { getTabForContentWindow } = require('../tabs/utils');
+180994: 
+180994: // WeakMap of sandboxes so we can access private values
+180994: const sandboxes = new WeakMap();
+180994: 
+180994: /* Trick the linker in order to ensure shipping these files in the XPI.
+180994:   require('./content-worker.js');
+180994:   Then, retrieve URL of these files in the XPI:
+180994: */
+180994: let prefix = module.uri.split('sandbox.js')[0];
+180994: const CONTENT_WORKER_URL = prefix + 'content-worker.js';
+180994: 
+180994: // Fetch additional list of domains to authorize access to for each content
+180994: // script. It is stored in manifest `metadata` field which contains
+180994: // package.json data. This list is originaly defined by authors in
+180994: // `permissions` attribute of their package.json addon file.
+182866: const permissions = require('@loader/options').metadata['permissions'] || {};
+180994: const EXPANDED_PRINCIPALS = permissions['cross-domain-content'] || [];
+180994: 
+180994: const JS_VERSION = '1.8';
+180994: 
+180994: const WorkerSandbox = Class({
+180994: 
+180994:   implements: [
+180994:     EventTarget
+180994:   ],
+180994:   
+180994:   /**
+180994:    * Emit a message to the worker content sandbox
+180994:    */
+180994:   emit: function emit(...args) {
+180994:     // Ensure having an asynchronous behavior
+180994:     let self = this;
+180994:     async(function () {
+180994:       emitToContent(self, JSON.stringify(args, replacer));
+180994:     });
+180994:   },
+180994: 
+180994:   /**
+180994:    * Synchronous version of `emit`.
+180994:    * /!\ Should only be used when it is strictly mandatory /!\
+180994:    *     Doesn't ensure passing only JSON values.
+180994:    *     Mainly used by context-menu in order to avoid breaking it.
+180994:    */
+180994:   emitSync: function emitSync(...args) {
+180994:     return emitToContent(this, args);
+180994:   },
+180994: 
+180994:   /**
+180994:    * Tells if content script has at least one listener registered for one event,
+180994:    * through `self.on('xxx', ...)`.
+180994:    * /!\ Shouldn't be used. Implemented to avoid breaking context-menu API.
+180994:    */
+180994:   hasListenerFor: function hasListenerFor(name) {
+180994:     return modelFor(this).hasListenerFor(name);
+180994:   },
+180994: 
+180994:   /**
+180994:    * Configures sandbox and loads content scripts into it.
+180994:    * @param {Worker} worker
+180994:    *    content worker
+180994:    */
+180994:   initialize: function WorkerSandbox(worker, window) {
+180994:     let model = {};
+180994:     sandboxes.set(this, model);
+180994:     model.worker = worker;
+180994:     // We receive a wrapped window, that may be an xraywrapper if it's content
+180994:     let proto = window;
+180994: 
+180994:     // TODO necessary?
+180994:     // Ensure that `emit` has always the right `this`
+180994:     this.emit = this.emit.bind(this);
+180994:     this.emitSync = this.emitSync.bind(this);
+180994: 
+180994:     // Eventually use expanded principal sandbox feature, if some are given.
+180994:     //
+180994:     // But prevent it when the Worker isn't used for a content script but for
+180994:     // injecting `addon` object into a Panel, Widget, ... scope.
+180994:     // That's because:
+180994:     // 1/ It is useless to use multiple domains as the worker is only used
+180994:     // to communicate with the addon,
+180994:     // 2/ By using it it would prevent the document to have access to any JS
+180994:     // value of the worker. As JS values coming from multiple domain principals
+180994:     // can't be accessed by 'mono-principals' (principal with only one domain).
+180994:     // Even if this principal is for a domain that is specified in the multiple
+180994:     // domain principal.
+180994:     let principals = window;
+180994:     let wantGlobalProperties = [];
+180994:     if (EXPANDED_PRINCIPALS.length > 0 && !requiresAddonGlobal(worker)) {
+180994:       principals = EXPANDED_PRINCIPALS.concat(window);
+180994:       // We have to replace XHR constructor of the content document
+180994:       // with a custom cross origin one, automagically added by platform code:
+180994:       delete proto.XMLHttpRequest;
+180994:       wantGlobalProperties.push('XMLHttpRequest');
+180994:     }
+180994: 
+180994:     // Instantiate trusted code in another Sandbox in order to prevent content
+180994:     // script from messing with standard classes used by proxy and API code.
+180994:     let apiSandbox = sandbox(principals, { wantXrays: true, sameZoneAs: window });
+180994:     apiSandbox.console = console;
+180994: 
+180994:     // Create the sandbox and bind it to window in order for content scripts to
+180994:     // have access to all standard globals (window, document, ...)
+180994:     let content = sandbox(principals, {
+180994:       sandboxPrototype: proto,
+180994:       wantXrays: true,
+180994:       wantGlobalProperties: wantGlobalProperties,
+180994:       sameZoneAs: window,
+182866:       metadata: { SDKContentScript: true }
+180994:     });
+180994:     model.sandbox = content;
+180994:     
+180994:     // We have to ensure that window.top and window.parent are the exact same
+180994:     // object than window object, i.e. the sandbox global object. But not
+180994:     // always, in case of iframes, top and parent are another window object.
+180994:     let top = window.top === window ? content : content.top;
+180994:     let parent = window.parent === window ? content : content.parent;
+180994:     merge(content, {
+180994:       // We need 'this === window === top' to be true in toplevel scope:
+180994:       get window() content,
+180994:       get top() top,
+180994:       get parent() parent,
+180994:       // Use the Greasemonkey naming convention to provide access to the
+180994:       // unwrapped window object so the content script can access document
+180994:       // JavaScript values.
+180994:       // NOTE: this functionality is experimental and may change or go away
+180994:       // at any time!
+180994:       get unsafeWindow() window.wrappedJSObject
+180994:     });
+180994: 
+180994:     // Load trusted code that will inject content script API.
+180994:     // We need to expose JS objects defined in same principal in order to
+180994:     // avoid having any kind of wrapper.
+180994:     load(apiSandbox, CONTENT_WORKER_URL);
+180994: 
+180994:     // prepare a clean `self.options`
+180994:     let options = 'contentScriptOptions' in worker ?
+180994:       JSON.stringify(worker.contentScriptOptions) :
+180994:       undefined;
+180994: 
+180994:     // Then call `inject` method and communicate with this script
+180994:     // by trading two methods that allow to send events to the other side:
+180994:     //   - `onEvent` called by content script
+180994:     //   - `result.emitToContent` called by addon script
+180994:     // Bug 758203: We have to explicitely define `__exposedProps__` in order
+180994:     // to allow access to these chrome object attributes from this sandbox with
+180994:     // content priviledges
+180994:     // https://developer.mozilla.org/en/XPConnect_wrappers#Other_security_wrappers
+180994:     let onEvent = onContentEvent.bind(null, this);
+180994:     // `ContentWorker` is defined in CONTENT_WORKER_URL file
+180994:     let chromeAPI = createChromeAPI();
+180994:     let result = apiSandbox.ContentWorker.inject(content, chromeAPI, onEvent, options);
+180994: 
+180994:     // Merge `emitToContent` and `hasListenerFor` into our private
+180994:     // model of the WorkerSandbox so we can communicate with content
+180994:     // script
+180994:     merge(model, result);
+180994: 
+180994:     // Handle messages send by this script:
+180994:     setListeners(this);
+180994: 
+180994:     // Inject `addon` global into target document if document is trusted,
+180994:     // `addon` in document is equivalent to `self` in content script.
+180994:     if (requiresAddonGlobal(worker)) {
+180994:       Object.defineProperty(getUnsafeWindow(window), 'addon', {
+180994:           value: content.self
+180994:         }
+180994:       );
+180994:     }
+180994: 
+180994:     // Inject our `console` into target document if worker doesn't have a tab
+180994:     // (e.g Panel, PageWorker, Widget).
+180994:     // `worker.tab` can't be used because bug 804935.
+180994:     if (!getTabForContentWindow(window)) {
+180994:       let win = getUnsafeWindow(window);
+180994: 
+180994:       // export our chrome console to content window, using the same approach
+180994:       // of `ConsoleAPI`:
+180994:       // http://mxr.mozilla.org/mozilla-central/source/dom/base/ConsoleAPI.js#150
+180994:       //
+180994:       // and described here:
+180994:       // https://developer.mozilla.org/en-US/docs/Components.utils.createObjectIn
+180994:       let con = Cu.createObjectIn(win);
+180994: 
+180994:       let genPropDesc = function genPropDesc(fun) {
+180994:         return { enumerable: true, configurable: true, writable: true,
+180994:           value: console[fun] };
+180994:       }
+180994: 
+180994:       const properties = {
+180994:         log: genPropDesc('log'),
+180994:         info: genPropDesc('info'),
+180994:         warn: genPropDesc('warn'),
+180994:         error: genPropDesc('error'),
+180994:         debug: genPropDesc('debug'),
+180994:         trace: genPropDesc('trace'),
+180994:         dir: genPropDesc('dir'),
+180994:         group: genPropDesc('group'),
+180994:         groupCollapsed: genPropDesc('groupCollapsed'),
+180994:         groupEnd: genPropDesc('groupEnd'),
+180994:         time: genPropDesc('time'),
+180994:         timeEnd: genPropDesc('timeEnd'),
+180994:         profile: genPropDesc('profile'),
+180994:         profileEnd: genPropDesc('profileEnd'),
+180994:        __noSuchMethod__: { enumerable: true, configurable: true, writable: true,
+180994:                             value: function() {} }
+180994:       };
+180994: 
+180994:       Object.defineProperties(con, properties);
+180994:       Cu.makeObjectPropsNormal(con);
+180994: 
+180994:       win.console = con;
+180994:     };
+180994: 
+180994:     // The order of `contentScriptFile` and `contentScript` evaluation is
+180994:     // intentional, so programs can load libraries like jQuery from script URLs
+180994:     // and use them in scripts.
+180994:     let contentScriptFile = ('contentScriptFile' in worker) ? worker.contentScriptFile
+180994:           : null,
+180994:         contentScript = ('contentScript' in worker) ? worker.contentScript : null;
+180994: 
+180994:     if (contentScriptFile)
+180994:       importScripts.apply(null, [this].concat(contentScriptFile));
+180994:     if (contentScript) {
+180994:       evaluateIn(
+180994:         this,
+180994:         Array.isArray(contentScript) ? contentScript.join(';\n') : contentScript
+180994:       );
+180994:     }
+180994:   },
+180994:   destroy: function destroy() {
+180994:     this.emitSync('detach');
+180994:     let model = modelFor(this);
+180994:     model.sandbox = null
+180994:     model.worker = null;
+180994:   },
+180994: 
+180994: });
+180994: 
+180994: exports.WorkerSandbox = WorkerSandbox;
+180994: 
+180994: /**
+180994:  * Imports scripts to the sandbox by reading files under urls and
+180994:  * evaluating its source. If exception occurs during evaluation
+180994:  * `'error'` event is emitted on the worker.
+180994:  * This is actually an analog to the `importScript` method in web
+180994:  * workers but in our case it's not exposed even though content
+180994:  * scripts may be able to do it synchronously since IO operation
+180994:  * takes place in the UI process.
+180994:  */
+180994: function importScripts (workerSandbox, ...urls) {
+180994:   let { worker, sandbox } = modelFor(workerSandbox);
+180994:   for (let i in urls) {
+180994:     let contentScriptFile = urls[i];
+180994:     try {
+180994:       let uri = URL(contentScriptFile);
+180994:       if (uri.scheme === 'resource')
+180994:         load(sandbox, String(uri));
+180994:       else
+180994:         throw Error('Unsupported `contentScriptFile` url: ' + String(uri));
+180994:     }
+180994:     catch(e) {
+180994:       emit(worker, 'error', e);
+180994:     }
+180994:   }
+180994: }
+180994: 
+180994: function setListeners (workerSandbox) {
+180994:   let { worker } = modelFor(workerSandbox);
+180994:   // console.xxx calls
+180994:   workerSandbox.on('console', function consoleListener (kind, ...args) {
+180994:     console[kind].apply(console, args);
+180994:   });
+180994: 
+180994:   // self.postMessage calls
+180994:   workerSandbox.on('message', function postMessage(data) {
+180994:     // destroyed?
+180994:     if (worker)
+180994:       emit(worker, 'message', data);
+180994:   });
+180994: 
+180994:   // self.port.emit calls
+180994:   workerSandbox.on('event', function portEmit (...eventArgs) {
+180994:     // If not destroyed, emit event information to worker
+180994:     // `eventArgs` has the event name as first element,
+180994:     // and remaining elements are additional arguments to pass
+180994:     if (worker)
+180994:       emit.apply(null, [worker.port].concat(eventArgs));
+180994:   });
+180994: 
+180994:   // unwrap, recreate and propagate async Errors thrown from content-script
+180994:   workerSandbox.on('error', function onError({instanceOfError, value}) {
+180994:     if (worker) {
+180994:       let error = value;
+180994:       if (instanceOfError) {
+180994:         error = new Error(value.message, value.fileName, value.lineNumber);
+180994:         error.stack = value.stack;
+180994:         error.name = value.name;
+180994:       }
+180994:       emit(worker, 'error', error);
+180994:     }
+180994:   });
+180994: }
+180994: 
+180994: /**
+180994:  * Evaluates code in the sandbox.
+180994:  * @param {String} code
+180994:  *    JavaScript source to evaluate.
+180994:  * @param {String} [filename='javascript:' + code]
+180994:  *    Name of the file
+180994:  */
+180994: function evaluateIn (workerSandbox, code, filename) {
+180994:   let { worker, sandbox } = modelFor(workerSandbox);
+180994:   try {
+180994:     evaluate(sandbox, code, filename || 'javascript:' + code);
+180994:   }
+180994:   catch(e) {
+180994:     emit(worker, 'error', e);
+180994:   }
+180994: }
+180994: 
+180994: /**
+180994:  * Method called by the worker sandbox when it needs to send a message
+180994:  */
+180994: function onContentEvent (workerSandbox, args) {
+180994:   // As `emit`, we ensure having an asynchronous behavior
+180994:   async(function () {
+180994:     // We emit event to chrome/addon listeners
+180994:     emit.apply(null, [workerSandbox].concat(JSON.parse(args)));
+180994:   });
+180994: }
+180994: 
+180994: 
+180994: function modelFor (workerSandbox) {
+180994:   return sandboxes.get(workerSandbox);
+180994: }
+180994: 
+180994: /**
+180994:  * JSON.stringify is buggy with cross-sandbox values,
+180994:  * it may return '{}' on functions. Use a replacer to match them correctly.
+180994:  */
+180994: function replacer (k, v) {
+180994:   return typeof v === 'function' ? undefined : v;
+180994: }
+180994: 
+180994: function getUnsafeWindow (win) {
+180994:   return win.wrappedJSObject || win;
+180994: }
+180994: 
+180994: function emitToContent (workerSandbox, args) {
+180994:   return modelFor(workerSandbox).emitToContent(args);
+180994: }
+180994: 
+180994: function createChromeAPI () {
+180994:   return {
+180994:     timers: {
+180994:       setTimeout: timer.setTimeout,
+180994:       setInterval: timer.setInterval,
+180994:       clearTimeout: timer.clearTimeout,
+180994:       clearInterval: timer.clearInterval,
+180994:       __exposedProps__: {
+180994:         setTimeout: 'r',
+180994:         setInterval: 'r',
+180994:         clearTimeout: 'r',
+180994:         clearInterval: 'r'
+180994:       },
+180994:     },
+180994:     sandbox: {
+180994:       evaluate: evaluate,
+180994:       __exposedProps__: {
+180994:         evaluate: 'r'
+180994:       }
+180994:     },
+180994:     __exposedProps__: {
+180994:       timers: 'r',
+180994:       sandbox: 'r'
+180994:     }
+180994:   };
+180994: }

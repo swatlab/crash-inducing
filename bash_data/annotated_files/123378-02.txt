@@ -1,0 +1,293 @@
+ 43788: /* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ 98983: /* This Source Code Form is subject to the terms of the Mozilla Public
+ 98983:  * License, v. 2.0. If a copy of the MPL was not distributed with this
+ 98983:  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 43788: 
+ 43819: /**
+ 43819:  * A class which manages pending restyles.  This handles keeping track
+ 43819:  * of what nodes restyles need to happen on and so forth.
+ 43819:  */
+ 43819: 
+ 43788: #include "RestyleTracker.h"
+ 43788: #include "nsCSSFrameConstructor.h"
+ 43789: #include "nsStyleChangeList.h"
+ 84290: #include "sampler.h"
+ 43788: 
+ 43788: namespace mozilla {
+ 43788: namespace css {
+ 43788: 
+ 43792: inline nsIDocument*
+ 43792: RestyleTracker::Document() const {
+ 43792:   return mFrameConstructor->mDocument;
+ 43792: }
+ 43792: 
+ 43788: #define RESTYLE_ARRAY_STACKSIZE 128
+ 43788: 
+ 43792: struct LaterSiblingCollector {
+ 43792:   RestyleTracker* tracker;
+ 43792:   nsTArray< nsRefPtr<dom::Element> >* elements;
+ 43792: };
+ 43792: 
+ 43792: static PLDHashOperator
+ 43792: CollectLaterSiblings(nsISupports* aElement,
+ 43792:                      RestyleTracker::RestyleData& aData,
+ 43792:                      void* aSiblingCollector)
+ 43792: {
+ 43792:   dom::Element* element =
+ 43792:     static_cast<dom::Element*>(aElement);
+ 43792:   LaterSiblingCollector* collector =
+ 43792:     static_cast<LaterSiblingCollector*>(aSiblingCollector);
+ 43792:   // Only collect the entries that actually need restyling by us (and
+ 43792:   // haven't, for example, already been restyled).
+ 43792:   // It's important to not mess with the flags on entries not in our
+ 43792:   // document.
+ 43792:   if (element->GetCurrentDoc() == collector->tracker->Document() &&
+ 43792:       element->HasFlag(collector->tracker->RestyleBit()) &&
+ 43792:       (aData.mRestyleHint & eRestyle_LaterSiblings)) {
+ 43792:     collector->elements->AppendElement(element);
+ 43792:   }
+ 43792: 
+ 43792:   return PL_DHASH_NEXT;
+ 43792: }
+ 43792: 
+ 43792: struct RestyleCollector {
+ 43792:   RestyleTracker* tracker;
+ 43792:   RestyleTracker::RestyleEnumerateData** restyleArrayPtr;
+ 43792: };
+ 43792: 
+ 43788: static PLDHashOperator
+ 43788: CollectRestyles(nsISupports* aElement,
+ 43788:                 RestyleTracker::RestyleData& aData,
+ 43792:                 void* aRestyleCollector)
+ 43788: {
+ 43792:   dom::Element* element =
+ 43792:     static_cast<dom::Element*>(aElement);
+ 43792:   RestyleCollector* collector =
+ 43792:     static_cast<RestyleCollector*>(aRestyleCollector);
+ 43792:   // Only collect the entries that actually need restyling by us (and
+ 43792:   // haven't, for example, already been restyled).
+ 43792:   // It's important to not mess with the flags on entries not in our
+ 43792:   // document.
+ 43792:   if (element->GetCurrentDoc() != collector->tracker->Document() ||
+ 43792:       !element->HasFlag(collector->tracker->RestyleBit())) {
+ 43792:     return PL_DHASH_NEXT;
+ 43792:   }
+ 43792: 
+ 43792:   NS_ASSERTION(!element->HasFlag(collector->tracker->RootBit()) ||
+ 43792:                // Maybe we're just not reachable via the frame tree?
+ 43792:                (element->GetFlattenedTreeParent() &&
+ 44167:                 (!element->GetFlattenedTreeParent()->GetPrimaryFrame()||
+ 44167:                  element->GetFlattenedTreeParent()->GetPrimaryFrame()->IsLeaf())) ||
+ 43792:                // Or not reachable due to an async reinsert we have
+ 43792:                // pending?  If so, we'll have a reframe hint around.
+ 43792:                // That incidentally makes it safe that we still have
+ 43792:                // the bit, since any descendants that didn't get added
+ 43792:                // to the roots list because we had the bits will be
+ 43792:                // completely restyled in a moment.
+ 43792:                (aData.mChangeHint & nsChangeHint_ReconstructFrame),
+ 43792:                "Why did this not get handled while processing mRestyleRoots?");
+ 43792: 
+ 43792:   // Unset the restyle bits now, so if they get readded later as we
+ 43792:   // process we won't clobber that adding of the bit.
+ 43792:   element->UnsetFlags(collector->tracker->RestyleBit() |
+ 43792:                       collector->tracker->RootBit());
+ 43792: 
+ 43788:   RestyleTracker::RestyleEnumerateData** restyleArrayPtr =
+ 43792:     collector->restyleArrayPtr;
+ 43788:   RestyleTracker::RestyleEnumerateData* currentRestyle =
+ 43788:     *restyleArrayPtr;
+ 43792:   currentRestyle->mElement = element;
+ 43788:   currentRestyle->mRestyleHint = aData.mRestyleHint;
+ 43788:   currentRestyle->mChangeHint = aData.mChangeHint;
+ 43788: 
+ 43788:   // Increment to the next slot in the array
+ 43788:   *restyleArrayPtr = currentRestyle + 1;
+ 43788: 
+ 43788:   return PL_DHASH_NEXT;
+ 43788: }
+ 43788: 
+ 43789: inline void
+ 43789: RestyleTracker::ProcessOneRestyle(Element* aElement,
+ 43789:                                   nsRestyleHint aRestyleHint,
+123378:                                   nsChangeHint aChangeHint)
+ 43789: {
+ 43792:   NS_PRECONDITION((aRestyleHint & eRestyle_LaterSiblings) == 0,
+ 43792:                   "Someone should have handled this before calling us");
+ 43815:   NS_PRECONDITION(Document(), "Must have a document");
+ 43815:   NS_PRECONDITION(aElement->GetCurrentDoc() == Document(),
+ 43792:                   "Element has unexpected document");
+ 43789: 
+ 43789:   nsIFrame* primaryFrame = aElement->GetPrimaryFrame();
+ 43794:   if (aRestyleHint & (eRestyle_Self | eRestyle_Subtree)) {
+ 43790:     mFrameConstructor->RestyleElement(aElement, primaryFrame, aChangeHint,
+ 43794:                                       *this,
+123378:                                       (aRestyleHint & eRestyle_Subtree) != 0);
+ 43789:   } else if (aChangeHint &&
+ 43789:              (primaryFrame ||
+ 43789:               (aChangeHint & nsChangeHint_ReconstructFrame))) {
+ 43789:     // Don't need to recompute style; just apply the hint
+ 43789:     nsStyleChangeList changeList;
+ 43789:     changeList.AppendChange(primaryFrame, aElement, aChangeHint);
+123378:     mFrameConstructor->ProcessRestyledFrames(changeList);
+ 43789:   }
+ 43789: }
+ 43789: 
+ 43788: void
+ 84595: RestyleTracker::DoProcessRestyles()
+ 43788: {
+ 84290:   SAMPLE_LABEL("CSS", "ProcessRestyles");
+ 43788:   // Make sure to not rebuild quote or counter lists while we're
+ 43788:   // processing restyles
+ 43788:   mFrameConstructor->BeginUpdate();
+ 43788: 
+ 80486:   mFrameConstructor->mInStyleRefresh = true;
+ 50365: 
+ 43788:   // loop so that we process any restyle events generated by processing
+ 43792:   while (mPendingRestyles.Count()) {
+ 43792:     if (mHaveLaterSiblingRestyles) {
+ 43792:       // Convert them to individual restyles on all the later siblings
+ 43792:       nsAutoTArray<nsRefPtr<Element>, RESTYLE_ARRAY_STACKSIZE> laterSiblingArr;
+ 43792:       LaterSiblingCollector siblingCollector = { this, &laterSiblingArr };
+ 43792:       mPendingRestyles.Enumerate(CollectLaterSiblings, &siblingCollector);
+108991:       for (uint32_t i = 0; i < laterSiblingArr.Length(); ++i) {
+ 43792:         Element* element = laterSiblingArr[i];
+ 43792:         for (nsIContent* sibling = element->GetNextSibling();
+ 43792:              sibling;
+ 43792:              sibling = sibling->GetNextSibling()) {
+ 43792:           if (sibling->IsElement() &&
+ 43793:               AddPendingRestyle(sibling->AsElement(), eRestyle_Subtree,
+ 43792:                                 NS_STYLE_HINT_NONE)) {
+ 43792:               // Nothing else to do here; we'll handle the following
+ 43792:               // siblings when we get to |sibling| in laterSiblingArr.
+ 43792:             break;
+ 43792:           }
+ 43792:         }
+ 43788:       }
+ 43788: 
+ 43792:       // Now remove all those eRestyle_LaterSiblings bits
+108991:       for (uint32_t i = 0; i < laterSiblingArr.Length(); ++i) {
+ 43792:         Element* element = laterSiblingArr[i];
+ 43792:         NS_ASSERTION(element->HasFlag(RestyleBit()), "How did that happen?");
+ 43792:         RestyleData data;
+ 43792: #ifdef DEBUG
+ 79445:         bool found =
+ 43792: #endif
+ 43792:           mPendingRestyles.Get(element, &data);
+ 43792:         NS_ASSERTION(found, "Where did our entry go?");
+ 43792:         data.mRestyleHint =
+ 43792:           nsRestyleHint(data.mRestyleHint & ~eRestyle_LaterSiblings);
+ 43792: 
+ 43792:         mPendingRestyles.Put(element, data);
+ 43792:       }
+ 43792: 
+ 80486:       mHaveLaterSiblingRestyles = false;
+ 43792:     }
+ 43792: 
+108991:     uint32_t rootCount;
+ 43792:     while ((rootCount = mRestyleRoots.Length())) {
+ 43792:       // Make sure to pop the element off our restyle root array, so
+ 43792:       // that we can freely append to the array as we process this
+ 43792:       // element.
+ 43792:       nsRefPtr<Element> element;
+ 43792:       element.swap(mRestyleRoots[rootCount - 1]);
+ 43792:       mRestyleRoots.RemoveElementAt(rootCount - 1);
+ 43792: 
+ 43792:       // Do the document check before calling GetRestyleData, since we
+ 43792:       // don't want to do the sibling-processing GetRestyleData does if
+ 43792:       // the node is no longer relevant.
+ 43815:       if (element->GetCurrentDoc() != Document()) {
+ 43792:         // Content node has been removed from our document; nothing else
+ 43792:         // to do here
+ 43792:         continue;
+ 43792:       }
+ 43792: 
+ 43792:       RestyleData data;
+ 43792:       if (!GetRestyleData(element, &data)) {
+ 43792:         continue;
+ 43792:       }
+ 43792: 
+123378:       ProcessOneRestyle(element, data.mRestyleHint, data.mChangeHint);
+ 43792:     }
+ 43792: 
+ 43792:     if (mHaveLaterSiblingRestyles) {
+ 43792:       // Keep processing restyles for now
+ 43792:       continue;
+ 43792:     }
+ 43792: 
+ 43792:     // Now we only have entries with change hints left.  To be safe in
+ 43792:     // case of reentry from the handing of the change hint, use a
+ 43792:     // scratch array instead of calling out to ProcessOneRestyle while
+ 43792:     // enumerating the hashtable.  Use the stack if we can, otherwise
+ 43792:     // fall back on heap-allocation.
+ 43792:     nsAutoTArray<RestyleEnumerateData, RESTYLE_ARRAY_STACKSIZE> restyleArr;
+ 43792:     RestyleEnumerateData* restylesToProcess =
+ 43792:       restyleArr.AppendElements(mPendingRestyles.Count());
+ 43792:     if (restylesToProcess) {
+ 43788:       RestyleEnumerateData* lastRestyle = restylesToProcess;
+ 43792:       RestyleCollector collector = { this, &lastRestyle };
+ 43792:       mPendingRestyles.Enumerate(CollectRestyles, &collector);
+ 43788: 
+ 43792:       // Clear the hashtable now that we don't need it anymore
+ 43788:       mPendingRestyles.Clear();
+ 43788: 
+ 43788:       for (RestyleEnumerateData* currentRestyle = restylesToProcess;
+ 43788:            currentRestyle != lastRestyle;
+ 43788:            ++currentRestyle) {
+ 43789:         ProcessOneRestyle(currentRestyle->mElement,
+ 43788:                           currentRestyle->mRestyleHint,
+123378:                           currentRestyle->mChangeHint);
+ 43788:       }
+ 43792:     }
+ 43788:   }
+ 43788: 
+ 43788:   // Set mInStyleRefresh to false now, since the EndUpdate call might
+ 43788:   // add more restyles.
+ 80486:   mFrameConstructor->mInStyleRefresh = false;
+ 43788: 
+ 43788:   mFrameConstructor->EndUpdate();
+ 43788: 
+ 43788: #ifdef DEBUG
+ 43788:   mFrameConstructor->mPresShell->VerifyStyleTree();
+ 43788: #endif
+ 43788: }
+ 43788: 
+ 79445: bool
+ 43792: RestyleTracker::GetRestyleData(Element* aElement, RestyleData* aData)
+ 43792: {
+ 43815:   NS_PRECONDITION(aElement->GetCurrentDoc() == Document(),
+ 43792:                   "Unexpected document; this will lead to incorrect behavior!");
+ 43792: 
+ 43792:   if (!aElement->HasFlag(RestyleBit())) {
+ 43792:     NS_ASSERTION(!aElement->HasFlag(RootBit()), "Bogus root bit?");
+ 80486:     return false;
+ 43792:   }
+ 43792: 
+ 43792: #ifdef DEBUG
+ 79445:   bool gotData =
+ 43792: #endif
+ 43792:   mPendingRestyles.Get(aElement, aData);
+ 43792:   NS_ASSERTION(gotData, "Must have data if restyle bit is set");
+ 43792: 
+ 43792:   if (aData->mRestyleHint & eRestyle_LaterSiblings) {
+ 43792:     // Someone readded the eRestyle_LaterSiblings hint for this
+ 43792:     // element.  Leave it around for now, but remove the other restyle
+ 43792:     // hints and the change hint for it.  Also unset its root bit,
+ 43792:     // since it's no longer a root with the new restyle data.
+ 43792:     RestyleData newData;
+ 43792:     newData.mChangeHint = nsChangeHint(0);
+ 43792:     newData.mRestyleHint = eRestyle_LaterSiblings;
+ 43792:     mPendingRestyles.Put(aElement, newData);
+ 43792:     aElement->UnsetFlags(RootBit());
+ 43792:     aData->mRestyleHint =
+ 43792:       nsRestyleHint(aData->mRestyleHint & ~eRestyle_LaterSiblings);
+ 43792:   } else {
+ 43792:     mPendingRestyles.Remove(aElement);
+ 43792:     aElement->UnsetFlags(mRestyleBits);
+ 43792:   }
+ 43792: 
+ 80486:   return true;
+ 43792: }
+ 43792: 
+ 43788: } // namespace css
+ 43788: } // namespace mozilla
+ 43792: 

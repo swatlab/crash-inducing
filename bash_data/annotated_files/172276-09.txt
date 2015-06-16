@@ -1,0 +1,599 @@
+165532: /* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+165532: /* vim:set ts=2 sw=2 sts=2 et cindent: */
+165532: /* This Source Code Form is subject to the terms of the Mozilla Public
+165532:  * License, v. 2.0. If a copy of the MPL was not distributed with this
+165532:  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+165532: 
+165532: #include "mozilla/DebugOnly.h"
+165532: 
+165532: #include "RtspMediaResource.h"
+165532: 
+165532: #include "MediaDecoder.h"
+165532: #include "mozilla/dom/HTMLMediaElement.h"
+165532: #include "mozilla/Monitor.h"
+165532: #include "mozilla/Preferences.h"
+165532: #include "nsIScriptSecurityManager.h"
+165532: #include "nsIStreamingProtocolService.h"
+165532: #include "nsServiceManagerUtils.h"
+165532: 
+165532: #ifdef PR_LOGGING
+165532: PRLogModuleInfo* gRtspMediaResourceLog;
+172276: #define LOG(msg, ...) PR_LOG(gRtspMediaResourceLog, PR_LOG_DEBUG, \
+165532:                              (msg, ##__VA_ARGS__))
+165532: // Debug logging macro with object pointer and class name.
+165532: #define RTSPMLOG(msg, ...) \
+172276:         LOG("%p [RtspMediaResource]: " msg, this, ##__VA_ARGS__)
+165532: #else
+172276: #define LOG(msg, ...)
+165532: #define RTSPMLOG(msg, ...)
+165532: #endif
+165532: 
+165532: namespace mozilla {
+165532: 
+165532: /* class RtspTrackBuffer: a ring buffer implementation for audio/video track
+165532:  * un-decoded data.
+165532:  * The ring buffer is divided into BUFFER_SLOT_NUM slots,
+165532:  * and each slot's size is fixed(mSlotSize).
+165532:  * Even though the ring buffer is divided into fixed size slots, it still can
+165532:  * store the data which size is larger than one slot size.
+165532:  * */
+165532: #define BUFFER_SLOT_NUM 8192
+165532: #define BUFFER_SLOT_DEFAULT_SIZE 256
+165532: #define BUFFER_SLOT_MAX_SIZE 8192
+165532: #define BUFFER_SLOT_INVALID -1
+165532: #define BUFFER_SLOT_EMPTY 0
+165532: 
+165532: struct BufferSlotData {
+165532:   int32_t mLength;
+165532:   uint64_t mTime;
+165532: };
+165532: 
+165532: class RtspTrackBuffer
+165532: {
+165532: public:
+165532:   RtspTrackBuffer(const char *aMonitor, int32_t aTrackIdx, uint32_t aSlotSize)
+165532:   : mMonitor(aMonitor)
+165532:   , mSlotSize(aSlotSize)
+165532:   , mTotalBufferSize(BUFFER_SLOT_NUM * mSlotSize)
+165532:   , mFrameType(0)
+165532:   , mIsStarted(false) {
+165532:     MOZ_COUNT_CTOR(RtspTrackBuffer);
+165532: #ifdef PR_LOGGING
+165532:     mTrackIdx = aTrackIdx;
+165532: #endif
+165532:     MOZ_ASSERT(mSlotSize < UINT32_MAX / BUFFER_SLOT_NUM);
+165532:     mRingBuffer = new uint8_t[mTotalBufferSize];
+165532:     Reset();
+165532:   };
+165532:   ~RtspTrackBuffer() {
+165532:     MOZ_COUNT_DTOR(RtspTrackBuffer);
+165532:     mRingBuffer = nullptr;
+165532:   };
+165532:   void Start() {
+165532:     MonitorAutoLock monitor(mMonitor);
+165532:     mIsStarted = true;
+165532:   }
+165532:   void Stop() {
+165532:     MonitorAutoLock monitor(mMonitor);
+165532:     mIsStarted = false;
+165532:   }
+165532: 
+165532:   // Read the data from mRingBuffer[mConsumerIdx*mSlotSize] into aToBuffer.
+165532:   // If the aToBufferSize is smaller than mBufferSlotDataLength[mConsumerIdx],
+165532:   // early return and set the aFrameSize to notify the reader the aToBuffer
+165532:   // doesn't have enough space. The reader must realloc the aToBuffer if it
+165532:   // wishes to read the data.
+165532:   nsresult ReadBuffer(uint8_t* aToBuffer, uint32_t aToBufferSize,
+165532:                       uint32_t& aReadCount, uint64_t& aFrameTime,
+165532:                       uint32_t& aFrameSize);
+165532:   // Write the data from aFromBuffer into mRingBuffer[mProducerIdx*mSlotSize].
+165532:   void WriteBuffer(const char *aFromBuffer, uint32_t aWriteCount,
+165532:                    uint64_t aFrameTime, uint32_t aFrameType);
+165532:   // Reset the mProducerIdx, mConsumerIdx, mBufferSlotDataLength[],
+165532:   // mBufferSlotDataTime[].
+165532:   void Reset();
+165532: 
+165532:   // We should call SetFrameType first then reset().
+165532:   // If we call reset() first, the queue may still has some "garbage" frame
+165532:   // from another thread's |OnMediaDataAvailable| before |SetFrameType|.
+165532:   void ResetWithFrameType(uint32_t aFrameType) {
+165532:     SetFrameType(aFrameType);
+165532:     Reset();
+165532:   }
+165532: 
+165532: private:
+165532:   // The FrameType is sync to nsIStreamingProtocolController.h
+165532:   void SetFrameType(uint32_t aFrameType) {
+165532:     MonitorAutoLock monitor(mMonitor);
+165532:     mFrameType = mFrameType | aFrameType;
+165532:   }
+165532: 
+165532:   // A monitor lock to prevent racing condition.
+165532:   Monitor mMonitor;
+165532: #ifdef PR_LOGGING
+165532:   // Indicate the track number for Rtsp.
+165532:   int32_t mTrackIdx;
+165532: #endif
+165532:   // mProducerIdx: A slot index that we store data from
+165532:   // nsIStreamingProtocolController.
+165532:   // mConsumerIdx: A slot index that we read when decoder need(from OMX decoder).
+165532:   int32_t mProducerIdx;
+165532:   int32_t mConsumerIdx;
+165532: 
+165532:   // Because each slot's size is fixed, we need an array to record the real
+165532:   // data length and data time stamp.
+165532:   // The value in mBufferSlotData[index].mLength represents:
+165532:   // -1(BUFFER_SLOT_INVALID): The index of slot data is invalid, mConsumerIdx
+165532:   //                          should go forward.
+165532:   // 0(BUFFER_SLOT_EMPTY): The index slot is empty. mConsumerIdx should wait here.
+165532:   // positive value: The index slot contains valid data and the value is data size.
+165532:   BufferSlotData mBufferSlotData[BUFFER_SLOT_NUM];
+165532: 
+165532:   // The ring buffer pointer.
+165532:   nsAutoArrayPtr<uint8_t> mRingBuffer;
+165532:   // Each slot's size.
+165532:   uint32_t mSlotSize;
+165532:   // Total mRingBuffer's total size.
+165532:   uint32_t mTotalBufferSize;
+165532:   // A flag that that indicate the incoming data should be dropped or stored.
+165532:   // When we are seeking, the incoming data should be dropped.
+165532:   // Bit definition in |nsIStreamingProtocolController.h|
+165532:   uint32_t mFrameType;
+165532: 
+165532:   // Set true/false when |Start()/Stop()| is called.
+165532:   bool mIsStarted;
+165532: };
+165532: 
+165532: nsresult RtspTrackBuffer::ReadBuffer(uint8_t* aToBuffer, uint32_t aToBufferSize,
+165532:                                      uint32_t& aReadCount, uint64_t& aFrameTime,
+165532:                                      uint32_t& aFrameSize)
+165532: {
+165532:   MonitorAutoLock monitor(mMonitor);
+165532:   RTSPMLOG("ReadBuffer mTrackIdx %d mProducerIdx %d mConsumerIdx %d "
+165532:            "mBufferSlotData[mConsumerIdx].mLength %d"
+165532:            ,mTrackIdx ,mProducerIdx ,mConsumerIdx
+165532:            ,mBufferSlotData[mConsumerIdx].mLength);
+165532:   // Reader should skip the slots with mLength==BUFFER_SLOT_INVALID.
+165532:   // The loop ends when
+165532:   // 1. Read data successfully
+165532:   // 2. Fail to read data due to aToBuffer's space
+165532:   // 3. No data in this buffer
+165532:   // 4. mIsStarted is not set
+165532:   while (1) {
+165532:     if (mBufferSlotData[mConsumerIdx].mLength > 0) {
+165532:       // Check the aToBuffer space is enough for data copy.
+165532:       if ((int32_t)aToBufferSize < mBufferSlotData[mConsumerIdx].mLength) {
+165532:         aFrameSize = mBufferSlotData[mConsumerIdx].mLength;
+165532:         break;
+165532:       }
+165532:       uint32_t slots = (mBufferSlotData[mConsumerIdx].mLength / mSlotSize) + 1;
+165532:       // we have data, copy to aToBuffer
+165532:       MOZ_ASSERT(mBufferSlotData[mConsumerIdx].mLength <=
+165532:                  (int32_t)((BUFFER_SLOT_NUM - mConsumerIdx) * mSlotSize));
+165532:       memcpy(aToBuffer,
+165532:              (void *)(&mRingBuffer[mSlotSize * mConsumerIdx]),
+165532:              mBufferSlotData[mConsumerIdx].mLength);
+165532: 
+165532:       aFrameSize = aReadCount = mBufferSlotData[mConsumerIdx].mLength;
+165532:       aFrameTime = mBufferSlotData[mConsumerIdx].mTime;
+165532:       RTSPMLOG("DataLength %d, data time %lld"
+165532:                ,mBufferSlotData[mConsumerIdx].mLength
+165532:                ,mBufferSlotData[mConsumerIdx].mTime);
+165532:       // After reading the data, we set current index of mBufferSlotDataLength
+165532:       // to BUFFER_SLOT_EMPTY to indicate these slots are free.
+165532:       for (uint32_t i = mConsumerIdx; i < mConsumerIdx + slots; ++i) {
+165532:         mBufferSlotData[i].mLength = BUFFER_SLOT_EMPTY;
+165532:         mBufferSlotData[i].mTime = BUFFER_SLOT_EMPTY;
+165532:       }
+165532:       mConsumerIdx = (mConsumerIdx + slots) % BUFFER_SLOT_NUM;
+165532:       break;
+165532:     } else if (mBufferSlotData[mConsumerIdx].mLength == BUFFER_SLOT_INVALID) {
+165532:       mConsumerIdx = (mConsumerIdx + 1) % BUFFER_SLOT_NUM;
+165532:       RTSPMLOG("BUFFER_SLOT_INVALID move forward");
+165532:     } else {
+165532:       // No data, and disconnected.
+165532:       if (!mIsStarted) {
+165532:         return NS_ERROR_FAILURE;
+165532:       }
+165532:       // No data, the decode thread is blocked here until we receive
+165532:       // OnMediaDataAvailable. The OnMediaDataAvailable will call WriteBuffer()
+165532:       // to wake up the decode thread.
+165532:       RTSPMLOG("monitor.Wait()");
+165532:       monitor.Wait();
+165532:     }
+165532:   }
+165532:   return NS_OK;
+165532: }
+165532: 
+165532: /* When we perform a WriteBuffer, we check mIsStarted and aFrameType first.
+165532:  * These flags prevent "garbage" frames from being written into the buffer.
+165532:  *
+165532:  * After writing the data into the buffer, we check to see if we wrote over a
+165532:  * slot, and update mConsumerIdx if necessary.
+165532:  * This ensures that the decoder will get the "oldest" data available in the
+165532:  * buffer.
+165532:  *
+165532:  * If the incoming data is larger than one slot size (isMultipleSlots), we do
+165532:  * |mBufferSlotData[].mLength = BUFFER_SLOT_INVALID;| for other slots except the
+165532:  * first slot, in order to notify the reader that some slots are unavailable.
+165532:  *
+165532:  * If the incoming data is isMultipleSlots and crosses the end of
+165532:  * BUFFER_SLOT_NUM, returnToHead is set to true and the data will continue to
+165532:  * be written from head(index 0).
+165532:  *
+165532:  * MEDIASTREAM_FRAMETYPE_DISCONTINUITY currently is used when we are seeking.
+165532:  * */
+165532: void RtspTrackBuffer::WriteBuffer(const char *aFromBuffer, uint32_t aWriteCount,
+165532:                                   uint64_t aFrameTime, uint32_t aFrameType)
+165532: {
+165532:   MonitorAutoLock monitor(mMonitor);
+165532:   if (!mIsStarted) {
+165532:     RTSPMLOG("mIsStarted is false");
+165532:     return;
+165532:   }
+165532:   if (mTotalBufferSize < aWriteCount) {
+165532:     RTSPMLOG("mTotalBufferSize < aWriteCount, incoming data is too large");
+165532:     return;
+165532:   }
+165532:   // Checking the incoming data's frame type.
+165532:   // If we receive MEDIASTREAM_FRAMETYPE_DISCONTINUITY, clear the mFrameType
+165532:   // imply the RtspTrackBuffer is ready for receive data.
+165532:   if (aFrameType & MEDIASTREAM_FRAMETYPE_DISCONTINUITY) {
+165532:     mFrameType = mFrameType & (~MEDIASTREAM_FRAMETYPE_DISCONTINUITY);
+165532:     RTSPMLOG("Clear mFrameType");
+165532:     return;
+165532:   }
+165532:   // Checking current buffer frame type.
+165532:   // If the MEDIASTREAM_FRAMETYPE_DISCONTINUNITY bit is set, imply the
+165532:   // RtspTrackBuffer can't receive data now. So we drop the frame until we
+165532:   // receive MEDIASTREAM_FRAMETYPE_DISCONTINUNITY.
+165532:   if (mFrameType & MEDIASTREAM_FRAMETYPE_DISCONTINUITY) {
+165532:     RTSPMLOG("Return because the mFrameType is set");
+165532:     return;
+165532:   }
+165532:   // The flag is true if the incoming data is larger than one slot size.
+165532:   bool isMultipleSlots = false;
+165532:   // The flag is true if the incoming data is larger than remainder free slots
+165532:   bool returnToHead = false;
+165532:   // Calculate how many slots the incoming data needed.
+165532:   int32_t slots = 1;
+165532:   int32_t i;
+165532:   RTSPMLOG("WriteBuffer mTrackIdx %d mProducerIdx %d mConsumerIdx %d",
+165532:            mTrackIdx, mProducerIdx,mConsumerIdx);
+165532:   if (aWriteCount > mSlotSize) {
+165532:     isMultipleSlots = true;
+165532:     slots = (aWriteCount / mSlotSize) + 1;
+165532:   }
+165532:   if (isMultipleSlots &&
+165532:       (aWriteCount > (BUFFER_SLOT_NUM - mProducerIdx) * mSlotSize)) {
+165532:     returnToHead = true;
+165532:   }
+165532:   RTSPMLOG("slots %d isMultipleSlots %d returnToHead %d",
+165532:            slots, isMultipleSlots, returnToHead);
+165532:   if (returnToHead) {
+165532:     // Clear the rest index of mBufferSlotData[].mLength
+165532:     for (i = mProducerIdx; i < BUFFER_SLOT_NUM; ++i) {
+165532:       mBufferSlotData[i].mLength = BUFFER_SLOT_INVALID;
+165532:     }
+165532:     // We wrote one or more slots that the decode thread has not yet read.
+165532:     // So the mConsumerIdx returns to the head of slot buffer and moves forward
+165532:     // to the oldest slot.
+165532:     if (mProducerIdx <= mConsumerIdx && mConsumerIdx < mProducerIdx + slots) {
+165532:       mConsumerIdx = 0;
+165532:       for (i = mConsumerIdx; i < BUFFER_SLOT_NUM; ++i) {
+165532:         if (mBufferSlotData[i].mLength > 0) {
+165532:           mConsumerIdx = i;
+165532:           break;
+165532:         }
+165532:       }
+165532:     }
+165532:     mProducerIdx = 0;
+165532:   }
+165532: 
+165532:   memcpy(&(mRingBuffer[mSlotSize * mProducerIdx]), aFromBuffer, aWriteCount);
+165532: 
+165532:   if (mProducerIdx <= mConsumerIdx && mConsumerIdx < mProducerIdx + slots
+165532:       && mBufferSlotData[mConsumerIdx].mLength > 0) {
+165532:     // Wrote one or more slots that the decode thread has not yet read.
+165532:     RTSPMLOG("overwrite!! %d time %lld"
+165532:              ,mTrackIdx,mBufferSlotData[mConsumerIdx].mTime);
+165532:     mBufferSlotData[mProducerIdx].mLength = aWriteCount;
+165532:     mBufferSlotData[mProducerIdx].mTime = aFrameTime;
+165532:     // Clear the mBufferSlotDataLength except the start slot.
+165532:     if (isMultipleSlots) {
+165532:       for (i = mProducerIdx + 1; i < mProducerIdx + slots; ++i) {
+165532:         mBufferSlotData[i].mLength = BUFFER_SLOT_INVALID;
+165532:       }
+165532:     }
+165532:     mProducerIdx = (mProducerIdx + slots) % BUFFER_SLOT_NUM;
+165532:     // Move the mConsumerIdx forward to ensure that the decoder reads the
+165532:     // oldest data available.
+165532:     mConsumerIdx = mProducerIdx;
+165532:   } else {
+165532:     // Normal case, the writer doesn't take over the reader.
+165532:     mBufferSlotData[mProducerIdx].mLength = aWriteCount;
+165532:     mBufferSlotData[mProducerIdx].mTime = aFrameTime;
+165532:     // Clear the mBufferSlotData[].mLength except the start slot.
+165532:     if (isMultipleSlots) {
+165532:       for (i = mProducerIdx + 1; i < mProducerIdx + slots; ++i) {
+165532:         mBufferSlotData[i].mLength = BUFFER_SLOT_INVALID;
+165532:       }
+165532:     }
+165532:     mProducerIdx = (mProducerIdx + slots) % BUFFER_SLOT_NUM;
+165532:   }
+165532: 
+165532:   mMonitor.NotifyAll();
+165532: }
+165532: 
+165532: void RtspTrackBuffer::Reset() {
+165532:   MonitorAutoLock monitor(mMonitor);
+165532:   mProducerIdx = 0;
+165532:   mConsumerIdx = 0;
+165532:   for (uint32_t i = 0; i < BUFFER_SLOT_NUM; ++i) {
+165532:     mBufferSlotData[i].mLength = BUFFER_SLOT_EMPTY;
+165532:     mBufferSlotData[i].mTime = BUFFER_SLOT_EMPTY;
+165532:   }
+165532:   mMonitor.NotifyAll();
+165532: }
+165532: 
+165532: RtspMediaResource::RtspMediaResource(MediaDecoder* aDecoder,
+165532:     nsIChannel* aChannel, nsIURI* aURI, const nsACString& aContentType)
+165532:   : BaseMediaResource(aDecoder, aChannel, aURI, aContentType)
+165532:   , mIsConnected(false)
+165532:   , mRealTime(false)
+165532: {
+165532:   nsCOMPtr<nsIStreamingProtocolControllerService> mediaControllerService =
+165532:     do_GetService(MEDIASTREAMCONTROLLERSERVICE_CONTRACTID);
+165532:   MOZ_ASSERT(mediaControllerService);
+165532:   if (mediaControllerService) {
+165532:     mediaControllerService->Create(mChannel,
+165532:                                    getter_AddRefs(mMediaStreamController));
+165532:     MOZ_ASSERT(mMediaStreamController);
+165532:     mListener = new Listener(this);
+165532:     mMediaStreamController->AsyncOpen(mListener);
+165532:   }
+165532: #ifdef PR_LOGGING
+165532:   if (!gRtspMediaResourceLog) {
+165532:     gRtspMediaResourceLog = PR_NewLogModule("RtspMediaResource");
+165532:   }
+165532: #endif
+165532: }
+165532: 
+165532: RtspMediaResource::~RtspMediaResource()
+165532: {
+165532:   RTSPMLOG("~RtspMediaResource");
+165532:   if (mListener) {
+165532:     // Kill its reference to us since we're going away
+165532:     mListener->Revoke();
+165532:   }
+165532: }
+165532: 
+165532: NS_IMPL_ISUPPORTS2(RtspMediaResource::Listener,
+165532:                    nsIInterfaceRequestor, nsIStreamingProtocolListener);
+165532: 
+165532: nsresult
+165532: RtspMediaResource::Listener::OnMediaDataAvailable(uint8_t aTrackIdx,
+165532:                                                   const nsACString &data,
+165532:                                                   uint32_t length,
+165532:                                                   uint32_t offset,
+165532:                                                   nsIStreamingProtocolMetaData *meta)
+165532: {
+165532:   if (!mResource)
+165532:     return NS_OK;
+165532:   return mResource->OnMediaDataAvailable(aTrackIdx, data, length, offset, meta);
+165532: }
+165532: 
+165532: nsresult
+165532: RtspMediaResource::Listener::OnConnected(uint8_t aTrackIdx,
+165532:                                          nsIStreamingProtocolMetaData *meta)
+165532: {
+165532:   if (!mResource)
+165532:     return NS_OK;
+165532:   return mResource->OnConnected(aTrackIdx, meta);
+165532: }
+165532: 
+165532: nsresult
+170685: RtspMediaResource::Listener::OnDisconnected(uint8_t aTrackIdx, nsresult reason)
+165532: {
+165532:   if (!mResource)
+165532:     return NS_OK;
+165532:   return mResource->OnDisconnected(aTrackIdx, reason);
+165532: }
+165532: 
+165532: nsresult
+165532: RtspMediaResource::Listener::GetInterface(const nsIID & aIID, void **aResult)
+165532: {
+165532:   return QueryInterface(aIID, aResult);
+165532: }
+165532: 
+165532: nsresult
+165532: RtspMediaResource::ReadFrameFromTrack(uint8_t* aBuffer, uint32_t aBufferSize,
+165532:                                       uint32_t aTrackIdx, uint32_t& aBytes,
+165532:                                       uint64_t& aTime, uint32_t& aFrameSize)
+165532: {
+165532:   NS_ASSERTION(!NS_IsMainThread(), "Don't call on main thread");
+165532:   NS_ASSERTION(aTrackIdx < mTrackBuffer.Length(),
+165532:                "ReadTrack index > mTrackBuffer");
+165532:   MOZ_ASSERT(aBuffer);
+165532: 
+165532:   return mTrackBuffer[aTrackIdx]->ReadBuffer(aBuffer, aBufferSize, aBytes,
+165532:                                              aTime, aFrameSize);
+165532: }
+165532: 
+165532: nsresult
+165532: RtspMediaResource::OnMediaDataAvailable(uint8_t aTrackIdx,
+165532:                                         const nsACString &data,
+165532:                                         uint32_t length,
+165532:                                         uint32_t offset,
+165532:                                         nsIStreamingProtocolMetaData *meta)
+165532: {
+165532:   uint64_t time;
+165532:   uint32_t frameType;
+165532:   meta->GetTimeStamp(&time);
+165532:   meta->GetFrameType(&frameType);
+165532:   if (mRealTime) {
+165532:     time = 0;
+165532:   }
+165532:   mTrackBuffer[aTrackIdx]->WriteBuffer(data.BeginReading(), length, time,
+165532:                                        frameType);
+165532:   return NS_OK;
+165532: }
+165532: 
+165532: nsresult
+165532: RtspMediaResource::OnConnected(uint8_t aTrackIdx,
+165532:                                nsIStreamingProtocolMetaData *meta)
+165532: {
+165532:   if (mIsConnected) {
+165532:     return NS_OK;
+165532:   }
+165532: 
+165532:   uint8_t tracks;
+165532:   mMediaStreamController->GetTotalTracks(&tracks);
+165532:   uint64_t duration = 0;
+165532:   for (int i = 0; i < tracks; ++i) {
+165532:     nsCString rtspTrackId("RtspTrack");
+165532:     rtspTrackId.AppendInt(i);
+165532:     nsCOMPtr<nsIStreamingProtocolMetaData> trackMeta;
+165532:     mMediaStreamController->GetTrackMetaData(i, getter_AddRefs(trackMeta));
+165532:     MOZ_ASSERT(trackMeta);
+165532:     trackMeta->GetDuration(&duration);
+165532: 
+165532:     // Here is a heuristic to estimate the slot size.
+165532:     // For video track, calculate the width*height.
+165532:     // For audio track, use the BUFFER_SLOT_DEFAULT_SIZE because the w*h is 0.
+165532:     // Finally clamp them into (BUFFER_SLOT_DEFAULT_SIZE,BUFFER_SLOT_MAX_SIZE)
+165532:     uint32_t w, h;
+165532:     uint32_t slotSize;
+165532:     trackMeta->GetWidth(&w);
+165532:     trackMeta->GetHeight(&h);
+165532:     slotSize = clamped((int32_t)(w * h), BUFFER_SLOT_DEFAULT_SIZE,
+165532:                        BUFFER_SLOT_MAX_SIZE);
+165532:     mTrackBuffer.AppendElement(new RtspTrackBuffer(rtspTrackId.get(),
+165532:                                                    i, slotSize));
+165532:     mTrackBuffer[i]->Start();
+165532:   }
+165532: 
+165532:   // If the duration is 0, imply the stream is live stream.
+165532:   if (duration) {
+165532:     // Not live stream.
+165532:     mRealTime = false;
+165532:     bool seekable = true;
+165532:     mDecoder->SetInfinite(false);
+165532:     mDecoder->SetTransportSeekable(seekable);
+165532:     mDecoder->SetDuration(duration);
+165532:   } else {
+165532:     // Live stream.
+165532:     // Check the preference "media.realtime_decoder.enabled".
+165532:     if (!Preferences::GetBool("media.realtime_decoder.enabled", false)) {
+165532:       // Give up, report error to media element.
+165532:       nsCOMPtr<nsIRunnable> event =
+165532:         NS_NewRunnableMethod(mDecoder, &MediaDecoder::DecodeError);
+165532:       NS_DispatchToMainThread(event, NS_DISPATCH_NORMAL);
+165532:       return NS_ERROR_FAILURE;
+165532:     } else {
+165532:       mRealTime = true;
+165532:       bool seekable = false;
+165532:       mDecoder->SetInfinite(true);
+165532:       mDecoder->SetTransportSeekable(seekable);
+165532:       mDecoder->SetMediaSeekable(seekable);
+165532:     }
+165532:   }
+165532:   // Fires an initial progress event and sets up the stall counter so stall events
+165532:   // fire if no download occurs within the required time frame.
+165532:   mDecoder->Progress(false);
+165532: 
+165532:   MediaDecoderOwner* owner = mDecoder->GetMediaOwner();
+165532:   NS_ENSURE_TRUE(owner, NS_ERROR_FAILURE);
+171973:   dom::HTMLMediaElement* element = owner->GetMediaElement();
+165532:   NS_ENSURE_TRUE(element, NS_ERROR_FAILURE);
+165532: 
+165532:   element->FinishDecoderSetup(mDecoder, this);
+165532:   mIsConnected = true;
+165532: 
+165532:   return NS_OK;
+165532: }
+165532: 
+165532: nsresult
+170685: RtspMediaResource::OnDisconnected(uint8_t aTrackIdx, nsresult aReason)
+165532: {
+165532:   NS_ASSERTION(NS_IsMainThread(), "Don't call on non-main thread");
+165532: 
+165532:   for (uint32_t i = 0 ; i < mTrackBuffer.Length(); ++i) {
+165532:     mTrackBuffer[i]->Stop();
+165532:     mTrackBuffer[i]->Reset();
+165532:   }
+165532: 
+170685:   if (aReason == NS_ERROR_CONNECTION_REFUSED) {
+165532:     mDecoder->NetworkError();
+165532:   }
+165532:   return NS_OK;
+165532: }
+165532: 
+165532: void RtspMediaResource::Suspend(bool aCloseImmediately)
+165532: {
+165532:   NS_ASSERTION(NS_IsMainThread(), "Don't call on non-main thread");
+165532: 
+165532:   MediaDecoderOwner* owner = mDecoder->GetMediaOwner();
+165532:   NS_ENSURE_TRUE_VOID(owner);
+171973:   dom::HTMLMediaElement* element = owner->GetMediaElement();
+165532:   NS_ENSURE_TRUE_VOID(element);
+165532: 
+165532:   mMediaStreamController->Suspend();
+165532:   element->DownloadSuspended();
+165532: }
+165532: 
+165532: void RtspMediaResource::Resume()
+165532: {
+165532:   NS_ASSERTION(NS_IsMainThread(), "Don't call on non-main thread");
+165532: 
+165532:   MediaDecoderOwner* owner = mDecoder->GetMediaOwner();
+165532:   NS_ENSURE_TRUE_VOID(owner);
+171973:   dom::HTMLMediaElement* element = owner->GetMediaElement();
+165532:   NS_ENSURE_TRUE_VOID(element);
+165532: 
+165532:   if (mChannel) {
+165532:     element->DownloadResumed();
+165532:   }
+165532:   mMediaStreamController->Resume();
+165532: }
+165532: 
+165532: nsresult RtspMediaResource::Open(nsIStreamListener **aStreamListener)
+165532: {
+165532:   return NS_OK;
+165532: }
+165532: 
+165532: nsresult RtspMediaResource::Close()
+165532: {
+165532:   NS_ASSERTION(NS_IsMainThread(), "Only call on main thread");
+165532:   mMediaStreamController->Stop();
+165532:   return NS_OK;
+165532: }
+165532: 
+165532: already_AddRefed<nsIPrincipal> RtspMediaResource::GetCurrentPrincipal()
+165532: {
+165532:   NS_ASSERTION(NS_IsMainThread(), "Only call on main thread");
+165532: 
+165532:   nsCOMPtr<nsIPrincipal> principal;
+165532:   nsIScriptSecurityManager* secMan = nsContentUtils::GetSecurityManager();
+165532:   if (!secMan || !mChannel)
+165532:     return nullptr;
+165532:   secMan->GetChannelPrincipal(mChannel, getter_AddRefs(principal));
+165532:   return principal.forget();
+165532: }
+165532: 
+165532: nsresult RtspMediaResource::SeekTime(int64_t aOffset)
+165532: {
+165532:   NS_ASSERTION(!NS_IsMainThread(), "Don't call on main thread");
+165532: 
+165532:   RTSPMLOG("Seek requested for aOffset [%lld] for decoder [%p]",
+165532:            aOffset, mDecoder);
+165532:   // Clear buffer and raise the frametype flag.
+165532:   for(uint32_t i = 0 ; i < mTrackBuffer.Length(); ++i) {
+165532:     mTrackBuffer[i]->ResetWithFrameType(MEDIASTREAM_FRAMETYPE_DISCONTINUITY);
+165532:   }
+165532: 
+165532:   return mMediaStreamController->Seek(aOffset);
+165532: }
+165532: 
+165532: } // namespace mozilla
+165532: 

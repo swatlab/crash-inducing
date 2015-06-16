@@ -1,0 +1,993 @@
+     1: /* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*-
+     1:  *
+ 98983:  * This Source Code Form is subject to the terms of the Mozilla Public
+ 98983:  * License, v. 2.0. If a copy of the MPL was not distributed with this
+ 98983:  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+     1: 
+     1: #include "imgRequestProxy.h"
+108324: #include "imgIOnloadBlocker.h"
+     1: 
+     1: #include "nsIInputStream.h"
+     1: #include "nsIComponentManager.h"
+     1: #include "nsIServiceManager.h"
+     1: #include "nsIMultiPartChannel.h"
+     1: 
+     1: #include "nsString.h"
+     1: #include "nsXPIDLString.h"
+     1: #include "nsReadableUtils.h"
+     1: #include "nsCRT.h"
+     1: 
+ 50546: #include "Image.h"
+108290: #include "nsError.h"
+     1: #include "ImageLogging.h"
+     1: 
+     1: #include "nspr.h"
+     1: 
+ 87852: using namespace mozilla::image;
+ 50546: 
+121868: // The split of imgRequestProxy and imgRequestProxyStatic means that
+121868: // certain overridden functions need to be usable in the destructor.
+121868: // Since virtual functions can't be used in that way, this class
+121868: // provides a behavioural trait for each class to use instead.
+121868: class ProxyBehaviour
+121868: {
+121868:  public:
+121868:   virtual ~ProxyBehaviour() {}
+121868: 
+121868:   virtual mozilla::image::Image* GetImage() const = 0;
+121868:   virtual imgStatusTracker& GetStatusTracker() const = 0;
+121868:   virtual imgRequest* GetOwner() const = 0;
+121868:   virtual void SetOwner(imgRequest* aOwner) = 0;
+121868: };
+121868: 
+121868: class RequestBehaviour : public ProxyBehaviour
+121868: {
+121868:  public:
+121868:   RequestBehaviour() : mOwner(nullptr), mOwnerHasImage(false) {}
+121868: 
+121868:   virtual mozilla::image::Image* GetImage() const MOZ_OVERRIDE;
+121868:   virtual imgStatusTracker& GetStatusTracker() const MOZ_OVERRIDE;
+121868: 
+121868:   virtual imgRequest* GetOwner() const MOZ_OVERRIDE {
+121868:     return mOwner;
+121868:   }
+121868: 
+121868:   virtual void SetOwner(imgRequest* aOwner) MOZ_OVERRIDE {
+121868:     mOwner = aOwner;
+121868:     mOwnerHasImage = !!aOwner->GetStatusTracker().GetImage();
+121868:   }
+121868: 
+121868:  private:
+121868:   // We maintain the following invariant:
+121868:   // The proxy is registered at most with a single imgRequest as an observer,
+121868:   // and whenever it is, mOwner points to that object. This helps ensure that
+121868:   // imgRequestProxy::~imgRequestProxy unregisters the proxy as an observer
+121868:   // from whatever request it was registered with (if any). This, in turn,
+121868:   // means that imgRequest::mObservers will not have any stale pointers in it.
+121868:   nsRefPtr<imgRequest> mOwner;
+121868: 
+121868:   bool mOwnerHasImage;
+121868: };
+121868: 
+121868: mozilla::image::Image*
+121868: RequestBehaviour::GetImage() const
+121868: {
+121868:   if (!mOwnerHasImage)
+121868:     return nullptr;
+121868:   return GetStatusTracker().GetImage();
+121868: }
+121868: 
+121868: imgStatusTracker&
+121868: RequestBehaviour::GetStatusTracker() const
+121868: {
+121868:   // NOTE: It's possible that our mOwner has an Image that it didn't notify
+121868:   // us about, if we were Canceled before its Image was constructed.
+121868:   // (Canceling removes us as an observer, so mOwner has no way to notify us).
+121868:   // That's why this method uses mOwner->GetStatusTracker() instead of just
+121868:   // mOwner->mStatusTracker -- we might have a null mImage and yet have an
+121868:   // mOwner with a non-null mImage (and a null mStatusTracker pointer).
+121868:   return mOwner->GetStatusTracker();
+121868: }
+121868: 
+ 71556: NS_IMPL_ADDREF(imgRequestProxy)
+ 71556: NS_IMPL_RELEASE(imgRequestProxy)
+ 71556: 
+ 71556: NS_INTERFACE_MAP_BEGIN(imgRequestProxy)
+ 71556:   NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, imgIRequest)
+ 71556:   NS_INTERFACE_MAP_ENTRY(imgIRequest)
+ 71556:   NS_INTERFACE_MAP_ENTRY(nsIRequest)
+ 71556:   NS_INTERFACE_MAP_ENTRY(nsISupportsPriority)
+ 71556:   NS_INTERFACE_MAP_ENTRY(nsISecurityInfoProvider)
+106838:   NS_INTERFACE_MAP_ENTRY_CONDITIONAL(nsITimedChannel, TimedChannel() != nullptr)
+ 71556: NS_INTERFACE_MAP_END
+     1: 
+     1: imgRequestProxy::imgRequestProxy() :
+121868:   mBehaviour(new RequestBehaviour),
+106838:   mURI(nullptr),
+106838:   mListener(nullptr),
+     1:   mLoadFlags(nsIRequest::LOAD_NORMAL),
+ 52147:   mLockCount(0),
+ 52149:   mAnimationConsumers(0),
+ 80486:   mCanceled(false),
+ 80486:   mIsInLoadGroup(false),
+ 80486:   mListenerIsStrongRef(false),
+ 80486:   mDecodeRequested(false),
+ 80486:   mDeferNotifications(false),
+121868:   mSentStartContainer(false)
+     1: {
+     1:   /* member initializers and constructor code */
+     1: 
+     1: }
+     1: 
+     1: imgRequestProxy::~imgRequestProxy()
+     1: {
+     1:   /* destructor code */
+     1:   NS_PRECONDITION(!mListener, "Someone forgot to properly cancel this request!");
+ 22953: 
+ 32516:   // Unlock the image the proper number of times if we're holding locks on it.
+ 52147:   // Note that UnlockImage() decrements mLockCount each time it's called.
+ 52147:   while (mLockCount)
+ 32424:     UnlockImage();
+ 32424: 
+ 52149:   ClearAnimationConsumers();
+ 52149: 
+     1:   // Explicitly set mListener to null to ensure that the RemoveProxy
+     1:   // call below can't send |this| to an arbitrary listener while |this|
+ 13293:   // is being destroyed.  This is all belt-and-suspenders in view of the
+ 13293:   // above assert.
+ 13293:   NullOutListener();
+     1: 
+121868:   if (GetOwner()) {
+     1:     /* Call RemoveProxy with a successful status.  This will keep the
+     1:        channel, if still downloading data, from being canceled if 'this' is
+     1:        the last observer.  This allows the image to continue to download and
+     1:        be cached even if no one is using it currently.
+     1:     */
+119697:     mCanceled = true;
+121868:     GetOwner()->RemoveProxy(this, NS_OK);
+     1:   }
+     1: }
+     1: 
+118746: nsresult imgRequestProxy::Init(imgStatusTracker* aStatusTracker,
+118746:                                nsILoadGroup* aLoadGroup,
+118750:                                nsIURI* aURI, imgINotificationObserver* aObserver)
+     1: {
+121868:   NS_PRECONDITION(!GetOwner() && !mListener, "imgRequestProxy is already initialized");
+     1: 
+120415:   LOG_SCOPE_WITH_PARAM(GetImgLog(), "imgRequestProxy::Init", "request", aStatusTracker->GetRequest());
+     1: 
+ 52149:   NS_ABORT_IF_FALSE(mAnimationConsumers == 0, "Cannot have animation before Init");
+ 52149: 
+121868:   mBehaviour->SetOwner(aStatusTracker->GetRequest());
+     1:   mListener = aObserver;
+ 13293:   // Make sure to addref mListener before the AddProxy call below, since
+ 13293:   // that call might well want to release it if the imgRequest has
+ 13293:   // already seen OnStopRequest.
+ 13293:   if (mListener) {
+ 80486:     mListenerIsStrongRef = true;
+ 13293:     NS_ADDREF(mListener);
+ 13293:   }
+     1:   mLoadGroup = aLoadGroup;
+ 48319:   mURI = aURI;
+     1: 
+ 23532:   // Note: AddProxy won't send all the On* notifications immediately
+121868:   if (GetOwner())
+121868:     GetOwner()->AddProxy(this);
+     1: 
+     1:   return NS_OK;
+     1: }
+     1: 
+     1: nsresult imgRequestProxy::ChangeOwner(imgRequest *aNewOwner)
+     1: {
+121868:   NS_PRECONDITION(GetOwner(), "Cannot ChangeOwner on a proxy without an owner!");
+ 48319: 
+119697:   if (mCanceled) {
+119697:     // Ensure that this proxy has received all notifications to date before
+119697:     // we clean it up when removing it from the old owner below.
+119697:     SyncNotifyListener();
+119697:   }
+119697: 
+ 48320:   // If we're holding locks, unlock the old image.
+ 52147:   // Note that UnlockImage decrements mLockCount each time it's called.
+108991:   uint32_t oldLockCount = mLockCount;
+ 52147:   while (mLockCount)
+ 48320:     UnlockImage();
+ 48320: 
+ 52149:   // If we're holding animation requests, undo them.
+108991:   uint32_t oldAnimationConsumers = mAnimationConsumers;
+ 52149:   ClearAnimationConsumers();
+ 52149: 
+ 32424:   // Were we decoded before?
+ 79445:   bool wasDecoded = false;
+118747:   if (GetImage() &&
+118747:       (GetStatusTracker().GetImageStatus() & imgIRequest::STATUS_FRAME_COMPLETE)) {
+ 80486:     wasDecoded = true;
+ 51297:   }
+ 32424: 
+121868:   GetOwner()->RemoveProxy(this, NS_IMAGELIB_CHANGING_OWNER);
+119697: 
+121868:   mBehaviour->SetOwner(aNewOwner);
+119697: 
+119697:   // If we were locked, apply the locks here
+119697:   for (uint32_t i = 0; i < oldLockCount; i++)
+119697:     LockImage();
+     1: 
+ 61324:   // If we had animation requests, restore them here. Note that we
+ 61324:   // do this *after* RemoveProxy, which clears out animation consumers
+ 61324:   // (see bug 601723).
+108991:   for (uint32_t i = 0; i < oldAnimationConsumers; i++)
+ 61324:     IncrementAnimationConsumers();
+ 61324: 
+121868:   GetOwner()->AddProxy(this);
+     1: 
+ 32516:   // If we were decoded, or if we'd previously requested a decode, request a
+ 32516:   // decode on the new image
+ 32516:   if (wasDecoded || mDecodeRequested)
+121868:     GetOwner()->StartDecoding();
+ 32424: 
+     1:   return NS_OK;
+     1: }
+     1: 
+     1: void imgRequestProxy::AddToLoadGroup()
+     1: {
+     1:   NS_ASSERTION(!mIsInLoadGroup, "Whaa, we're already in the loadgroup!");
+     1: 
+     1:   if (!mIsInLoadGroup && mLoadGroup) {
+106838:     mLoadGroup->AddRequest(this, nullptr);
+ 80486:     mIsInLoadGroup = true;
+     1:   }
+     1: }
+     1: 
+ 79445: void imgRequestProxy::RemoveFromLoadGroup(bool releaseLoadGroup)
+     1: {
+     1:   if (!mIsInLoadGroup)
+     1:     return;
+     1: 
+     1:   /* calling RemoveFromLoadGroup may cause the document to finish
+     1:      loading, which could result in our death.  We need to make sure
+     1:      that we stay alive long enough to fight another battle... at
+     1:      least until we exit this function.
+     1:   */
+     1:   nsCOMPtr<imgIRequest> kungFuDeathGrip(this);
+     1: 
+106838:   mLoadGroup->RemoveRequest(this, nullptr, NS_OK);
+ 80486:   mIsInLoadGroup = false;
+     1: 
+     1:   if (releaseLoadGroup) {
+     1:     // We're done with the loadgroup, release it.
+106838:     mLoadGroup = nullptr;
+     1:   }
+     1: }
+     1: 
+     1: 
+     1: /**  nsIRequest / imgIRequest methods **/
+     1: 
+     1: /* readonly attribute wstring name; */
+     1: NS_IMETHODIMP imgRequestProxy::GetName(nsACString &aName)
+     1: {
+     1:   aName.Truncate();
+ 48319: 
+ 48319:   if (mURI)
+ 48319:     mURI->GetSpec(aName);
+ 48319: 
+     1:   return NS_OK;
+     1: }
+     1: 
+     1: /* boolean isPending (); */
+ 79445: NS_IMETHODIMP imgRequestProxy::IsPending(bool *_retval)
+     1: {
+     1:   return NS_ERROR_NOT_IMPLEMENTED;
+     1: }
+     1: 
+     1: /* readonly attribute nsresult status; */
+     1: NS_IMETHODIMP imgRequestProxy::GetStatus(nsresult *aStatus)
+     1: {
+ 24472:   return NS_ERROR_NOT_IMPLEMENTED;
+     1: }
+     1: 
+     1: /* void cancel (in nsresult status); */
+     1: NS_IMETHODIMP imgRequestProxy::Cancel(nsresult status)
+     1: {
+ 48320:   if (mCanceled)
+     1:     return NS_ERROR_FAILURE;
+     1: 
+120415:   LOG_SCOPE(GetImgLog(), "imgRequestProxy::Cancel");
+     1: 
+ 80486:   mCanceled = true;
+     1: 
+ 22953:   nsCOMPtr<nsIRunnable> ev = new imgCancelRunnable(this, status);
+ 22953:   return NS_DispatchToCurrentThread(ev);
+ 22953: }
+ 22953: 
+ 22953: void
+ 22953: imgRequestProxy::DoCancel(nsresult status)
+ 22953: {
+121868:   if (GetOwner()) {
+121868:     GetOwner()->RemoveProxy(this, status);
+118608:   }
+     1: 
+ 13293:   NullOutListener();
+ 22953: }
+ 22953: 
+ 22953: /* void cancelAndForgetObserver (in nsresult aStatus); */
+ 22953: NS_IMETHODIMP imgRequestProxy::CancelAndForgetObserver(nsresult aStatus)
+ 22953: {
+ 80562:   // If mCanceled is true but mListener is non-null, that means
+ 80562:   // someone called Cancel() on us but the imgCancelRunnable is still
+ 80562:   // pending.  We still need to null out mListener before returning
+ 80562:   // from this function in this case.  That means we want to do the
+ 80562:   // RemoveProxy call right now, because we need to deliver the
+ 80562:   // onStopRequest.
+ 80562:   if (mCanceled && !mListener)
+ 22953:     return NS_ERROR_FAILURE;
+ 22953: 
+120415:   LOG_SCOPE(GetImgLog(), "imgRequestProxy::CancelAndForgetObserver");
+ 22953: 
+ 80486:   mCanceled = true;
+ 22953: 
+ 39122:   // Now cheat and make sure our removal from loadgroup happens async
+ 79445:   bool oldIsInLoadGroup = mIsInLoadGroup;
+ 80486:   mIsInLoadGroup = false;
+ 39122: 
+121868:   if (GetOwner()) {
+121868:     GetOwner()->RemoveProxy(this, aStatus);
+118608:   }
+ 22953: 
+ 39122:   mIsInLoadGroup = oldIsInLoadGroup;
+ 39122: 
+ 39122:   if (mIsInLoadGroup) {
+ 39122:     nsCOMPtr<nsIRunnable> ev =
+ 41361:       NS_NewRunnableMethod(this, &imgRequestProxy::DoRemoveFromLoadGroup);
+ 39122:     NS_DispatchToCurrentThread(ev);
+ 39122:   }
+ 39122: 
+ 22953:   NullOutListener();
+ 21421: 
+ 21421:   return NS_OK;
+     1: }
+     1: 
+116146: /* void startDecode (); */
+116146: NS_IMETHODIMP
+116146: imgRequestProxy::StartDecoding()
+116146: {
+121868:   if (!GetOwner())
+116146:     return NS_ERROR_FAILURE;
+116146: 
+116146:   // Flag this, so we know to transfer the request if our owner changes
+116146:   mDecodeRequested = true;
+116146: 
+116146:   // Forward the request
+121868:   return GetOwner()->StartDecoding();
+116146: }
+116146: 
+ 32424: /* void requestDecode (); */
+ 32424: NS_IMETHODIMP
+ 32424: imgRequestProxy::RequestDecode()
+ 32424: {
+121868:   if (!GetOwner())
+ 32424:     return NS_ERROR_FAILURE;
+ 32424: 
+ 32516:   // Flag this, so we know to transfer the request if our owner changes
+ 80486:   mDecodeRequested = true;
+ 32424: 
+ 32516:   // Forward the request
+121868:   return GetOwner()->RequestDecode();
+ 32424: }
+ 32424: 
+116146: 
+ 32424: /* void lockImage (); */
+ 32424: NS_IMETHODIMP
+ 32424: imgRequestProxy::LockImage()
+ 32424: {
+ 52147:   mLockCount++;
+118747:   if (GetImage())
+118747:     return GetImage()->LockImage();
+ 51297:   return NS_OK;
+ 51297: }
+ 51297: 
+ 32424: /* void unlockImage (); */
+ 32424: NS_IMETHODIMP
+ 32424: imgRequestProxy::UnlockImage()
+ 32424: {
+ 52147:   NS_ABORT_IF_FALSE(mLockCount > 0, "calling unlock but no locks!");
+ 51297: 
+ 52147:   mLockCount--;
+118747:   if (GetImage())
+118747:     return GetImage()->UnlockImage();
+ 51297:   return NS_OK;
+ 51297: }
+ 32424: 
+ 91981: /* void requestDiscard (); */
+ 91981: NS_IMETHODIMP
+ 91981: imgRequestProxy::RequestDiscard()
+ 91981: {
+118747:   if (GetImage())
+118747:     return GetImage()->RequestDiscard();
+ 91981:   return NS_OK;
+ 91981: }
+ 91981: 
+ 52149: NS_IMETHODIMP
+ 52149: imgRequestProxy::IncrementAnimationConsumers()
+ 52149: {
+ 52149:   mAnimationConsumers++;
+118747:   if (GetImage())
+118747:     GetImage()->IncrementAnimationConsumers();
+ 52149:   return NS_OK;
+ 52149: }
+ 52149: 
+ 52149: NS_IMETHODIMP
+ 52149: imgRequestProxy::DecrementAnimationConsumers()
+ 52149: {
+ 52149:   // We may get here if some responsible code called Increment,
+ 52149:   // then called us, but we have meanwhile called ClearAnimationConsumers
+ 52149:   // because we needed to get rid of them earlier (see
+ 52149:   // imgRequest::RemoveProxy), and hence have nothing left to
+ 52149:   // decrement. (In such a case we got rid of the animation consumers
+ 52149:   // early, but not the observer.)
+ 52149:   if (mAnimationConsumers > 0) {
+ 52149:     mAnimationConsumers--;
+118747:     if (GetImage())
+118747:       GetImage()->DecrementAnimationConsumers();
+ 52149:   }
+ 52149:   return NS_OK;
+ 52149: }
+ 52149: 
+ 52149: void
+ 52149: imgRequestProxy::ClearAnimationConsumers()
+ 52149: {
+ 52149:   while (mAnimationConsumers > 0)
+ 52149:     DecrementAnimationConsumers();
+ 52149: }
+ 52149: 
+     1: /* void suspend (); */
+     1: NS_IMETHODIMP imgRequestProxy::Suspend()
+     1: {
+     1:     return NS_ERROR_NOT_IMPLEMENTED;
+     1: }
+     1: 
+     1: /* void resume (); */
+     1: NS_IMETHODIMP imgRequestProxy::Resume()
+     1: {
+     1:     return NS_ERROR_NOT_IMPLEMENTED;
+     1: }
+     1: 
+     1: /* attribute nsILoadGroup loadGroup */
+     1: NS_IMETHODIMP imgRequestProxy::GetLoadGroup(nsILoadGroup **loadGroup)
+     1: {
+     1:   NS_IF_ADDREF(*loadGroup = mLoadGroup.get());
+     1:   return NS_OK;
+     1: }
+     1: NS_IMETHODIMP imgRequestProxy::SetLoadGroup(nsILoadGroup *loadGroup)
+     1: {
+     1:   mLoadGroup = loadGroup;
+     1:   return NS_OK;
+     1: }
+     1: 
+     1: /* attribute nsLoadFlags loadFlags */
+     1: NS_IMETHODIMP imgRequestProxy::GetLoadFlags(nsLoadFlags *flags)
+     1: {
+     1:   *flags = mLoadFlags;
+     1:   return NS_OK;
+     1: }
+     1: NS_IMETHODIMP imgRequestProxy::SetLoadFlags(nsLoadFlags flags)
+     1: {
+     1:   mLoadFlags = flags;
+     1:   return NS_OK;
+     1: }
+     1: 
+     1: /**  imgIRequest methods **/
+     1: 
+     1: /* attribute imgIContainer image; */
+     1: NS_IMETHODIMP imgRequestProxy::GetImage(imgIContainer * *aImage)
+     1: {
+ 51297:   // It's possible that our owner has an image but hasn't notified us of it -
+ 51297:   // that'll happen if we get Canceled before the owner instantiates its image
+ 51297:   // (because Canceling unregisters us as a listener on mOwner). If we're
+ 51297:   // in that situation, just grab the image off of mOwner.
+121868:   imgIContainer* imageToReturn = GetImage();
+121868:   if (!imageToReturn && GetOwner())
+121868:     imageToReturn = GetOwner()->mImage.get();
+ 51297: 
+ 51297:   if (!imageToReturn)
+     1:     return NS_ERROR_FAILURE;
+     1: 
+ 51297:   NS_ADDREF(*aImage = imageToReturn);
+ 48319: 
+     1:   return NS_OK;
+     1: }
+     1: 
+     1: /* readonly attribute unsigned long imageStatus; */
+108991: NS_IMETHODIMP imgRequestProxy::GetImageStatus(uint32_t *aStatus)
+     1: {
+ 51297:   *aStatus = GetStatusTracker().GetImageStatus();
+     1: 
+ 48319:   return NS_OK;
+ 48319: }
+ 48319: 
+     1: /* readonly attribute nsIURI URI; */
+     1: NS_IMETHODIMP imgRequestProxy::GetURI(nsIURI **aURI)
+     1: {
+ 48319:   if (!mURI)
+     1:     return NS_ERROR_FAILURE;
+     1: 
+ 48319:   NS_ADDREF(*aURI = mURI);
+ 48319: 
+ 48319:   return NS_OK;
+     1: }
+     1: 
+118750: /* readonly attribute imgINotificationObserver notificationObserver; */
+118750: NS_IMETHODIMP imgRequestProxy::GetNotificationObserver(imgINotificationObserver **aObserver)
+     1: {
+118750:   *aObserver = mListener;
+118750:   NS_IF_ADDREF(*aObserver);
+     1:   return NS_OK;
+     1: }
+     1: 
+     1: /* readonly attribute string mimeType; */
+     1: NS_IMETHODIMP imgRequestProxy::GetMimeType(char **aMimeType)
+     1: {
+121868:   if (!GetOwner())
+     1:     return NS_ERROR_FAILURE;
+     1: 
+121868:   const char *type = GetOwner()->GetMimeType();
+     1:   if (!type)
+     1:     return NS_ERROR_FAILURE;
+     1: 
+ 26655:   *aMimeType = NS_strdup(type);
+     1: 
+     1:   return NS_OK;
+     1: }
+     1: 
+118751: static imgRequestProxy* NewProxy(imgRequestProxy* /*aThis*/)
+118751: {
+118751:   return new imgRequestProxy();
+118751: }
+118751: 
+118751: imgRequestProxy* NewStaticProxy(imgRequestProxy* aThis)
+118751: {
+118751:   nsCOMPtr<nsIPrincipal> currentPrincipal;
+118751:   aThis->GetImagePrincipal(getter_AddRefs(currentPrincipal));
+121868:   return new imgRequestProxyStatic(aThis->GetImage(), currentPrincipal);
+118751: }
+118751: 
+118750: NS_IMETHODIMP imgRequestProxy::Clone(imgINotificationObserver* aObserver,
+118671:                                      imgIRequest** aClone)
+118671: {
+118751:   return PerformClone(aObserver, NewProxy, aClone);
+118751: }
+118751: 
+118751: nsresult imgRequestProxy::PerformClone(imgINotificationObserver* aObserver,
+118751:                                        imgRequestProxy* (aAllocFn)(imgRequestProxy*),
+118751:                                        imgIRequest** aClone)
+118751: {
+     1:   NS_PRECONDITION(aClone, "Null out param");
+ 48320: 
+120415:   LOG_SCOPE(GetImgLog(), "imgRequestProxy::Clone");
+ 48320: 
+106838:   *aClone = nullptr;
+118751:   nsRefPtr<imgRequestProxy> clone = aAllocFn(this);
+     1: 
+     1:   // It is important to call |SetLoadFlags()| before calling |Init()| because
+     1:   // |Init()| adds the request to the loadgroup.
+     1:   // When a request is added to a loadgroup, its load flags are merged
+     1:   // with the load flags of the loadgroup.
+     1:   // XXXldb That's not true anymore.  Stuff from imgLoader adds the
+     1:   // request to the loadgroup.
+     1:   clone->SetLoadFlags(mLoadFlags);
+118751:   nsresult rv = clone->Init(&GetStatusTracker(), mLoadGroup, mURI, aObserver);
+ 48319:   if (NS_FAILED(rv))
+     1:     return rv;
+     1: 
+ 48319:   // Assign to *aClone before calling Notify so that if the caller expects to
+ 48319:   // only be notified for requests it's already holding pointers to it won't be
+ 48319:   // surprised.
+ 48320:   NS_ADDREF(*aClone = clone);
+     1: 
+ 48321:   // This is wrong!!! We need to notify asynchronously, but there's code that
+ 48321:   // assumes that we don't. This will be fixed in bug 580466.
+ 48321:   clone->SyncNotifyListener();
+     1: 
+     1:   return NS_OK;
+     1: }
+     1: 
+  7703: /* readonly attribute nsIPrincipal imagePrincipal; */
+  7703: NS_IMETHODIMP imgRequestProxy::GetImagePrincipal(nsIPrincipal **aPrincipal)
+  7703: {
+121868:   if (!GetOwner())
+  7703:     return NS_ERROR_FAILURE;
+  7703: 
+121868:   NS_ADDREF(*aPrincipal = GetOwner()->GetPrincipal());
+ 48319:   return NS_OK;
+  7703: }
+  7703: 
+ 98961: /* readonly attribute bool multipart; */
+ 98961: NS_IMETHODIMP imgRequestProxy::GetMultipart(bool *aMultipart)
+ 98961: {
+121868:   if (!GetOwner())
+ 98961:     return NS_ERROR_FAILURE;
+ 98961: 
+121868:   *aMultipart = GetOwner()->GetMultipart();
+ 98961: 
+ 98961:   return NS_OK;
+ 98961: }
+ 98961: 
+108991: /* readonly attribute int32_t CORSMode; */
+108991: NS_IMETHODIMP imgRequestProxy::GetCORSMode(int32_t* aCorsMode)
+ 73879: {
+121868:   if (!GetOwner())
+ 73879:     return NS_ERROR_FAILURE;
+ 73879: 
+121868:   *aCorsMode = GetOwner()->GetCORSMode();
+ 73879: 
+ 73879:   return NS_OK;
+ 73879: }
+ 73879: 
+     1: /** nsISupportsPriority methods **/
+     1: 
+108991: NS_IMETHODIMP imgRequestProxy::GetPriority(int32_t *priority)
+     1: {
+121868:   NS_ENSURE_STATE(GetOwner());
+121868:   *priority = GetOwner()->Priority();
+     1:   return NS_OK;
+     1: }
+     1: 
+108991: NS_IMETHODIMP imgRequestProxy::SetPriority(int32_t priority)
+     1: {
+121868:   NS_ENSURE_STATE(GetOwner() && !mCanceled);
+121868:   GetOwner()->AdjustPriority(this, priority - GetOwner()->Priority());
+     1:   return NS_OK;
+     1: }
+     1: 
+108991: NS_IMETHODIMP imgRequestProxy::AdjustPriority(int32_t priority)
+     1: {
+121868:   NS_ENSURE_STATE(GetOwner() && !mCanceled);
+121868:   GetOwner()->AdjustPriority(this, priority);
+     1:   return NS_OK;
+     1: }
+     1: 
+ 18557: /** nsISecurityInfoProvider methods **/
+ 18557: 
+ 18557: NS_IMETHODIMP imgRequestProxy::GetSecurityInfo(nsISupports** _retval)
+ 18557: {
+121868:   if (GetOwner())
+121868:     return GetOwner()->GetSecurityInfo(_retval);
+ 18557: 
+106838:   *_retval = nullptr;
+ 18557:   return NS_OK;
+ 18557: }
+ 18557: 
+ 79445: NS_IMETHODIMP imgRequestProxy::GetHasTransferredData(bool* hasData)
+ 25037: {
+121868:   if (GetOwner()) {
+121868:     *hasData = GetOwner()->HasTransferredData();
+ 25037:   } else {
+ 25037:     // The safe thing to do is to claim we have data
+ 80486:     *hasData = true;
+ 25037:   }
+ 25037:   return NS_OK;
+ 25037: }
+ 25037: 
+     1: /** imgIDecoderObserver methods **/
+     1: 
+118757: void imgRequestProxy::OnStartContainer()
+     1: {
+120415:   LOG_FUNC(GetImgLog(), "imgRequestProxy::OnStartContainer");
+     1: 
+ 49700:   if (mListener && !mCanceled && !mSentStartContainer) {
+     1:     // Hold a ref to the listener while we call it, just in case.
+118750:     nsCOMPtr<imgINotificationObserver> kungFuDeathGrip(mListener);
+118758:     mListener->Notify(this, imgINotificationObserver::SIZE_AVAILABLE, nullptr);
+ 80486:     mSentStartContainer = true;
+     1:   }
+     1: }
+     1: 
+118758: void imgRequestProxy::OnFrameUpdate(const nsIntRect * rect)
+     1: {
+120415:   LOG_FUNC(GetImgLog(), "imgRequestProxy::OnDataAvailable");
+     1: 
+ 22953:   if (mListener && !mCanceled) {
+     1:     // Hold a ref to the listener while we call it, just in case.
+118750:     nsCOMPtr<imgINotificationObserver> kungFuDeathGrip(mListener);
+118758:     mListener->Notify(this, imgINotificationObserver::FRAME_UPDATE, rect);
+     1:   }
+     1: }
+     1: 
+118757: void imgRequestProxy::OnStopFrame()
+     1: {
+120415:   LOG_FUNC(GetImgLog(), "imgRequestProxy::OnStopFrame");
+     1: 
+ 22953:   if (mListener && !mCanceled) {
+     1:     // Hold a ref to the listener while we call it, just in case.
+118750:     nsCOMPtr<imgINotificationObserver> kungFuDeathGrip(mListener);
+118758:     mListener->Notify(this, imgINotificationObserver::FRAME_COMPLETE, nullptr);
+     1:   }
+     1: }
+     1: 
+118752: void imgRequestProxy::OnStopDecode()
+     1: {
+120415:   LOG_FUNC(GetImgLog(), "imgRequestProxy::OnStopDecode");
+     1: 
+ 22953:   if (mListener && !mCanceled) {
+     1:     // Hold a ref to the listener while we call it, just in case.
+118750:     nsCOMPtr<imgINotificationObserver> kungFuDeathGrip(mListener);
+118758:     mListener->Notify(this, imgINotificationObserver::DECODE_COMPLETE, nullptr);
+     1:   }
+118752: 
+118752:   // Multipart needs reset for next OnStartContainer
+121868:   if (GetOwner() && GetOwner()->GetMultipart())
+118752:     mSentStartContainer = false;
+     1: }
+     1: 
+ 32424: void imgRequestProxy::OnDiscard()
+ 32424: {
+120415:   LOG_FUNC(GetImgLog(), "imgRequestProxy::OnDiscard");
+ 32424: 
+ 32424:   if (mListener && !mCanceled) {
+ 32424:     // Hold a ref to the listener while we call it, just in case.
+118750:     nsCOMPtr<imgINotificationObserver> kungFuDeathGrip(mListener);
+118750:     mListener->Notify(this, imgINotificationObserver::DISCARD, nullptr);
+ 32424:   }
+ 32424: }
+ 32424: 
+ 82096: void imgRequestProxy::OnImageIsAnimated()
+ 82096: {
+120415:   LOG_FUNC(GetImgLog(), "imgRequestProxy::OnImageIsAnimated");
+ 82096:   if (mListener && !mCanceled) {
+ 82096:     // Hold a ref to the listener while we call it, just in case.
+118750:     nsCOMPtr<imgINotificationObserver> kungFuDeathGrip(mListener);
+118750:     mListener->Notify(this, imgINotificationObserver::IS_ANIMATED, nullptr);
+ 82096:   }
+ 82096: }
+ 82096: 
+ 48317: void imgRequestProxy::OnStartRequest()
+     1: {
+     1: #ifdef PR_LOGGING
+110974:   nsAutoCString name;
+     1:   GetName(name);
+120415:   LOG_FUNC_WITH_PARAM(GetImgLog(), "imgRequestProxy::OnStartRequest", "name", name.get());
+     1: #endif
+     1: }
+     1: 
+ 79445: void imgRequestProxy::OnStopRequest(bool lastPart)
+     1: {
+     1: #ifdef PR_LOGGING
+110974:   nsAutoCString name;
+     1:   GetName(name);
+120415:   LOG_FUNC_WITH_PARAM(GetImgLog(), "imgRequestProxy::OnStopRequest", "name", name.get());
+     1: #endif
+ 13419:   // There's all sorts of stuff here that could kill us (the OnStopRequest call
+ 13419:   // on the listener, the removal from the loadgroup, the release of the
+ 13419:   // listener, etc).  Don't let them do it.
+ 13419:   nsCOMPtr<imgIRequest> kungFuDeathGrip(this);
+     1: 
+     1:   if (mListener) {
+     1:     // Hold a ref to the listener while we call it, just in case.
+118750:     nsCOMPtr<imgINotificationObserver> kungFuDeathGrip(mListener);
+118758:     mListener->Notify(this, imgINotificationObserver::LOAD_COMPLETE, nullptr);
+     1:   }
+     1: 
+     1:   // If we're expecting more data from a multipart channel, re-add ourself
+     1:   // to the loadgroup so that the document doesn't lose track of the load.
+     1:   // If the request is already a background request and there's more data
+     1:   // coming, we can just leave the request in the loadgroup as-is.
+     1:   if (lastPart || (mLoadFlags & nsIRequest::LOAD_BACKGROUND) == 0) {
+     1:     RemoveFromLoadGroup(lastPart);
+     1:     // More data is coming, so change the request to be a background request
+     1:     // and put it back in the loadgroup.
+     1:     if (!lastPart) {
+     1:       mLoadFlags |= nsIRequest::LOAD_BACKGROUND;
+     1:       AddToLoadGroup();
+     1:     }
+     1:   }
+ 13293: 
+ 13293:   if (mListenerIsStrongRef) {
+ 13293:     NS_PRECONDITION(mListener, "How did that happen?");
+ 13293:     // Drop our strong ref to the listener now that we're done with
+ 13293:     // everything.  Note that this can cancel us and other fun things
+ 13293:     // like that.  Don't add anything in this method after this point.
+118750:     imgINotificationObserver* obs = mListener;
+ 80486:     mListenerIsStrongRef = false;
+ 13293:     NS_RELEASE(obs);
+ 13293:   }
+     1: }
+     1: 
+108324: void imgRequestProxy::BlockOnload()
+108324: {
+108324: #ifdef PR_LOGGING
+110974:   nsAutoCString name;
+108324:   GetName(name);
+120415:   LOG_FUNC_WITH_PARAM(GetImgLog(), "imgRequestProxy::BlockOnload", "name", name.get());
+108324: #endif
+108324: 
+108324:   nsCOMPtr<imgIOnloadBlocker> blocker = do_QueryInterface(mListener);
+108324:   if (blocker) {
+108324:     blocker->BlockOnload(this);
+108324:   }
+108324: }
+108324: 
+108324: void imgRequestProxy::UnblockOnload()
+108324: {
+108324: #ifdef PR_LOGGING
+110974:   nsAutoCString name;
+108324:   GetName(name);
+120415:   LOG_FUNC_WITH_PARAM(GetImgLog(), "imgRequestProxy::UnblockOnload", "name", name.get());
+108324: #endif
+108324: 
+108324:   nsCOMPtr<imgIOnloadBlocker> blocker = do_QueryInterface(mListener);
+108324:   if (blocker) {
+108324:     blocker->UnblockOnload(this);
+108324:   }
+108324: }
+108324: 
+ 13293: void imgRequestProxy::NullOutListener()
+ 13293: {
+ 52149:   // If we have animation consumers, then they don't matter anymore
+ 52149:   if (mListener)
+ 52149:     ClearAnimationConsumers();
+ 52149: 
+ 13293:   if (mListenerIsStrongRef) {
+ 13293:     // Releasing could do weird reentery stuff, so just play it super-safe
+118750:     nsCOMPtr<imgINotificationObserver> obs;
+ 13293:     obs.swap(mListener);
+ 80486:     mListenerIsStrongRef = false;
+ 13293:   } else {
+106838:     mListener = nullptr;
+ 13293:   }
+ 13293: }
+ 35581: 
+ 35581: NS_IMETHODIMP
+ 35581: imgRequestProxy::GetStaticRequest(imgIRequest** aReturn)
+ 35581: {
+106838:   *aReturn = nullptr;
+118747:   mozilla::image::Image* image = GetImage();
+ 48319: 
+ 79445:   bool animated;
+118747:   if (!image || (NS_SUCCEEDED(image->GetAnimated(&animated)) && !animated)) {
+ 48319:     // Early exit - we're not animated, so we don't have to do anything.
+ 35581:     NS_ADDREF(*aReturn = this);
+ 35581:     return NS_OK;
+ 48320:   }
+ 48320: 
+ 48319:   // We are animated. We need to extract the current frame from this image.
+108991:   int32_t w = 0;
+108991:   int32_t h = 0;
+118747:   image->GetWidth(&w);
+118747:   image->GetHeight(&h);
+ 35581:   nsIntRect rect(0, 0, w, h);
+ 48320:   nsCOMPtr<imgIContainer> currentFrame;
+118747:   nsresult rv = image->ExtractFrame(imgIContainer::FRAME_CURRENT, rect,
+ 35581:                                     imgIContainer::FLAG_SYNC_DECODE,
+ 35581:                                     getter_AddRefs(currentFrame));
+ 48320:   if (NS_FAILED(rv))
+ 48320:     return rv;
+ 35581: 
+ 50546:   nsRefPtr<Image> frame = static_cast<Image*>(currentFrame.get());
+ 35581: 
+ 48320:   // Create a static imgRequestProxy with our new extracted frame.
+118742:   nsCOMPtr<nsIPrincipal> currentPrincipal;
+118742:   GetImagePrincipal(getter_AddRefs(currentPrincipal));
+118747:   nsRefPtr<imgRequestProxy> req = new imgRequestProxyStatic(frame, currentPrincipal);
+118746:   req->Init(&frame->GetStatusTracker(), nullptr, mURI, nullptr);
+ 48319: 
+ 35581:   NS_ADDREF(*aReturn = req);
+ 48319: 
+ 35581:   return NS_OK;
+ 35581: }
+ 35581: 
+ 48320: void imgRequestProxy::NotifyListener()
+ 48319: {
+ 48321:   // It would be nice to notify the observer directly in the status tracker
+ 48321:   // instead of through the proxy, but there are several places we do extra
+ 48321:   // processing when we receive notifications (like OnStopRequest()), and we
+ 48321:   // need to check mCanceled everywhere too.
+ 48320: 
+121868:   if (GetOwner()) {
+ 48321:     // Send the notifications to our listener asynchronously.
+121868:     GetStatusTracker().Notify(GetOwner(), this);
+ 48321:   } else {
+ 48321:     // We don't have an imgRequest, so we can only notify the clone of our
+ 48321:     // current state, but we still have to do that asynchronously.
+118747:     NS_ABORT_IF_FALSE(GetImage(),
+ 51297:                       "if we have no imgRequest, we should have an Image");
+118747:     GetStatusTracker().NotifyCurrentState(this);
+ 48319:   }
+ 48321: }
+ 48321: 
+ 48321: void imgRequestProxy::SyncNotifyListener()
+ 48321: {
+ 48321:   // It would be nice to notify the observer directly in the status tracker
+ 48321:   // instead of through the proxy, but there are several places we do extra
+ 48321:   // processing when we receive notifications (like OnStopRequest()), and we
+ 48321:   // need to check mCanceled everywhere too.
+ 48321: 
+ 51297:   GetStatusTracker().SyncNotify(this);
+ 48321: }
+ 51297: 
+ 51297: void
+118747: imgRequestProxy::SetHasImage()
+ 51297: {
+118747:   Image* image = GetStatusTracker().GetImage();
+ 51297: 
+121868:   // Force any private status related to the owner to reflect
+121868:   // the presence of an image;
+121868:   mBehaviour->SetOwner(mBehaviour->GetOwner());
+ 51297: 
+ 52147:   // Apply any locks we have
+108991:   for (uint32_t i = 0; i < mLockCount; ++i)
+118747:     image->LockImage();
+ 52149: 
+ 52149:   // Apply any animation consumers we have
+108991:   for (uint32_t i = 0; i < mAnimationConsumers; i++)
+118747:     image->IncrementAnimationConsumers();
+ 51297: }
+ 51297: 
+ 51297: imgStatusTracker&
+118747: imgRequestProxy::GetStatusTracker() const
+ 51297: {
+121868:   return mBehaviour->GetStatusTracker();
+118747: }
+118747: 
+118747: mozilla::image::Image*
+118747: imgRequestProxy::GetImage() const
+118747: {
+121868:   return mBehaviour->GetImage();
+121868: }
+121868: 
+121868: imgRequest*
+121868: imgRequestProxy::GetOwner() const
+121868: {
+121868:   return mBehaviour->GetOwner();
+118667: }
+118742: 
+118742: ////////////////// imgRequestProxyStatic methods
+118742: 
+121868: class StaticBehaviour : public ProxyBehaviour
+121868: {
+121868: public:
+121868:   StaticBehaviour(mozilla::image::Image* aImage) : mImage(aImage) {}
+121868: 
+121868:   virtual mozilla::image::Image* GetImage() const MOZ_OVERRIDE {
+121868:     return mImage;
+121868:   }
+121868: 
+121868:   virtual imgStatusTracker& GetStatusTracker() const MOZ_OVERRIDE {
+121868:     return mImage->GetStatusTracker();
+121868:   }
+121868: 
+121868:   virtual imgRequest* GetOwner() const MOZ_OVERRIDE {
+121868:     return nullptr;
+121868:   }
+121868: 
+121868:   virtual void SetOwner(imgRequest* aOwner) MOZ_OVERRIDE {
+121868:     MOZ_ASSERT_IF(aOwner, "We shouldn't be giving static requests a non-null owner.");
+121868:   }
+121868: 
+121868: private:
+121868:   // Our image. We have to hold a strong reference here, because that's normally
+121868:   // the job of the underlying request.
+121868:   nsRefPtr<mozilla::image::Image> mImage;
+121868: };
+121868: 
+121868: imgRequestProxyStatic::imgRequestProxyStatic(mozilla::image::Image* aImage,
+121868:                                              nsIPrincipal* aPrincipal)
+121868: : mPrincipal(aPrincipal)
+121868: {
+121868:   mBehaviour = new StaticBehaviour(aImage);
+121868: }
+121868: 
+118742: NS_IMETHODIMP imgRequestProxyStatic::GetImagePrincipal(nsIPrincipal **aPrincipal)
+118742: {
+118742:   if (!mPrincipal)
+118742:     return NS_ERROR_FAILURE;
+118742: 
+118742:   NS_ADDREF(*aPrincipal = mPrincipal);
+118742: 
+118742:   return NS_OK;
+118742: }
+118747: 
+118751: NS_IMETHODIMP
+118751: imgRequestProxyStatic::Clone(imgINotificationObserver* aObserver,
+118751:                              imgIRequest** aClone)
+118751: {
+118751:   return PerformClone(aObserver, NewStaticProxy, aClone);
+118751: }

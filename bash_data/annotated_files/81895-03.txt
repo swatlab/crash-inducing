@@ -1,0 +1,644 @@
+40132: /* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+40132: /* vim:set ts=2 sw=2 sts=2 et cindent: */
+40132: /* ***** BEGIN LICENSE BLOCK *****
+40132:  * Version: ML 1.1/GPL 2.0/LGPL 2.1
+40132:  *
+40132:  * The contents of this file are subject to the Mozilla Public License Version
+40132:  * 1.1 (the "License"); you may not use this file except in compliance with
+40132:  * the License. You may obtain a copy of the License at
+40132:  * http://www.mozilla.org/MPL/
+40132:  *
+40132:  * Software distributed under the License is distributed on an "AS IS" basis,
+40132:  * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+40132:  * for the specific language governing rights and limitations under the
+40132:  * License.
+40132:  *
+40132:  * The Original Code is Mozilla code.
+40132:  *
+40132:  * The Initial Developer of the Original Code is the Mozilla Foundation.
+40132:  * Portions created by the Initial Developer are Copyright (C) 2010
+40132:  * the Initial Developer. All Rights Reserved.
+40132:  *
+40132:  * Contributor(s):
+40132:  *  Chris Double <chris.double@double.co.nz>
+40132:  *  Chris Pearce <chris@pearce.org.nz>
+40132:  *
+40132:  * Alternatively, the contents of this file may be used under the terms of
+40132:  * either the GNU General Public License Version 2 or later (the "GPL"), or
+40132:  * the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+40132:  * in which case the provisions of the GPL or the LGPL are applicable instead
+40132:  * of those above. If you wish to allow use of your version of this file only
+40132:  * under the terms of either the GPL or the LGPL, and not to allow others to
+40132:  * use your version of this file under the terms of the MPL, indicate your
+40132:  * decision by deleting the provisions above and replace them with the notice
+40132:  * and other provisions required by the GPL or the LGPL. If you do not delete
+40132:  * the provisions above, a recipient may use your version of this file under
+40132:  * the terms of any one of the MPL, the GPL or the LGPL.
+40132:  *
+40132:  * ***** END LICENSE BLOCK ***** */
+41387: /*
+73703: Each video element for a media file has two threads:
+41387: 
+41387:   1) The Audio thread writes the decoded audio data to the audio
+73703:      hardware. This is done in a separate thread to ensure that the
+41387:      audio hardware gets a constant stream of data without
+41387:      interruption due to decoding or display. At some point
+41387:      libsydneyaudio will be refactored to have a callback interface
+41387:      where it asks for data and an extra thread will no longer be
+41387:      needed.
+41387: 
+41387:   2) The decode thread. This thread reads from the media stream and
+73703:      decodes the Theora and Vorbis data. It places the decoded data into
+73703:      queues for the other threads to pull from.
+41387: 
+73703: All file reads, seeks, and all decoding must occur on the decode thread.
+73703: Synchronisation of state between the thread is done via a monitor owned
+73703: by nsBuiltinDecoder.
+41387: 
+73703: The lifetime of the decode and audio threads is controlled by the state
+73703: machine when it runs on the shared state machine thread. When playback
+73703: needs to occur they are created and events dispatched to them to run
+73703: them. These events exit when decoding/audio playback is completed or
+73703: no longer required.
+41387: 
+73703: A/V synchronisation is handled by the state machine. It examines the audio
+73703: playback time and compares this to the next frame in the queue of video
+73703: frames. If it is time to play the video frame it is then displayed, otherwise
+73703: it schedules the state machine to run again at the time of the next frame.
+41387: 
+41387: Frame skipping is done in the following ways:
+41387: 
+73703:   1) The state machine will skip all frames in the video queue whose
+41387:      display time is less than the current audio time. This ensures
+41387:      the correct frame for the current time is always displayed.
+41387: 
+41387:   2) The decode thread will stop decoding interframes and read to the
+41387:      next keyframe if it determines that decoding the remaining
+41387:      interframes will cause playback issues. It detects this by:
+41387:        a) If the amount of audio data in the audio queue drops
+41387:           below a threshold whereby audio may start to skip.
+41387:        b) If the video queue drops below a threshold where it
+41387:           will be decoding video data that won't be displayed due
+41387:           to the decode thread dropping the frame immediately.
+41387: 
+73703: When hardware accelerated graphics is not available, YCbCr conversion
+73703: is done on the decode thread when video frames are decoded.
+41387: 
+41387: The decode thread pushes decoded audio and videos frames into two
+41387: separate queues - one for audio and one for video. These are kept
+76757: separate to make it easy to constantly feed audio data to the audio
+41387: hardware while allowing frame skipping of video data. These queues are
+73703: threadsafe, and neither the decode, audio, or state machine should
+41387: be able to monopolize them, and cause starvation of the other threads.
+41387: 
+41387: Both queues are bounded by a maximum size. When this size is reached
+41387: the decode thread will no longer decode video or audio depending on the
+73703: queue that has reached the threshold. If both queues are full, the decode
+73703: thread will wait on the decoder monitor.
+73703: 
+73703: When the decode queues are full (they've reaced their maximum size) and
+73703: the decoder is not in PLAYING play state, the state machine may opt
+73703: to shut down the decode thread in order to conserve resources.
+41387: 
+41387: During playback the audio thread will be idle (via a Wait() on the
+73703: monitor) if the audio queue is empty. Otherwise it constantly pops
+76757: audio data off the queue and plays it with a blocking write to the audio
+41387: hardware (via nsAudioStream and libsydneyaudio).
+41387: 
+41387: */
+41954: #if !defined(nsBuiltinDecoderStateMachine_h__)
+41954: #define nsBuiltinDecoderStateMachine_h__
+40132: 
+40132: #include "prmem.h"
+40132: #include "nsThreadUtils.h"
+41387: #include "nsBuiltinDecoder.h"
+41954: #include "nsBuiltinDecoderReader.h"
+51477: #include "nsAudioAvailableEventManager.h"
+40132: #include "nsHTMLMediaElement.h"
+69142: #include "mozilla/ReentrantMonitor.h"
+73700: #include "nsITimer.h"
+40132: 
+40132: /*
+73703:   The state machine class. This manages the decoding and seeking in the
+73703:   nsBuiltinDecoderReader on the decode thread, and A/V sync on the shared
+40132:   state machine thread, and controls the audio "push" thread.
+40132: 
+73703:   All internal state is synchronised via the decoder monitor. State changes
+73703:   are either propagated by NotifyAll on the monitor (typically when state
+73703:   changes need to be propagated to non-state machine threads) or by scheduling
+73703:   the state machine to run another cycle on the shared state machine thread.
+40132: 
+41954:   See nsBuiltinDecoder.h for more details.
+40132: */
+41954: class nsBuiltinDecoderStateMachine : public nsDecoderStateMachine
+40132: {
+40132: public:
+69142:   typedef mozilla::ReentrantMonitor ReentrantMonitor;
+41954:   typedef mozilla::TimeStamp TimeStamp;
+41954:   typedef mozilla::TimeDuration TimeDuration;
+40132: 
+79445:   nsBuiltinDecoderStateMachine(nsBuiltinDecoder* aDecoder, nsBuiltinDecoderReader* aReader, bool aRealTime = false);
+41954:   ~nsBuiltinDecoderStateMachine();
+40132: 
+41387:   // nsDecoderStateMachine interface
+54993:   virtual nsresult Init(nsDecoderStateMachine* aCloneDonor);
+41954:   State GetState()
+41954:   { 
+69142:     mDecoder->GetReentrantMonitor().AssertCurrentThreadIn();
+41954:     return mState; 
+41954:   }
+60727:   virtual void SetVolume(double aVolume);
+41387:   virtual void Shutdown();
+41387:   virtual PRInt64 GetDuration();
+41387:   virtual void SetDuration(PRInt64 aDuration);
+69475:   void SetEndTime(PRInt64 aEndTime);
+79445:   virtual bool OnDecodeThread() const {
+41387:     return IsCurrentThread(mDecodeThread);
+41387:   }
+40132: 
+41387:   virtual nsHTMLMediaElement::NextFrameStatus GetNextFrameStatus();
+63623:   virtual void Play();
+60727:   virtual void Seek(double aTime);
+63622:   virtual double GetCurrentTime() const;
+41387:   virtual void ClearPositionChangeFlag();
+79445:   virtual void SetSeekable(bool aSeekable);
+41954:   virtual void UpdatePlaybackPosition(PRInt64 aTime);
+48104:   virtual void StartBuffering();
+41954: 
+73701:   // State machine thread run function. Defers to RunStateMachine().
+40132:   NS_IMETHOD Run();
+40132: 
+40132:   // This is called on the state machine thread and audio thread.
+40132:   // The decoder monitor must be obtained before calling this.
+79445:   bool HasAudio() const {
+69142:     mDecoder->GetReentrantMonitor().AssertCurrentThreadIn();
+63857:     return mInfo.mHasAudio;
+40132:   }
+40132: 
+40132:   // This is called on the state machine thread and audio thread.
+40132:   // The decoder monitor must be obtained before calling this.
+79445:   bool HasVideo() const {
+69142:     mDecoder->GetReentrantMonitor().AssertCurrentThreadIn();
+63857:     return mInfo.mHasVideo;
+40132:   }
+40132: 
+40132:   // Should be called by main thread.
+79445:   bool HaveNextFrameData() const;
+40132: 
+40132:   // Must be called with the decode monitor held.
+79445:   bool IsBuffering() const {
+69142:     mDecoder->GetReentrantMonitor().AssertCurrentThreadIn();
+40132: 
+41954:     return mState == nsBuiltinDecoderStateMachine::DECODER_STATE_BUFFERING;
+40132:   }
+40132: 
+40132:   // Must be called with the decode monitor held.
+79445:   bool IsSeeking() const {
+69142:     mDecoder->GetReentrantMonitor().AssertCurrentThreadIn();
+40132: 
+41954:     return mState == nsBuiltinDecoderStateMachine::DECODER_STATE_SEEKING;
+40132:   }
+40132: 
+40132:   // Functions used by assertions to ensure we're calling things
+40132:   // on the appropriate threads.
+79445:   bool OnAudioThread() const {
+41387:     return IsCurrentThread(mAudioThread);
+40132:   }
+40132: 
+81895:   bool OnStateMachineThread() const {
+81895:     return IsCurrentThread(GetStateMachineThread());
+81895:   }
+40132:  
+63627:   nsresult GetBuffered(nsTimeRanges* aBuffered);
+48902: 
+74548:   PRInt64 VideoQueueMemoryInUse() {
+74548:     if (mReader) {
+74548:       return mReader->VideoQueueMemoryInUse();
+74548:     }
+74548:     return 0;
+74548:   }
+74548: 
+74548:   PRInt64 AudioQueueMemoryInUse() {
+74548:     if (mReader) {
+74548:       return mReader->AudioQueueMemoryInUse();
+74548:     }
+74548:     return 0;
+74548:   }
+74548: 
+53765:   void NotifyDataArrived(const char* aBuffer, PRUint32 aLength, PRUint32 aOffset) {
+53765:     NS_ASSERTION(NS_IsMainThread(), "Only call on main thread");
+53765:     mReader->NotifyDataArrived(aBuffer, aLength, aOffset);
+53765:   }
+53765: 
+54994:   PRInt64 GetEndMediaTime() const {
+69142:     mDecoder->GetReentrantMonitor().AssertCurrentThreadIn();
+54994:     return mEndTime;
+54994:   }
+54994: 
+79445:   bool IsSeekable() {
+69475:     mDecoder->GetReentrantMonitor().AssertCurrentThreadIn();
+69475:     return mSeekable;
+69475:   }
+69475: 
+67873:   // Sets the current frame buffer length for the MozAudioAvailable event.
+67873:   // Accessed on the main and state machine threads.
+67873:   virtual void SetFrameBufferLength(PRUint32 aLength);
+67873: 
+73701:   // Returns the shared state machine thread.
+73701:   static nsIThread* GetStateMachineThread();
+73701: 
+73701:   // Schedules the shared state machine thread to run the state machine.
+73701:   // If the state machine thread is the currently running the state machine,
+73701:   // we wait until that has completely finished before running the state
+73701:   // machine again.
+73700:   nsresult ScheduleStateMachine();
+73700: 
+73701:   // Schedules the shared state machine thread to run the state machine
+73700:   // in aUsecs microseconds from now, if it's not already scheduled to run
+73700:   // earlier, in which case the request is discarded.
+73700:   nsresult ScheduleStateMachine(PRInt64 aUsecs);
+73700: 
+73701:   // Timer function to implement ScheduleStateMachine(aUsecs).
+73701:   void TimeoutExpired();
+73701: 
+77175:   // Set the media fragment end time. aEndTime is in microseconds.
+77175:   void SetFragmentEndTime(PRInt64 aEndTime);
+77175: 
+78619:   // Drop reference to decoder.  Only called during shutdown dance.
+78619:   void ReleaseDecoder() { mDecoder = nsnull; }
+78619: 
+63621: protected:
+60724: 
+79547:   // Returns true if we've got less than aAudioUsecs microseconds of decoded
+68450:   // and playable data. The decoder monitor must be held.
+79445:   bool HasLowDecodedData(PRInt64 aAudioUsecs) const;
+40132: 
+79547:   // Returns true if we're running low on data which is not yet decoded.
+63622:   // The decoder monitor must be held.
+79445:   bool HasLowUndecodedData() const;
+63622: 
+68450:   // Returns the number of microseconds of undecoded data available for
+63622:   // decoding. The decoder monitor must be held.
+63622:   PRInt64 GetUndecodedData() const;
+58312: 
+68450:   // Returns the number of unplayed usecs of audio we've got decoded and/or
+53827:   // pushed to the hardware waiting to play. This is how much audio we can
+63622:   // play without having to run the audio decoder. The decoder monitor
+63622:   // must be held.
+68450:   PRInt64 AudioDecodedUsecs() const;
+53827: 
+79547:   // Returns true when there's decoded audio waiting to play.
+42254:   // The decoder monitor must be held.
+79445:   bool HasFutureAudio() const;
+42254: 
+79547:   // Returns true if we recently exited "quick buffering" mode.
+79445:   bool JustExitedQuickBuffering();
+63623: 
+69142:   // Waits on the decoder ReentrantMonitor for aUsecs microseconds. If the decoder
+68450:   // monitor is awoken by a Notify() call, we'll continue waiting, unless
+68450:   // we've moved into shutdown state. This enables us to ensure that we
+69731:   // wait for a specified time, and that the myriad of Notify()s we do on
+69731:   // the decoder monitor don't cause the audio thread to be starved. aUsecs
+69731:   // values of less than 1 millisecond are rounded up to 1 millisecond
+73703:   // (see bug 651023). The decoder monitor must be held. Called only on the
+73703:   // audio thread.
+68450:   void Wait(PRInt64 aUsecs);
+40132: 
+40132:   // Dispatches an asynchronous event to update the media element's ready state.
+40132:   void UpdateReadyState();
+40132: 
+73697:   // Resets playback timing data. Called when we seek, on the decode thread.
+40132:   void ResetPlayback();
+40132: 
+40132:   // Returns the audio clock, if we have audio, or -1 if we don't.
+40132:   // Called on the state machine thread.
+40132:   PRInt64 GetAudioClock();
+40132: 
+79385:   // Returns the presentation time of the first audio or video frame in the
+79385:   // media.  If the media has video, it returns the first video frame. The
+79385:   // decoder monitor must be held with exactly one lock count. Called on the
+79385:   // state machine thread.
+40132:   VideoData* FindStartTime();
+40132: 
+61823:   // Update only the state machine's current playback position (and duration,
+61823:   // if unknown).  Does not update the playback position on the decoder or
+61823:   // media element -- use UpdatePlaybackPosition for that.  Called on the state
+61823:   // machine thread, caller must hold the decoder lock.
+61823:   void UpdatePlaybackPositionInternal(PRInt64 aTime);
+61823: 
+73703:   // Pushes the image down the rendering pipeline. Called on the shared state
+73703:   // machine thread. The decoder monitor must *not* be held when calling this.
+72348:   void RenderVideoFrame(VideoData* aData, TimeStamp aTarget);
+40132:  
+40132:   // If we have video, display a video frame if it's time for display has
+79385:   // arrived, otherwise sleep until it's time for the next frame. Update the
+79385:   // current frame time as appropriate, and trigger ready state update.  The
+79385:   // decoder monitor must be held with exactly one lock count. Called on the
+79385:   // state machine thread.
+40132:   void AdvanceFrame();
+40132: 
+79385:   // Write aFrames of audio frames of silence to the audio hardware. Returns
+79385:   // the number of frames actually written. The write size is capped at
+79385:   // SILENCE_BYTES_CHUNK (32kB), so must be called in a loop to write the
+79385:   // desired number of frames. This ensures that the playback position
+79385:   // advances smoothly, and guarantees that we don't try to allocate an
+79385:   // impossibly large chunk of memory in order to play back silence. Called
+79385:   // on the audio thread.
+79385:   PRUint32 PlaySilence(PRUint32 aFrames,
+68450:                        PRUint32 aChannels,
+79385:                        PRUint64 aFrameOffset);
+50359: 
+50359:   // Pops an audio chunk from the front of the audio queue, and pushes its
+79385:   // audio data to the audio hardware. MozAudioAvailable data is also queued
+79385:   // here. Called on the audio thread.
+79385:   PRUint32 PlayFromAudioQueue(PRUint64 aFrameOffset, PRUint32 aChannels);
+50359: 
+73695:   // Stops the decode thread. The decoder monitor must be held with exactly
+40132:   // one lock count. Called on the state machine thread.
+73695:   void StopDecodeThread();
+40132: 
+73695:   // Stops the audio thread. The decoder monitor must be held with exactly
+40132:   // one lock count. Called on the state machine thread.
+73695:   void StopAudioThread();
+73695: 
+73695:   // Starts the decode thread. The decoder monitor must be held with exactly
+73695:   // one lock count. Called on the state machine thread.
+73695:   nsresult StartDecodeThread();
+73695: 
+73695:   // Starts the audio thread. The decoder monitor must be held with exactly
+73695:   // one lock count. Called on the state machine thread.
+73695:   nsresult StartAudioThread();
+40132: 
+40132:   // The main loop for the audio thread. Sent to the thread as
+41361:   // an nsRunnableMethod. This continually does blocking writes to
+40132:   // to audio stream to play audio data.
+40132:   void AudioLoop();
+40132: 
+73699:   // Sets internal state which causes playback of media to pause.
+73699:   // The decoder monitor must be held. Called on the main, state machine,
+73699:   // and decode threads.
+73699:   void StopPlayback();
+40132: 
+73699:   // Sets internal state which causes playback of media to begin or resume.
+73699:   // Must be called with the decode monitor held. Called on the state machine
+73699:   // and decode threads.
+40132:   void StartPlayback();
+40132: 
+63623:   // Moves the decoder into decoding state. Called on the state machine
+63623:   // thread. The decoder monitor must be held.
+63623:   void StartDecoding();
+63623: 
+79547:   // Returns true if we're currently playing. The decoder monitor must
+40132:   // be held.
+79445:   bool IsPlaying();
+40132: 
+53826:   // Returns the "media time". This is the absolute time which the media
+53826:   // playback has reached. i.e. this returns values in the range
+53826:   // [mStartTime, mEndTime], and mStartTime will not be 0 if the media does
+53826:   // not start at 0. Note this is different to the value returned
+53826:   // by GetCurrentTime(), which is in the range [0,duration].
+53826:   PRInt64 GetMediaTime() const {
+69142:     mDecoder->GetReentrantMonitor().AssertCurrentThreadIn();
+53826:     return mStartTime + mCurrentFrameTime;
+53826:   }
+53826: 
+68450:   // Returns an upper bound on the number of microseconds of audio that is
+68450:   // decoded and playable. This is the sum of the number of usecs of audio which
+68450:   // is decoded and in the reader's audio queue, and the usecs of unplayed audio
+60416:   // which has been pushed to the audio hardware for playback. Note that after
+60416:   // calling this, the audio hardware may play some of the audio pushed to
+60416:   // hardware, so this can only be used as a upper bound. The decoder monitor
+73703:   // must be held when calling this. Called on the decode thread.
+60416:   PRInt64 GetDecodedAudioDuration();
+60416: 
+73696:   // Load metadata. Called on the decode thread. The decoder monitor
+73696:   // must be held with exactly one lock count.
+73696:   nsresult DecodeMetadata();
+73696: 
+73697:   // Seeks to mSeekTarget. Called on the decode thread. The decoder monitor
+73697:   // must be held with exactly one lock count.
+73697:   void DecodeSeek();
+73697: 
+73697:   // Decode loop, decodes data until EOF or shutdown.
+73697:   // Called on the decode thread.
+73697:   void DecodeLoop();
+73697: 
+73697:   // Decode thread run function. Determines which of the Decode*() functions
+73697:   // to call.
+73697:   void DecodeThreadRun();
+73697: 
+73701:   // State machine thread run function. Defers to RunStateMachine().
+73701:   nsresult CallRunStateMachine();
+73701: 
+73701:   // Performs one "cycle" of the state machine. Polls the state, and may send
+73701:   // a video frame to be displayed, and generally manages the decode. Called
+73701:   // periodically via timer to ensure the video stays in sync.
+73701:   nsresult RunStateMachine();
+73701: 
+79445:   bool IsStateMachineScheduled() const {
+73701:     mDecoder->GetReentrantMonitor().AssertCurrentThreadIn();
+73701:     return !mTimeout.IsNull() || mRunAgain;
+73700:   }
+73700: 
+79547:   // Returns true if we're not playing and the decode thread has filled its
+73702:   // decode buffers and is waiting. We can shut the decode thread down in this
+73702:   // case as it may not be needed again.
+79445:   bool IsPausedAndDecoderWaiting();
+73702: 
+78619:   // The decoder object that created this state machine. The state machine
+78619:   // holds a strong reference to the decoder to ensure that the decoder stays
+78619:   // alive once media element has started the decoder shutdown process, and has
+78619:   // dropped its reference to the decoder. This enables the state machine to
+78619:   // keep using the decoder's monitor until the state machine has finished
+78619:   // shutting down, without fear of the monitor being destroyed. After
+78619:   // shutting down, the state machine will then release this reference,
+78619:   // causing the decoder to be destroyed. This is accessed on the decode,
+78619:   // state machine, audio and main threads.
+78619:   nsRefPtr<nsBuiltinDecoder> mDecoder;
+78619: 
+78619:   // The decoder monitor must be obtained before modifying this state.
+78619:   // NotifyAll on the monitor must be called when the state is changed so
+78619:   // that interested threads can wake up and alter behaviour if appropriate
+78619:   // Accessed on state machine, audio, main, and AV thread.
+78619:   State mState;
+78619: 
+40132:   // The size of the decoded YCbCr frame.
+40132:   // Accessed on state machine thread.
+40132:   PRUint32 mCbCrSize;
+40132: 
+40132:   // Accessed on state machine thread.
+40132:   nsAutoArrayPtr<unsigned char> mCbCrBuffer;
+40132: 
+40132:   // Thread for pushing audio onto the audio hardware.
+40132:   // The "audio push thread".
+40132:   nsCOMPtr<nsIThread> mAudioThread;
+40132: 
+40132:   // Thread for decoding video in background. The "decode thread".
+40132:   nsCOMPtr<nsIThread> mDecodeThread;
+40132: 
+73700:   // Timer to call the state machine Run() method. Used by
+73700:   // ScheduleStateMachine(). Access protected by decoder monitor.
+73700:   nsCOMPtr<nsITimer> mTimer;
+73700: 
+73700:   // Timestamp at which the next state machine Run() method will be called.
+73700:   // If this is non-null, a call to Run() is scheduled, either by a timer,
+73700:   // or via an event. Access protected by decoder monitor.
+73700:   TimeStamp mTimeout;
+73700: 
+62888:   // The time that playback started from the system clock. This is used for
+62888:   // timing the presentation of video frames when there's no audio.
+40132:   // Accessed only via the state machine thread.
+40132:   TimeStamp mPlayStartTime;
+40132: 
+40132:   // The amount of time we've spent playing already the media. The current
+62888:   // playback position is therefore |Now() - mPlayStartTime +
+62888:   // mPlayDuration|, which must be adjusted by mStartTime if used with media
+62888:   // timestamps.  Accessed only via the state machine thread.
+68450:   PRInt64 mPlayDuration;
+40132: 
+40132:   // Time that buffering started. Used for buffering timeout and only
+60723:   // accessed on the state machine thread. This is null while we're not
+60723:   // buffering.
+40132:   TimeStamp mBufferingStart;
+40132: 
+68450:   // Start time of the media, in microseconds. This is the presentation
+79385:   // time of the first frame decoded from the media, and is used to calculate
+73703:   // duration and as a bounds for seeking. Accessed on state machine, decode,
+73703:   // and main threads. Access controlled by decoder monitor.
+40132:   PRInt64 mStartTime;
+40132: 
+79385:   // Time of the last frame in the media, in microseconds. This is the
+79385:   // end time of the last frame in the media. Accessed on state
+73703:   // machine, decode, and main threads. Access controlled by decoder monitor.
+40132:   PRInt64 mEndTime;
+40132: 
+68450:   // Position to seek to in microseconds when the seek state transition occurs.
+40132:   // The decoder monitor lock must be obtained before reading or writing
+73703:   // this value. Accessed on main and decode thread.
+40132:   PRInt64 mSeekTime;
+40132: 
+77175:   // Media Fragment end time in microseconds. Access controlled by decoder monitor.
+77175:   PRInt64 mFragmentEndTime;
+77175: 
+73699:   // The audio stream resource. Used on the state machine, and audio threads.
+73699:   // This is created and destroyed on the audio thread, while holding the
+73699:   // decoder monitor, so if this is used off the audio thread, you must
+73699:   // first acquire the decoder monitor and check that it is non-null.
+57627:   nsRefPtr<nsAudioStream> mAudioStream;
+40132: 
+41954:   // The reader, don't call its methods with the decoder monitor held.
+41954:   // This is created in the play state machine's constructor, and destroyed
+41954:   // in the play state machine's destructor.
+41954:   nsAutoPtr<nsBuiltinDecoderReader> mReader;
+41954: 
+68450:   // The time of the current frame in microseconds. This is referenced from
+40132:   // 0 which is the initial playback position. Set by the state machine
+40132:   // thread, and read-only from the main thread to get the current
+40132:   // time value. Synchronised via decoder monitor.
+40132:   PRInt64 mCurrentFrameTime;
+40132: 
+79385:   // The presentation time of the first audio frame that was played in
+68450:   // microseconds. We can add this to the audio stream position to determine
+68450:   // the current audio time. Accessed on audio and state machine thread.
+68450:   // Synchronized by decoder monitor.
+40132:   PRInt64 mAudioStartTime;
+40132: 
+79385:   // The end time of the last audio frame that's been pushed onto the audio
+68450:   // hardware in microseconds. This will approximately be the end time of the
+79385:   // audio stream, unless another frame is pushed to the hardware.
+40132:   PRInt64 mAudioEndTime;
+40132: 
+68450:   // The presentation end time of the last video frame which has been displayed
+68450:   // in microseconds. Accessed from the state machine thread.
+43445:   PRInt64 mVideoFrameEndTime;
+40132:   
+40132:   // Volume of playback. 0.0 = muted. 1.0 = full volume. Read/Written
+40132:   // from the state machine and main threads. Synchronised via decoder
+40132:   // monitor.
+60727:   double mVolume;
+40132: 
+63623:   // Time at which we started decoding. Synchronised via decoder monitor.
+63623:   TimeStamp mDecodeStartTime;
+63623: 
+79547:   // True if the media resource can be seeked. Accessed from the state
+40132:   // machine and main threads. Synchronised via decoder monitor.
+79445:   bool mSeekable;
+40132: 
+79547:   // True if an event to notify about a change in the playback
+79547:   // position has been queued, but not yet run. It is set to false when
+40132:   // the event is run. This allows coalescing of these events as they can be
+40132:   // produced many times per second. Synchronised via decoder monitor.
+40132:   // Accessed on main and state machine threads.
+79445:   bool mPositionChangeQueued;
+40132: 
+79547:   // True if the audio playback thread has finished. It is finished
+79385:   // when either all the audio frames in the Vorbis bitstream have completed
+40132:   // playing, or we've moved into shutdown state, and the threads are to be
+40132:   // destroyed. Written by the audio playback thread and read and written by
+40132:   // the state machine thread. Synchronised via decoder monitor.
+79445:   bool mAudioCompleted;
+40132: 
+79547:   // True if mDuration has a value obtained from an HTTP header, or from
+54994:   // the media index/metadata. Accessed on the state machine thread.
+79445:   bool mGotDurationFromMetaData;
+40132:     
+79547:   // False while decode thread should be running. Accessed state machine
+73695:   // and decode threads. Syncrhonised by decoder monitor.
+79445:   bool mStopDecodeThread;
+73695: 
+79547:   // True when the decode thread run function has finished, but the thread
+73697:   // has not necessarily been shut down yet. This can happen if we switch
+73697:   // from COMPLETED state to SEEKING before the state machine has a chance
+73697:   // to run in the COMPLETED state and shutdown the decode thread.
+73697:   // Synchronised by the decoder monitor.
+79445:   bool mDecodeThreadIdle;
+73697: 
+79547:   // False while audio thread should be running. Accessed state machine
+73695:   // and audio threads. Syncrhonised by decoder monitor.
+79445:   bool mStopAudioThread;
+51477: 
+79547:   // If this is true while we're in buffering mode, we can exit early,
+63623:   // as it's likely we may be able to playback. This happens when we enter
+63623:   // buffering mode soon after the decode starts, because the decode-ahead
+63623:   // ran fast enough to exhaust all data while the download is starting up.
+63623:   // Synchronised via decoder monitor.
+79445:   bool mQuickBuffering;
+63623: 
+79547:   // True if the shared state machine thread is currently running this
+73701:   // state machine.
+79445:   bool mIsRunning;
+73701: 
+79547:   // True if we should run the state machine again once the current
+73701:   // state machine run has finished.
+79445:   bool mRunAgain;
+73701: 
+79547:   // True if we've dispatched an event to run the state machine. It's
+73701:   // imperative that we don't dispatch multiple events to run the state
+73701:   // machine at the same time, as our code assume all events are synchronous.
+73701:   // If we dispatch multiple events, the second event can run while the
+73701:   // first is shutting down a thread, causing inconsistent state.
+79445:   bool mDispatchedRunEvent;
+73701: 
+79547:   // True if the decode thread has gone filled its buffers and is now
+73702:   // waiting to be awakened before it continues decoding. Synchronized
+73702:   // by the decoder monitor.
+79445:   bool mDecodeThreadWaiting;
+73702: 
+79547:   // True is we are decoding a realtime stream, like a camera stream
+79445:   bool mRealTime;
+78958:   
+78958:   PRUint32 mBufferingWait;
+78958:   PRInt64  mLowDataThresholdUsecs;
+78958: 
+51477: private:
+51477:   // Manager for queuing and dispatching MozAudioAvailable events.  The
+51477:   // event manager is accessed from the state machine and audio threads,
+51477:   // and takes care of synchronizing access to its internal queue.
+51477:   nsAudioAvailableEventManager mEventManager;
+63857: 
+63857:   // Stores presentation info required for playback. The decoder monitor
+63857:   // must be held when accessing this.
+63857:   nsVideoInfo mInfo;
+40132: };
+40132: 
+40132: #endif

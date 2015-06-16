@@ -1,0 +1,375 @@
+16295: /********************************************************************
+16295:  *                                                                  *
+16295:  * THIS FILE IS PART OF THE OggVorbis SOFTWARE CODEC SOURCE CODE.   *
+16295:  * USE, DISTRIBUTION AND REPRODUCTION OF THIS LIBRARY SOURCE IS     *
+16295:  * GOVERNED BY A BSD-STYLE SOURCE LICENSE INCLUDED WITH THIS SOURCE *
+16295:  * IN 'COPYING'. PLEASE READ THESE TERMS BEFORE DISTRIBUTING.       *
+16295:  *                                                                  *
+31034:  * THE OggVorbis SOURCE CODE IS (C) COPYRIGHT 1994-2009             *
+16295:  * by the Xiph.Org Foundation http://www.xiph.org/                  *
+16295:  *                                                                  *
+16295:  ********************************************************************
+16295: 
+16295:  function: PCM data envelope analysis
+31034:  last mod: $Id: envelope.c 16227 2009-07-08 06:58:46Z xiphmont $
+16295: 
+16295:  ********************************************************************/
+16295: 
+16295: #include <stdlib.h>
+16295: #include <string.h>
+16295: #include <stdio.h>
+16295: #include <math.h>
+16295: #include <ogg/ogg.h>
+16295: #include "vorbis/codec.h"
+16295: #include "codec_internal.h"
+16295: 
+16295: #include "os.h"
+16295: #include "scales.h"
+16295: #include "envelope.h"
+16295: #include "mdct.h"
+16295: #include "misc.h"
+16295: 
+16295: void _ve_envelope_init(envelope_lookup *e,vorbis_info *vi){
+16295:   codec_setup_info *ci=vi->codec_setup;
+16295:   vorbis_info_psy_global *gi=&ci->psy_g_param;
+16295:   int ch=vi->channels;
+16295:   int i,j;
+16295:   int n=e->winlength=128;
+16295:   e->searchstep=64; /* not random */
+16295: 
+16295:   e->minenergy=gi->preecho_minenergy;
+16295:   e->ch=ch;
+16295:   e->storage=128;
+16295:   e->cursor=ci->blocksizes[1]/2;
+16295:   e->mdct_win=_ogg_calloc(n,sizeof(*e->mdct_win));
+16295:   mdct_init(&e->mdct,n);
+16295: 
+16295:   for(i=0;i<n;i++){
+16295:     e->mdct_win[i]=sin(i/(n-1.)*M_PI);
+16295:     e->mdct_win[i]*=e->mdct_win[i];
+16295:   }
+16295: 
+16295:   /* magic follows */
+16295:   e->band[0].begin=2;  e->band[0].end=4;
+16295:   e->band[1].begin=4;  e->band[1].end=5;
+16295:   e->band[2].begin=6;  e->band[2].end=6;
+16295:   e->band[3].begin=9;  e->band[3].end=8;
+16295:   e->band[4].begin=13;  e->band[4].end=8;
+16295:   e->band[5].begin=17;  e->band[5].end=8;
+16295:   e->band[6].begin=22;  e->band[6].end=8;
+16295: 
+16295:   for(j=0;j<VE_BANDS;j++){
+16295:     n=e->band[j].end;
+16295:     e->band[j].window=_ogg_malloc(n*sizeof(*e->band[0].window));
+16295:     for(i=0;i<n;i++){
+16295:       e->band[j].window[i]=sin((i+.5)/n*M_PI);
+16295:       e->band[j].total+=e->band[j].window[i];
+16295:     }
+16295:     e->band[j].total=1./e->band[j].total;
+16295:   }
+16295: 
+16295:   e->filter=_ogg_calloc(VE_BANDS*ch,sizeof(*e->filter));
+16295:   e->mark=_ogg_calloc(e->storage,sizeof(*e->mark));
+16295: 
+16295: }
+16295: 
+16295: void _ve_envelope_clear(envelope_lookup *e){
+16295:   int i;
+16295:   mdct_clear(&e->mdct);
+16295:   for(i=0;i<VE_BANDS;i++)
+16295:     _ogg_free(e->band[i].window);
+16295:   _ogg_free(e->mdct_win);
+16295:   _ogg_free(e->filter);
+16295:   _ogg_free(e->mark);
+16295:   memset(e,0,sizeof(*e));
+16295: }
+16295: 
+16295: /* fairly straight threshhold-by-band based until we find something
+16295:    that works better and isn't patented. */
+16295: 
+16295: static int _ve_amp(envelope_lookup *ve,
+16295:                    vorbis_info_psy_global *gi,
+16295:                    float *data,
+16295:                    envelope_band *bands,
+30043:                    envelope_filter_state *filters){
+16295:   long n=ve->winlength;
+16295:   int ret=0;
+16295:   long i,j;
+16295:   float decay;
+16295: 
+16295:   /* we want to have a 'minimum bar' for energy, else we're just
+16295:      basing blocks on quantization noise that outweighs the signal
+16295:      itself (for low power signals) */
+16295: 
+16295:   float minV=ve->minenergy;
+16295:   float *vec=alloca(n*sizeof(*vec));
+16295: 
+16295:   /* stretch is used to gradually lengthen the number of windows
+16295:      considered prevoius-to-potential-trigger */
+16295:   int stretch=max(VE_MINSTRETCH,ve->stretch/2);
+16295:   float penalty=gi->stretch_penalty-(ve->stretch/2-VE_MINSTRETCH);
+16295:   if(penalty<0.f)penalty=0.f;
+16295:   if(penalty>gi->stretch_penalty)penalty=gi->stretch_penalty;
+16295: 
+16295:   /*_analysis_output_always("lpcm",seq2,data,n,0,0,
+16295:     totalshift+pos*ve->searchstep);*/
+16295: 
+16295:  /* window and transform */
+16295:   for(i=0;i<n;i++)
+16295:     vec[i]=data[i]*ve->mdct_win[i];
+16295:   mdct_forward(&ve->mdct,vec,vec);
+16295: 
+16295:   /*_analysis_output_always("mdct",seq2,vec,n/2,0,1,0); */
+16295: 
+16295:   /* near-DC spreading function; this has nothing to do with
+16295:      psychoacoustics, just sidelobe leakage and window size */
+16295:   {
+16295:     float temp=vec[0]*vec[0]+.7*vec[1]*vec[1]+.2*vec[2]*vec[2];
+16295:     int ptr=filters->nearptr;
+16295: 
+16295:     /* the accumulation is regularly refreshed from scratch to avoid
+16295:        floating point creep */
+16295:     if(ptr==0){
+16295:       decay=filters->nearDC_acc=filters->nearDC_partialacc+temp;
+16295:       filters->nearDC_partialacc=temp;
+16295:     }else{
+16295:       decay=filters->nearDC_acc+=temp;
+16295:       filters->nearDC_partialacc+=temp;
+16295:     }
+16295:     filters->nearDC_acc-=filters->nearDC[ptr];
+16295:     filters->nearDC[ptr]=temp;
+16295: 
+16295:     decay*=(1./(VE_NEARDC+1));
+16295:     filters->nearptr++;
+16295:     if(filters->nearptr>=VE_NEARDC)filters->nearptr=0;
+16295:     decay=todB(&decay)*.5-15.f;
+16295:   }
+16295: 
+16295:   /* perform spreading and limiting, also smooth the spectrum.  yes,
+16295:      the MDCT results in all real coefficients, but it still *behaves*
+16295:      like real/imaginary pairs */
+16295:   for(i=0;i<n/2;i+=2){
+16295:     float val=vec[i]*vec[i]+vec[i+1]*vec[i+1];
+16295:     val=todB(&val)*.5f;
+16295:     if(val<decay)val=decay;
+16295:     if(val<minV)val=minV;
+16295:     vec[i>>1]=val;
+16295:     decay-=8.;
+16295:   }
+16295: 
+16295:   /*_analysis_output_always("spread",seq2++,vec,n/4,0,0,0);*/
+16295: 
+16295:   /* perform preecho/postecho triggering by band */
+16295:   for(j=0;j<VE_BANDS;j++){
+16295:     float acc=0.;
+16295:     float valmax,valmin;
+16295: 
+16295:     /* accumulate amplitude */
+16295:     for(i=0;i<bands[j].end;i++)
+16295:       acc+=vec[i+bands[j].begin]*bands[j].window[i];
+16295: 
+16295:     acc*=bands[j].total;
+16295: 
+16295:     /* convert amplitude to delta */
+16295:     {
+16295:       int p,this=filters[j].ampptr;
+16295:       float postmax,postmin,premax=-99999.f,premin=99999.f;
+16295: 
+16295:       p=this;
+16295:       p--;
+16295:       if(p<0)p+=VE_AMP;
+16295:       postmax=max(acc,filters[j].ampbuf[p]);
+16295:       postmin=min(acc,filters[j].ampbuf[p]);
+16295: 
+16295:       for(i=0;i<stretch;i++){
+16295:         p--;
+16295:         if(p<0)p+=VE_AMP;
+16295:         premax=max(premax,filters[j].ampbuf[p]);
+16295:         premin=min(premin,filters[j].ampbuf[p]);
+16295:       }
+16295: 
+16295:       valmin=postmin-premin;
+16295:       valmax=postmax-premax;
+16295: 
+16295:       /*filters[j].markers[pos]=valmax;*/
+16295:       filters[j].ampbuf[this]=acc;
+16295:       filters[j].ampptr++;
+16295:       if(filters[j].ampptr>=VE_AMP)filters[j].ampptr=0;
+16295:     }
+16295: 
+16295:     /* look at min/max, decide trigger */
+16295:     if(valmax>gi->preecho_thresh[j]+penalty){
+16295:       ret|=1;
+16295:       ret|=4;
+16295:     }
+16295:     if(valmin<gi->postecho_thresh[j]-penalty)ret|=2;
+16295:   }
+16295: 
+16295:   return(ret);
+16295: }
+16295: 
+16295: #if 0
+16295: static int seq=0;
+16295: static ogg_int64_t totalshift=-1024;
+16295: #endif
+16295: 
+16295: long _ve_envelope_search(vorbis_dsp_state *v){
+16295:   vorbis_info *vi=v->vi;
+16295:   codec_setup_info *ci=vi->codec_setup;
+16295:   vorbis_info_psy_global *gi=&ci->psy_g_param;
+16295:   envelope_lookup *ve=((private_state *)(v->backend_state))->ve;
+16295:   long i,j;
+16295: 
+16295:   int first=ve->current/ve->searchstep;
+16295:   int last=v->pcm_current/ve->searchstep-VE_WIN;
+16295:   if(first<0)first=0;
+16295: 
+16295:   /* make sure we have enough storage to match the PCM */
+16295:   if(last+VE_WIN+VE_POST>ve->storage){
+16295:     ve->storage=last+VE_WIN+VE_POST; /* be sure */
+16295:     ve->mark=_ogg_realloc(ve->mark,ve->storage*sizeof(*ve->mark));
+16295:   }
+16295: 
+16295:   for(j=first;j<last;j++){
+16295:     int ret=0;
+16295: 
+16295:     ve->stretch++;
+16295:     if(ve->stretch>VE_MAXSTRETCH*2)
+16295:       ve->stretch=VE_MAXSTRETCH*2;
+16295: 
+16295:     for(i=0;i<ve->ch;i++){
+16295:       float *pcm=v->pcm[i]+ve->searchstep*(j);
+30043:       ret|=_ve_amp(ve,gi,pcm,ve->band,ve->filter+i*VE_BANDS);
+16295:     }
+16295: 
+16295:     ve->mark[j+VE_POST]=0;
+16295:     if(ret&1){
+16295:       ve->mark[j]=1;
+16295:       ve->mark[j+1]=1;
+16295:     }
+16295: 
+16295:     if(ret&2){
+16295:       ve->mark[j]=1;
+16295:       if(j>0)ve->mark[j-1]=1;
+16295:     }
+16295: 
+16295:     if(ret&4)ve->stretch=-1;
+16295:   }
+16295: 
+16295:   ve->current=last*ve->searchstep;
+16295: 
+16295:   {
+16295:     long centerW=v->centerW;
+16295:     long testW=
+16295:       centerW+
+16295:       ci->blocksizes[v->W]/4+
+16295:       ci->blocksizes[1]/2+
+16295:       ci->blocksizes[0]/4;
+16295: 
+16295:     j=ve->cursor;
+16295: 
+16295:     while(j<ve->current-(ve->searchstep)){/* account for postecho
+16295:                                              working back one window */
+16295:       if(j>=testW)return(1);
+16295: 
+16295:       ve->cursor=j;
+16295: 
+16295:       if(ve->mark[j/ve->searchstep]){
+16295:         if(j>centerW){
+16295: 
+16295: #if 0
+16295:           if(j>ve->curmark){
+16295:             float *marker=alloca(v->pcm_current*sizeof(*marker));
+16295:             int l,m;
+16295:             memset(marker,0,sizeof(*marker)*v->pcm_current);
+16295:             fprintf(stderr,"mark! seq=%d, cursor:%fs time:%fs\n",
+16295:                     seq,
+16295:                     (totalshift+ve->cursor)/44100.,
+16295:                     (totalshift+j)/44100.);
+16295:             _analysis_output_always("pcmL",seq,v->pcm[0],v->pcm_current,0,0,totalshift);
+16295:             _analysis_output_always("pcmR",seq,v->pcm[1],v->pcm_current,0,0,totalshift);
+16295: 
+16295:             _analysis_output_always("markL",seq,v->pcm[0],j,0,0,totalshift);
+16295:             _analysis_output_always("markR",seq,v->pcm[1],j,0,0,totalshift);
+16295: 
+16295:             for(m=0;m<VE_BANDS;m++){
+16295:               char buf[80];
+16295:               sprintf(buf,"delL%d",m);
+16295:               for(l=0;l<last;l++)marker[l*ve->searchstep]=ve->filter[m].markers[l]*.1;
+16295:               _analysis_output_always(buf,seq,marker,v->pcm_current,0,0,totalshift);
+16295:             }
+16295: 
+16295:             for(m=0;m<VE_BANDS;m++){
+16295:               char buf[80];
+16295:               sprintf(buf,"delR%d",m);
+16295:               for(l=0;l<last;l++)marker[l*ve->searchstep]=ve->filter[m+VE_BANDS].markers[l]*.1;
+16295:               _analysis_output_always(buf,seq,marker,v->pcm_current,0,0,totalshift);
+16295:             }
+16295: 
+16295:             for(l=0;l<last;l++)marker[l*ve->searchstep]=ve->mark[l]*.4;
+16295:             _analysis_output_always("mark",seq,marker,v->pcm_current,0,0,totalshift);
+16295: 
+16295: 
+16295:             seq++;
+16295: 
+16295:           }
+16295: #endif
+16295: 
+16295:           ve->curmark=j;
+16295:           if(j>=testW)return(1);
+16295:           return(0);
+16295:         }
+16295:       }
+16295:       j+=ve->searchstep;
+16295:     }
+16295:   }
+16295: 
+16295:   return(-1);
+16295: }
+16295: 
+16295: int _ve_envelope_mark(vorbis_dsp_state *v){
+16295:   envelope_lookup *ve=((private_state *)(v->backend_state))->ve;
+16295:   vorbis_info *vi=v->vi;
+16295:   codec_setup_info *ci=vi->codec_setup;
+16295:   long centerW=v->centerW;
+16295:   long beginW=centerW-ci->blocksizes[v->W]/4;
+16295:   long endW=centerW+ci->blocksizes[v->W]/4;
+16295:   if(v->W){
+16295:     beginW-=ci->blocksizes[v->lW]/4;
+16295:     endW+=ci->blocksizes[v->nW]/4;
+16295:   }else{
+16295:     beginW-=ci->blocksizes[0]/4;
+16295:     endW+=ci->blocksizes[0]/4;
+16295:   }
+16295: 
+16295:   if(ve->curmark>=beginW && ve->curmark<endW)return(1);
+16295:   {
+16295:     long first=beginW/ve->searchstep;
+16295:     long last=endW/ve->searchstep;
+16295:     long i;
+16295:     for(i=first;i<last;i++)
+16295:       if(ve->mark[i])return(1);
+16295:   }
+16295:   return(0);
+16295: }
+16295: 
+16295: void _ve_envelope_shift(envelope_lookup *e,long shift){
+16295:   int smallsize=e->current/e->searchstep+VE_POST; /* adjust for placing marks
+16295:                                                      ahead of ve->current */
+16295:   int smallshift=shift/e->searchstep;
+16295: 
+16295:   memmove(e->mark,e->mark+smallshift,(smallsize-smallshift)*sizeof(*e->mark));
+16295: 
+16295: #if 0
+16295:   for(i=0;i<VE_BANDS*e->ch;i++)
+16295:     memmove(e->filter[i].markers,
+16295:             e->filter[i].markers+smallshift,
+16295:             (1024-smallshift)*sizeof(*(*e->filter).markers));
+16295:   totalshift+=shift;
+16295: #endif
+16295: 
+16295:   e->current-=shift;
+16295:   if(e->curmark>=0)
+16295:     e->curmark-=shift;
+16295:   e->cursor-=shift;
+16295: }

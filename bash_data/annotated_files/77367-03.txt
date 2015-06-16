@@ -1,0 +1,516 @@
+53178: /* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+53178:  * vim: set ts=4 sw=4 et tw=99:
+53178:  *
+53178:  * ***** BEGIN LICENSE BLOCK *****
+53168:  * Version: MPL 1.1/GPL 2.0/LGPL 2.1
+53168:  *
+53168:  * The contents of this file are subject to the Mozilla Public License Version
+53168:  * 1.1 (the "License"); you may not use this file except in compliance with
+53168:  * the License. You may obtain a copy of the License at
+53168:  * http://www.mozilla.org/MPL/
+53168:  *
+53168:  * Software distributed under the License is distributed on an "AS IS" basis,
+53168:  * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+53168:  * for the specific language governing rights and limitations under the
+53168:  * License.
+53168:  *
+53168:  * The Original Code is Mozilla Jaegermonkey.
+53168:  *
+53168:  * The Initial Developer of the Original Code is the Mozilla Foundation.
+53168:  *
+53168:  * Portions created by the Initial Developer are Copyright (C) 2010
+53168:  * the Initial Developer. All Rights Reserved.
+53168:  *
+53168:  * Contributor(s):
+53168:  *   Andrew Drake <drakedevel@gmail.com>
+53168:  *
+53168:  * Alternatively, the contents of this file may be used under the terms of
+53168:  * either the GNU General Public License Version 2 or later (the "GPL"), or
+53168:  * the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+53168:  * in which case the provisions of the GPL or the LGPL are applicable instead
+53168:  * of those above. If you wish to allow use of your version of this file only
+53168:  * under the terms of either the GPL or the LGPL, and not to allow others to
+53168:  * use your version of this file under the terms of the MPL, indicate your
+53168:  * decision by deleting the provisions above and replace them with the notice
+53168:  * and other provisions required by the GPL or the LGPL. If you do not delete
+53168:  * the provisions above, a recipient may use your version of this file under
+53168:  * the terms of any one of the MPL, the GPL or the LGPL.
+53168:  *
+53168:  * ***** END LICENSE BLOCK ***** */
+53168: 
+53168: #ifdef JS_METHODJIT
+53178: 
+53168: #include "Retcon.h"
+53168: #include "MethodJIT.h"
+53168: #include "Compiler.h"
+76185: #include "StubCalls.h"
+53168: #include "jsdbgapi.h"
+53168: #include "jsnum.h"
+76185: #include "assembler/assembler/LinkBuffer.h"
+76185: #include "assembler/assembler/RepatchBuffer.h"
+53168: 
+53168: #include "jscntxtinlines.h"
+76185: #include "jsinterpinlines.h"
+76185: 
+76185: #include "MethodJIT-inl.h"
+53168: 
+53168: using namespace js;
+53168: using namespace js::mjit;
+53168: 
+53168: namespace js {
+53168: namespace mjit {
+53168: 
+53168: AutoScriptRetrapper::~AutoScriptRetrapper()
+53168: {
+53168:     while (!traps.empty()) {
+53168:         jsbytecode *pc = traps.back();
+53168:         traps.popBack();
+53168:         *pc = JSOP_TRAP;
+53168:     }
+53168: }
+53168: 
+53168: bool
+53168: AutoScriptRetrapper::untrap(jsbytecode *pc)
+53168: {
+53168:     if (!traps.append(pc))
+53168:         return false;
+68895:     *pc = JS_GetTrapOpcode(traps.allocPolicy().context(), script, pc);
+53168:     return true;
+53168: }
+53168: 
+76185: static inline JSRejoinState ScriptedRejoin(uint32 pcOffset)
+76185: {
+76185:     return REJOIN_SCRIPTED | (pcOffset << 1);
+76185: }
+76185: 
+76185: static inline JSRejoinState StubRejoin(RejoinState rejoin)
+76185: {
+76185:     return rejoin << 1;
+76185: }
+76185: 
+76185: static inline void
+76185: SetRejoinState(StackFrame *fp, const CallSite &site, void **location)
+76185: {
+76185:     if (site.rejoin == REJOIN_SCRIPTED) {
+76185:         fp->setRejoin(ScriptedRejoin(site.pcOffset));
+76185:         *location = JS_FUNC_TO_DATA_PTR(void *, JaegerInterpolineScripted);
+76185:     } else {
+76185:         fp->setRejoin(StubRejoin(site.rejoin));
+76185:         *location = JS_FUNC_TO_DATA_PTR(void *, JaegerInterpoline);
+76185:     }
+76185: }
+76185: 
+76185: void
+76185: Recompiler::patchCall(JITScript *jit, StackFrame *fp, void **location)
+76020: {
+76206:     uint8* codeStart = (uint8 *)jit->code.m_code.executableAddress();
+76185: 
+76206:     CallSite *callSites_ = jit->callSites();
+76206:     for (uint32 i = 0; i < jit->nCallSites; i++) {
+76206:         if (callSites_[i].codeOffset + codeStart == *location) {
+76185:             JS_ASSERT(callSites_[i].inlineIndex == analyze::CrossScriptSSA::OUTER_FRAME);
+76185:             SetRejoinState(fp, callSites_[i], location);
+76185:             return;
+76206:         }
+76020:     }
+76020: 
+76206:     JS_NOT_REACHED("failed to find call site");
+76020: }
+76020: 
+76020: void
+77353: Recompiler::patchNative(JSCompartment *compartment, JITScript *jit, StackFrame *fp,
+76185:                         jsbytecode *pc, CallSite *inlined, RejoinState rejoin)
+53168: {
+76185:     /*
+76185:      * There is a native IC at pc which triggered a recompilation. The recompilation
+76185:      * could have been triggered either by the native call itself, or by a SplatApplyArgs
+76185:      * preparing for the native call. Either way, we don't want to patch up the call,
+76185:      * but will instead steal the pool for the native IC so it doesn't get freed
+76185:      * with the old script, and patch up the jump at the end to go to the interpoline.
+76185:      */
+76185:     fp->setRejoin(StubRejoin(rejoin));
+76185: 
+76185:     /* :XXX: We might crash later if this fails. */
+77353:     compartment->jaegerCompartment()->orphanedNativeFrames.append(fp);
+76185: 
+76185:     unsigned i;
+76185:     ic::CallICInfo *callICs = jit->callICs();
+76185:     for (i = 0; i < jit->nCallICs; i++) {
+76185:         CallSite *call = callICs[i].call;
+76185:         if (inlined) {
+76185:             /*
+76185:              * The IC and regs.inlined will have two different call sites for
+76185:              * the same point in the script. The IC site refers to the scripted
+76185:              * return and regs.inlined has the prologue site (which was in use
+76185:              * when the native stub was generated.
+76185:              */
+76185:             if (call->inlineIndex == inlined->inlineIndex && call->pcOffset == inlined->pcOffset)
+76185:                 break;
+76185:         } else if (call->inlineIndex == uint32(-1) &&
+76185:                    call->pcOffset == uint32(pc - jit->script->code)) {
+76185:             break;
+76185:         }
+76185:     }
+76185:     JS_ASSERT(i < jit->nCallICs);
+76185:     ic::CallICInfo &ic = callICs[i];
+76185:     JS_ASSERT(ic.fastGuardedNative);
+76185: 
+76185:     JSC::ExecutablePool *&pool = ic.pools[ic::CallICInfo::Pool_NativeStub];
+76185: 
+76185:     if (!pool) {
+76185:         /* Already stole this stub. */
+76185:         return;
+76185:     }
+76185: 
+76185:     /* Patch the native fallthrough to go to the interpoline. */
+76185:     {
+76185: #ifdef _WIN64
+76185:         /* Win64 needs stack adjustment */
+76185:         void *interpoline = JS_FUNC_TO_DATA_PTR(void *, JaegerInterpolinePatched);
+76185: #else
+76185:         void *interpoline = JS_FUNC_TO_DATA_PTR(void *, JaegerInterpoline);
+76185: #endif
+76185:         uint8 *start = (uint8 *)ic.nativeJump.executableAddress();
+76185:         JSC::RepatchBuffer repatch(JSC::JITCode(start - 32, 64));
+76185: #ifdef JS_CPU_X64
+76185:         repatch.repatch(ic.nativeJump, interpoline);
+76185: #else
+76185:         repatch.relink(ic.nativeJump, JSC::CodeLocationLabel(interpoline));
+76185: #endif
+76185:     }
+76185: 
+76185:     /* :XXX: We leak the pool if this fails. Oh well. */
+77353:     compartment->jaegerCompartment()->orphanedNativePools.append(pool);
+76185: 
+76185:     /* Mark as stolen in case there are multiple calls on the stack. */
+76185:     pool = NULL;
+76185: }
+76185: 
+77353: void
+77353: Recompiler::patchFrame(JSCompartment *compartment, VMFrame *f, JSScript *script)
+77353: {
+77353:     /*
+77353:      * Check if the VMFrame returns directly into the script's jitcode. This
+77353:      * depends on the invariant that f->fp() reflects the frame at the point
+77353:      * where the call occurred, irregardless of any frames which were pushed
+77353:      * inside the call.
+77353:      */
+77353:     StackFrame *fp = f->fp();
+77353:     void **addr = f->returnAddressLocation();
+77353:     RejoinState rejoin = (RejoinState) f->stubRejoin;
+77353:     if (rejoin == REJOIN_NATIVE ||
+77353:         rejoin == REJOIN_NATIVE_LOWERED) {
+77353:         /* Native call. */
+77353:         if (fp->script() == script) {
+77353:             patchNative(compartment, fp->jit(), fp,
+77353:                         f->regs.pc, NULL, rejoin);
+77353:             f->stubRejoin = REJOIN_NATIVE_PATCHED;
+77353:         }
+77353:     } else if (rejoin == REJOIN_NATIVE_PATCHED) {
+77353:         /* Already patched, don't do anything. */
+77353:     } else if (rejoin) {
+77353:         /* Recompilation triggered by CompileFunction. */
+77353:         if (fp->script() == script) {
+77353:             fp->setRejoin(StubRejoin(rejoin));
+77353:             *addr = JS_FUNC_TO_DATA_PTR(void *, JaegerInterpoline);
+77353:             f->stubRejoin = 0;
+77353:         }
+77353:     } else if (script->jitCtor && script->jitCtor->isValidCode(*addr)) {
+77353:         patchCall(script->jitCtor, fp, addr);
+77353:     } else if (script->jitNormal && script->jitNormal->isValidCode(*addr)) {
+77353:         patchCall(script->jitNormal, fp, addr);
+77353:     }
+77353: }
+77353: 
+76185: StackFrame *
+77353: Recompiler::expandInlineFrameChain(StackFrame *outer, InlineFrame *inner)
+76185: {
+76185:     StackFrame *parent;
+76185:     if (inner->parent)
+77353:         parent = expandInlineFrameChain(outer, inner->parent);
+76185:     else
+76185:         parent = outer;
+76185: 
+76185:     JaegerSpew(JSpew_Recompile, "Expanding inline frame\n");
+76185: 
+76185:     StackFrame *fp = (StackFrame *) ((uint8 *)outer + sizeof(Value) * inner->depth);
+76185:     fp->initInlineFrame(inner->fun, parent, inner->parentpc);
+76185:     uint32 pcOffset = inner->parentpc - parent->script()->code;
+76185: 
+76185:     void **location = fp->addressOfNativeReturnAddress();
+76185:     *location = JS_FUNC_TO_DATA_PTR(void *, JaegerInterpolineScripted);
+76185:     parent->setRejoin(ScriptedRejoin(pcOffset));
+76185: 
+76185:     return fp;
+76185: }
+76185: 
+76185: /*
+76185:  * Whether a given return address for a frame indicates it returns directly
+76185:  * into JIT code.
+76185:  */
+76185: static inline bool
+76185: JITCodeReturnAddress(void *data)
+76185: {
+76185:     return data != NULL  /* frame is interpreted */
+76185:         && data != JS_FUNC_TO_DATA_PTR(void *, JaegerTrampolineReturn)
+76185:         && data != JS_FUNC_TO_DATA_PTR(void *, JaegerInterpoline)
+76185: #ifdef _WIN64
+76185:         && data != JS_FUNC_TO_DATA_PTR(void *, JaegerInterpolinePatched)
+76185: #endif
+76185:         && data != JS_FUNC_TO_DATA_PTR(void *, JaegerInterpolineScripted);
+76185: }
+76185: 
+76185: /*
+76185:  * Expand all inlined frames within fp per 'inlined' and update next and regs
+76185:  * to refer to the new innermost frame.
+76185:  */
+76185: void
+77353: Recompiler::expandInlineFrames(JSCompartment *compartment,
+77353:                                StackFrame *fp, mjit::CallSite *inlined,
+76185:                                StackFrame *next, VMFrame *f)
+76185: {
+76185:     JS_ASSERT_IF(next, next->prev() == fp && next->prevInline() == inlined);
+76185: 
+76185:     /*
+76185:      * Treat any frame expansion as a recompilation event, so that f.jit() is
+76185:      * stable if no recompilations have occurred.
+76185:      */
+77353:     compartment->types.frameExpansions++;
+76185: 
+76185:     /*
+76185:      * Patch the VMFrame's return address if it is returning at the given inline site.
+76185:      * Note there is no worry about handling a native or CompileFunction call here,
+76185:      * as such IC stubs are not generated within inline frames.
+76185:      */
+76185:     void **frameAddr = f->returnAddressLocation();
+76185:     uint8* codeStart = (uint8 *)fp->jit()->code.m_code.executableAddress();
+76185: 
+76185:     InlineFrame *inner = &fp->jit()->inlineFrames()[inlined->inlineIndex];
+76185:     jsbytecode *innerpc = inner->fun->script()->code + inlined->pcOffset;
+76185: 
+77353:     StackFrame *innerfp = expandInlineFrameChain(fp, inner);
+76185: 
+76185:     /* Check if the VMFrame returns into the inlined frame. */
+76185:     if (f->stubRejoin && f->fp() == fp) {
+76185:         /* The VMFrame is calling CompileFunction. */
+76185:         JS_ASSERT(f->stubRejoin != REJOIN_NATIVE &&
+76185:                   f->stubRejoin != REJOIN_NATIVE_LOWERED &&
+76185:                   f->stubRejoin != REJOIN_NATIVE_PATCHED);
+76185:         innerfp->setRejoin(StubRejoin((RejoinState) f->stubRejoin));
+76185:         *frameAddr = JS_FUNC_TO_DATA_PTR(void *, JaegerInterpoline);
+76185:         f->stubRejoin = 0;
+76185:     }
+76185:     if (*frameAddr == codeStart + inlined->codeOffset) {
+76185:         /* The VMFrame returns directly into the expanded frame. */
+76185:         SetRejoinState(innerfp, *inlined, frameAddr);
+76185:     }
+76185: 
+76185:     if (f->fp() == fp) {
+76185:         JS_ASSERT(f->regs.inlined() == inlined);
+76185:         f->regs.expandInline(innerfp, innerpc);
+76185:     }
+76185: 
+76185:     /*
+76185:      * Note: unlike the case for recompilation, during frame expansion we don't
+76185:      * need to worry about the next VMFrame holding a reference to the inlined
+76185:      * frame in its entryncode. entryncode is non-NULL only if the next frame's
+76185:      * code was discarded and has executed via the Interpoline, which can only
+76185:      * happen after all inline frames have been expanded.
+76185:      */
+76185: 
+76185:     if (next) {
+76185:         next->resetInlinePrev(innerfp, innerpc);
+76185:         void **addr = next->addressOfNativeReturnAddress();
+76185:         if (JITCodeReturnAddress(*addr)) {
+76185:             innerfp->setRejoin(ScriptedRejoin(inlined->pcOffset));
+76185:             *addr = JS_FUNC_TO_DATA_PTR(void *, JaegerInterpolineScripted);
+76185:         }
+76185:     }
+76185: }
+76185: 
+76185: void
+77353: ExpandInlineFrames(JSCompartment *compartment, bool all)
+76185: {
+77353:     if (!compartment || !compartment->hasJaegerCompartment())
+76185:         return;
+76185: 
+76185:     if (!all) {
+77353:         VMFrame *f = compartment->jaegerCompartment()->activeFrame();
+77353:         if (f && f->regs.inlined())
+77353:             mjit::Recompiler::expandInlineFrames(compartment, f->fp(), f->regs.inlined(), NULL, f);
+76185:         return;
+76185:     }
+76185: 
+77353:     for (VMFrame *f = compartment->jaegerCompartment()->activeFrame();
+76185:          f != NULL;
+76185:          f = f->previous) {
+76185: 
+77353:         if (f->regs.inlined())
+77353:             mjit::Recompiler::expandInlineFrames(compartment, f->fp(), f->regs.inlined(), NULL, f);
+76185: 
+76185:         StackFrame *end = f->entryfp->prev();
+76185:         StackFrame *next = NULL;
+76185:         for (StackFrame *fp = f->fp(); fp != end; fp = fp->prev()) {
+77353:             if (!next) {
+77353:                 next = fp;
+77353:                 continue;
+77353:             }
+76185:             mjit::CallSite *inlined;
+77353:             next->prevpc(&inlined);
+77353:             if (inlined) {
+77353:                 mjit::Recompiler::expandInlineFrames(compartment, fp, inlined, next, f);
+76185:                 fp = next;
+76185:                 next = NULL;
+76185:             } else {
+76185:                 if (fp->downFramesExpanded())
+76185:                     break;
+76185:                 next = fp;
+76185:             }
+76185:             fp->setDownFramesExpanded();
+76185:         }
+76185:     }
+53168: }
+53168: 
+77353: void
+77353: ClearAllFrames(JSCompartment *compartment)
+77353: {
+77353:     if (!compartment || !compartment->hasJaegerCompartment())
+77353:         return;
+77353: 
+77353:     ExpandInlineFrames(compartment, true);
+77353: 
+77353:     for (VMFrame *f = compartment->jaegerCompartment()->activeFrame();
+77353:          f != NULL;
+77353:          f = f->previous) {
+77353: 
+77367:         // We don't need to scan the frames internal to this VMFrame, or update
+77367:         // their ncode values. Patching the VMFrame's return address will cause
+77367:         // all its frames to finish in the interpreter, unless the interpreter
+77367:         // enters one of the intermediate frames at a loop boundary. In such a
+77367:         // case, the interpreter will enter through EnterMethodJIT, which
+77367:         // overwrites the entry frame's ncode value.
+77353: 
+77353:         Recompiler::patchFrame(compartment, f, f->fp()->script());
+77353:     }
+77353: }
+77353: 
+53391: Recompiler::Recompiler(JSContext *cx, JSScript *script)
+53391:   : cx(cx), script(script)
+53168: {    
+53168: }
+53168: 
+53168: /*
+76185:  * Recompilation can be triggered either by the debugger (turning debug mode on for
+76185:  * a script or setting/clearing a trap), or by dynamic changes in type information
+76185:  * from type inference. When recompiling we don't immediately recompile the JIT
+76185:  * code, but destroy the old code and remove all references to the code, including
+76185:  * those from active stack frames. Things to do:
+76185:  *
+76185:  * - Purge scripted call inline caches calling into the script.
+76185:  *
+76185:  * - For frames with an ncode return address in the original script, redirect
+76185:  *   to the interpoline.
+76185:  *
+76185:  * - For VMFrames with a stub call return address in the original script,
+76185:  *   redirect to the interpoline.
+76185:  *
+76185:  * - For VMFrames whose entryncode address (the value of entryfp->ncode before
+76185:  *   being clobbered with JaegerTrampolineReturn) is in the original script,
+76185:  *   redirect that entryncode to the interpoline.
+76185:  */
+76185: void
+76185: Recompiler::recompile(bool resetUses)
+76185: {
+76185:     JS_ASSERT(script->hasJITCode());
+76185: 
+76185:     JaegerSpew(JSpew_Recompile, "recompiling script (file \"%s\") (line \"%d\") (length \"%d\")\n",
+76185:                script->filename, script->lineno, script->length);
+76185: 
+76185:     types::AutoEnterTypeInference enter(cx, true);
+76185: 
+76185:     /*
+53168:      * The strategy for this goes as follows:
+53168:      * 
+53168:      * 1) Scan the stack, looking at all return addresses that could go into JIT
+53168:      *    code.
+53168:      * 2) If an address corresponds to a call site registered by |callSite| during
+76185:      *    the last compilation, patch it to go to the interpoline.
+76185:      * 3) Purge the old compiled state.
+53168:      */
+56854: 
+56854:     // Find all JIT'd stack frames to account for return addresses that will
+56854:     // need to be patched after recompilation.
+72551:     for (VMFrame *f = script->compartment->jaegerCompartment()->activeFrame();
+56854:          f != NULL;
+56854:          f = f->previous) {
+56854: 
+56854:         // Scan all frames owned by this VMFrame.
+69223:         StackFrame *end = f->entryfp->prev();
+76185:         StackFrame *next = NULL;
+69223:         for (StackFrame *fp = f->fp(); fp != end; fp = fp->prev()) {
+76185:             if (fp->script() != script) {
+76185:                 next = fp;
+76185:                 continue;
+53168:             }
+53168: 
+76185:             if (next) {
+76185:                 // check for a scripted call returning into the recompiled script.
+76185:                 // this misses scanning the entry fp, which cannot return directly
+76185:                 // into JIT code.
+76185:                 void **addr = next->addressOfNativeReturnAddress();
+76185: 
+76185:                 if (JITCodeReturnAddress(*addr)) {
+76185:                     JS_ASSERT(fp->jit()->isValidCode(*addr));
+76185:                     patchCall(fp->jit(), fp, addr);
+53168:                 }
+53391:             }
+53168: 
+76185:             next = fp;
+57766:         }
+55503: 
+77353:         patchFrame(cx->compartment, f, script);
+55503:     }
+55487: 
+76185:     if (script->jitNormal) {
+76185:         cleanup(script->jitNormal);
+76185:         ReleaseScriptCode(cx, script, true);
+57766:     }
+76185:     if (script->jitCtor) {
+76185:         cleanup(script->jitCtor);
+76185:         ReleaseScriptCode(cx, script, false);
+57766:     }
+57766: 
+76185:     if (resetUses) {
+76185:         /*
+76185:          * Wait for the script to get warm again before doing another compile,
+76185:          * unless we are recompiling *because* the script got hot.
+76185:          */
+76185:         script->resetUseCount();
+76185:     }
+76185: 
+76185:     cx->compartment->types.recompilations++;
+76185: }
+76185: 
+76185: void
+76185: Recompiler::cleanup(JITScript *jit)
+76206: {
+76185:     while (!JS_CLIST_IS_EMPTY(&jit->callers)) {
+76185:         JaegerSpew(JSpew_Recompile, "Purging IC caller\n");
+76030: 
+76185:         JS_STATIC_ASSERT(offsetof(ic::CallICInfo, links) == 0);
+76185:         ic::CallICInfo *ic = (ic::CallICInfo *) jit->callers.next;
+62075: 
+76185:         uint8 *start = (uint8 *)ic->funGuard.executableAddress();
+76185:         JSC::RepatchBuffer repatch(JSC::JITCode(start - 32, 64));
+53391: 
+76185:         repatch.repatch(ic->funGuard, NULL);
+76185:         repatch.relink(ic->funJump, ic->slowPathStart);
+76185:         ic->purgeGuardedObject();
+76185:     }
+53168: }
+53168: 
+53170: } /* namespace mjit */
+53170: } /* namespace js */
+53168: 
+53178: #endif /* JS_METHODJIT */
+53178: 

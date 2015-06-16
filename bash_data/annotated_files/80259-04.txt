@@ -1,0 +1,574 @@
+80259: //* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+35729: // Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+35729: // Use of this source code is governed by a BSD-style license that can be
+35729: // found in the LICENSE file.
+35729: 
+35729: #include <dirent.h>
+35729: #include <errno.h>
+35729: #include <fcntl.h>
+35729: #include <signal.h>
+35729: #include <stdlib.h>
+35729: #include <sys/resource.h>
+35729: #include <sys/time.h>
+35729: #include <sys/types.h>
+35729: #include <sys/wait.h>
+35729: #include <unistd.h>
+35729: 
+35729: #include <limits>
+35729: #include <set>
+35729: 
+35729: #include "base/basictypes.h"
+35729: #include "base/eintr_wrapper.h"
+35729: #include "base/logging.h"
+35729: #include "base/platform_thread.h"
+35729: #include "base/process_util.h"
+35729: #include "base/scoped_ptr.h"
+35729: #include "base/sys_info.h"
+35729: #include "base/time.h"
+35729: #include "base/waitable_event.h"
+80259: #include "base/dir_reader_posix.h"
+35729: 
+35729: const int kMicrosecondsPerSecond = 1000000;
+35729: 
+35729: namespace base {
+35729: 
+35729: ProcessId GetCurrentProcId() {
+35729:   return getpid();
+35729: }
+35729: 
+35729: ProcessHandle GetCurrentProcessHandle() {
+35729:   return GetCurrentProcId();
+35729: }
+35729: 
+35729: bool OpenProcessHandle(ProcessId pid, ProcessHandle* handle) {
+35729:   // On Posix platforms, process handles are the same as PIDs, so we
+35729:   // don't need to do anything.
+35729:   *handle = pid;
+35729:   return true;
+35729: }
+35729: 
+35729: bool OpenPrivilegedProcessHandle(ProcessId pid, ProcessHandle* handle) {
+35729:   // On POSIX permissions are checked for each operation on process,
+35729:   // not when opening a "handle".
+35729:   return OpenProcessHandle(pid, handle);
+35729: }
+35729: 
+35729: void CloseProcessHandle(ProcessHandle process) {
+35729:   // See OpenProcessHandle, nothing to do.
+35729:   return;
+35729: }
+35729: 
+35729: ProcessId GetProcId(ProcessHandle process) {
+35729:   return process;
+35729: }
+35729: 
+35729: // Attempts to kill the process identified by the given process
+35729: // entry structure.  Ignores specified exit_code; posix can't force that.
+35729: // Returns true if this is successful, false otherwise.
+35729: bool KillProcess(ProcessHandle process_id, int exit_code, bool wait) {
+35729:   bool result = kill(process_id, SIGTERM) == 0;
+35729: 
+35729:   if (result && wait) {
+35729:     int tries = 60;
+35729:     // The process may not end immediately due to pending I/O
+35729:     while (tries-- > 0) {
+35729:       int pid = HANDLE_EINTR(waitpid(process_id, NULL, WNOHANG));
+35729:       if (pid == process_id)
+35729:         break;
+35729: 
+35729:       sleep(1);
+35729:     }
+35729: 
+35729:     result = kill(process_id, SIGKILL) == 0;
+35729:   }
+35729: 
+35729:   if (!result)
+35729:     DLOG(ERROR) << "Unable to terminate process.";
+35729: 
+35729:   return result;
+35729: }
+35729: 
+80259: #ifdef ANDROID
+80259: typedef unsigned long int rlim_t;
+80259: #endif
+80259: 
+35729: // A class to handle auto-closing of DIR*'s.
+35729: class ScopedDIRClose {
+35729:  public:
+35729:   inline void operator()(DIR* x) const {
+35729:     if (x) {
+35729:       closedir(x);
+35729:     }
+35729:   }
+35729: };
+35729: typedef scoped_ptr_malloc<DIR, ScopedDIRClose> ScopedDIR;
+35729: 
+46920: 
+35729: void CloseSuperfluousFds(const base::InjectiveMultimap& saved_mapping) {
+80259:   // DANGER: no calls to malloc are allowed from now on:
+80259:   // http://crbug.com/36678
+80259: #if defined(ANDROID)
+80259:   static const rlim_t kSystemDefaultMaxFds = 1024;
+80259:   static const char kFDDir[] = "/proc/self/fd";
+80259: #elif defined(OS_LINUX)
+35729:   static const rlim_t kSystemDefaultMaxFds = 8192;
+80259:   static const char kFDDir[] = "/proc/self/fd";
+35729: #elif defined(OS_MACOSX)
+35729:   static const rlim_t kSystemDefaultMaxFds = 256;
+80259:   static const char kFDDir[] = "/dev/fd";
+35729: #endif
+35729: 
+35729:   // Get the maximum number of FDs possible.
+35729:   struct rlimit nofile;
+35729:   rlim_t max_fds;
+35729:   if (getrlimit(RLIMIT_NOFILE, &nofile)) {
+35729:     // getrlimit failed. Take a best guess.
+35729:     max_fds = kSystemDefaultMaxFds;
+35729:     DLOG(ERROR) << "getrlimit(RLIMIT_NOFILE) failed: " << errno;
+35729:   } else {
+35729:     max_fds = nofile.rlim_cur;
+35729:   }
+35729: 
+35729:   if (max_fds > INT_MAX)
+35729:     max_fds = INT_MAX;
+35729: 
+80259:   DirReaderPosix fd_dir(kFDDir);
+35729: 
+80259:   if (!fd_dir.IsValid()) {
+35729:     // Fallback case: Try every possible fd.
+35729:     for (rlim_t i = 0; i < max_fds; ++i) {
+35729:       const int fd = static_cast<int>(i);
+80259:       if (fd == STDIN_FILENO || fd == STDOUT_FILENO || fd == STDERR_FILENO)
+80259:         continue;
+80259:       InjectiveMultimap::const_iterator j;
+80259:       for (j = saved_mapping.begin(); j != saved_mapping.end(); j++) {
+80259:         if (fd == j->dest)
+80259:           break;
+80259:       }
+80259:       if (j != saved_mapping.end())
+35729:         continue;
+35729: 
+80259:       // Since we're just trying to close anything we can find,
+80259:       // ignore any error return values of close().
+35729:       HANDLE_EINTR(close(fd));
+35729:     }
+35729:     return;
+35729:   }
+35729: 
+80259:   const int dir_fd = fd_dir.fd();
+80259: 
+80259:   for ( ; fd_dir.Next(); ) {
+35729:     // Skip . and .. entries.
+80259:     if (fd_dir.name()[0] == '.')
+35729:       continue;
+35729: 
+35729:     char *endptr;
+35729:     errno = 0;
+80259:     const long int fd = strtol(fd_dir.name(), &endptr, 10);
+80259:     if (fd_dir.name()[0] == 0 || *endptr || fd < 0 || errno)
+35729:       continue;
+80259:     if (fd == STDIN_FILENO || fd == STDOUT_FILENO || fd == STDERR_FILENO)
+80259:       continue;
+80259:     InjectiveMultimap::const_iterator i;
+80259:     for (i = saved_mapping.begin(); i != saved_mapping.end(); i++) {
+80259:       if (fd == i->dest)
+80259:         break;
+80259:     }
+80259:     if (i != saved_mapping.end())
+80259:       continue;
+80259:     if (fd == dir_fd)
+35729:       continue;
+35729: 
+35729:     // When running under Valgrind, Valgrind opens several FDs for its
+35729:     // own use and will complain if we try to close them.  All of
+35729:     // these FDs are >= |max_fds|, so we can check against that here
+35729:     // before closing.  See https://bugs.kde.org/show_bug.cgi?id=191758
+80259:     if (fd < static_cast<int>(max_fds)) {
+80259:       int ret = HANDLE_EINTR(close(fd));
+80259:       if (ret != 0) {
+80259:         DLOG(ERROR) << "Problem closing fd";
+80259:       }
+80259:     }
+35729:   }
+35729: }
+35729: 
+35729: // Sets all file descriptors to close on exec except for stdin, stdout
+35729: // and stderr.
+35729: // TODO(agl): Remove this function. It's fundamentally broken for multithreaded
+35729: // apps.
+35729: void SetAllFDsToCloseOnExec() {
+35729: #if defined(OS_LINUX)
+35729:   const char fd_dir[] = "/proc/self/fd";
+35729: #elif defined(OS_MACOSX)
+35729:   const char fd_dir[] = "/dev/fd";
+35729: #endif
+35729:   ScopedDIR dir_closer(opendir(fd_dir));
+35729:   DIR *dir = dir_closer.get();
+35729:   if (NULL == dir) {
+35729:     DLOG(ERROR) << "Unable to open " << fd_dir;
+35729:     return;
+35729:   }
+35729: 
+35729:   struct dirent *ent;
+35729:   while ((ent = readdir(dir))) {
+35729:     // Skip . and .. entries.
+35729:     if (ent->d_name[0] == '.')
+35729:       continue;
+35729:     int i = atoi(ent->d_name);
+35729:     // We don't close stdin, stdout or stderr.
+35729:     if (i <= STDERR_FILENO)
+35729:       continue;
+35729: 
+35729:     int flags = fcntl(i, F_GETFD);
+35729:     if ((flags == -1) || (fcntl(i, F_SETFD, flags | FD_CLOEXEC) == -1)) {
+35729:       DLOG(ERROR) << "fcntl failure.";
+35729:     }
+35729:   }
+35729: }
+35729: 
+35729: ProcessMetrics::ProcessMetrics(ProcessHandle process) : process_(process),
+35729:                                                         last_time_(0),
+35729:                                                         last_system_time_(0) {
+35729:   processor_count_ = base::SysInfo::NumberOfProcessors();
+35729: }
+35729: 
+35729: // static
+35729: ProcessMetrics* ProcessMetrics::CreateProcessMetrics(ProcessHandle process) {
+35729:   return new ProcessMetrics(process);
+35729: }
+35729: 
+35729: ProcessMetrics::~ProcessMetrics() { }
+35729: 
+35729: void EnableTerminationOnHeapCorruption() {
+35729:   // On POSIX, there nothing to do AFAIK.
+35729: }
+35729: 
+35729: void RaiseProcessToHighPriority() {
+35729:   // On POSIX, we don't actually do anything here.  We could try to nice() or
+35729:   // setpriority() or sched_getscheduler, but these all require extra rights.
+35729: }
+35729: 
+35729: bool DidProcessCrash(bool* child_exited, ProcessHandle handle) {
+35729:   int status;
+35729:   const int result = HANDLE_EINTR(waitpid(handle, &status, WNOHANG));
+35729:   if (result == -1) {
+35729:     LOG(ERROR) << "waitpid failed pid:" << handle << " errno:" << errno;
+35729:     if (child_exited)
+35729:       *child_exited = false;
+35729:     return false;
+35729:   } else if (result == 0) {
+35729:     // the child hasn't exited yet.
+35729:     if (child_exited)
+35729:       *child_exited = false;
+35729:     return false;
+35729:   }
+35729: 
+35729:   if (child_exited)
+35729:     *child_exited = true;
+35729: 
+35729:   if (WIFSIGNALED(status)) {
+35729:     switch(WTERMSIG(status)) {
+35729:       case SIGSEGV:
+35729:       case SIGILL:
+35729:       case SIGABRT:
+35729:       case SIGFPE:
+35729:         return true;
+35729:       default:
+35729:         return false;
+35729:     }
+35729:   }
+35729: 
+35729:   if (WIFEXITED(status))
+35729:     return WEXITSTATUS(status) != 0;
+35729: 
+35729:   return false;
+35729: }
+35729: 
+35729: bool WaitForExitCode(ProcessHandle handle, int* exit_code) {
+35729:   int status;
+35729:   if (HANDLE_EINTR(waitpid(handle, &status, 0)) == -1) {
+35729:     NOTREACHED();
+35729:     return false;
+35729:   }
+35729: 
+35729:   if (WIFEXITED(status)) {
+35729:     *exit_code = WEXITSTATUS(status);
+35729:     return true;
+35729:   }
+35729: 
+35729:   // If it didn't exit cleanly, it must have been signaled.
+35729:   DCHECK(WIFSIGNALED(status));
+35729:   return false;
+35729: }
+35729: 
+35729: namespace {
+35729: 
+35729: int WaitpidWithTimeout(ProcessHandle handle, int wait_milliseconds,
+35729:                        bool* success) {
+35729:   // This POSIX version of this function only guarantees that we wait no less
+35729:   // than |wait_milliseconds| for the proces to exit.  The child process may
+35729:   // exit sometime before the timeout has ended but we may still block for
+35729:   // up to 0.25 seconds after the fact.
+35729:   //
+35729:   // waitpid() has no direct support on POSIX for specifying a timeout, you can
+35729:   // either ask it to block indefinitely or return immediately (WNOHANG).
+35729:   // When a child process terminates a SIGCHLD signal is sent to the parent.
+35729:   // Catching this signal would involve installing a signal handler which may
+35729:   // affect other parts of the application and would be difficult to debug.
+35729:   //
+35729:   // Our strategy is to call waitpid() once up front to check if the process
+35729:   // has already exited, otherwise to loop for wait_milliseconds, sleeping for
+35729:   // at most 0.25 secs each time using usleep() and then calling waitpid().
+35729:   //
+35729:   // usleep() is speced to exit if a signal is received for which a handler
+35729:   // has been installed.  This means that when a SIGCHLD is sent, it will exit
+35729:   // depending on behavior external to this function.
+35729:   //
+35729:   // This function is used primarily for unit tests, if we want to use it in
+35729:   // the application itself it would probably be best to examine other routes.
+35729:   int status = -1;
+35729:   pid_t ret_pid = HANDLE_EINTR(waitpid(handle, &status, WNOHANG));
+35729:   static const int64 kQuarterSecondInMicroseconds = kMicrosecondsPerSecond/4;
+35729: 
+35729:   // If the process hasn't exited yet, then sleep and try again.
+35729:   Time wakeup_time = Time::Now() + TimeDelta::FromMilliseconds(
+35729:       wait_milliseconds);
+35729:   while (ret_pid == 0) {
+35729:     Time now = Time::Now();
+35729:     if (now > wakeup_time)
+35729:       break;
+35729:     // Guaranteed to be non-negative!
+35729:     int64 sleep_time_usecs = (wakeup_time - now).InMicroseconds();
+35729:     // Don't sleep for more than 0.25 secs at a time.
+35729:     if (sleep_time_usecs > kQuarterSecondInMicroseconds) {
+35729:       sleep_time_usecs = kQuarterSecondInMicroseconds;
+35729:     }
+35729: 
+35729:     // usleep() will return 0 and set errno to EINTR on receipt of a signal
+35729:     // such as SIGCHLD.
+35729:     usleep(sleep_time_usecs);
+35729:     ret_pid = HANDLE_EINTR(waitpid(handle, &status, WNOHANG));
+35729:   }
+35729: 
+35729:   if (success)
+35729:     *success = (ret_pid != -1);
+35729: 
+35729:   return status;
+35729: }
+35729: 
+35729: }  // namespace
+35729: 
+35729: bool WaitForSingleProcess(ProcessHandle handle, int wait_milliseconds) {
+35729:   bool waitpid_success;
+35729:   int status;
+35729:   if (wait_milliseconds == base::kNoTimeout)
+35729:     waitpid_success = (HANDLE_EINTR(waitpid(handle, &status, 0)) != -1);
+35729:   else
+35729:     status = WaitpidWithTimeout(handle, wait_milliseconds, &waitpid_success);
+35729:   if (status != -1) {
+35729:     DCHECK(waitpid_success);
+35729:     return WIFEXITED(status);
+35729:   } else {
+35729:     return false;
+35729:   }
+35729: }
+35729: 
+35729: bool CrashAwareSleep(ProcessHandle handle, int wait_milliseconds) {
+35729:   bool waitpid_success;
+35729:   int status = WaitpidWithTimeout(handle, wait_milliseconds, &waitpid_success);
+35729:   if (status != -1) {
+35729:     DCHECK(waitpid_success);
+35729:     return !(WIFEXITED(status) || WIFSIGNALED(status));
+35729:   } else {
+35729:     // If waitpid returned with an error, then the process doesn't exist
+35729:     // (which most probably means it didn't exist before our call).
+35729:     return waitpid_success;
+35729:   }
+35729: }
+35729: 
+35729: namespace {
+35729: 
+35729: int64 TimeValToMicroseconds(const struct timeval& tv) {
+35729:   return tv.tv_sec * kMicrosecondsPerSecond + tv.tv_usec;
+35729: }
+35729: 
+35729: }
+35729: 
+35729: int ProcessMetrics::GetCPUUsage() {
+35729:   struct timeval now;
+35729:   struct rusage usage;
+35729: 
+35729:   int retval = gettimeofday(&now, NULL);
+35729:   if (retval)
+35729:     return 0;
+35729:   retval = getrusage(RUSAGE_SELF, &usage);
+35729:   if (retval)
+35729:     return 0;
+35729: 
+35729:   int64 system_time = (TimeValToMicroseconds(usage.ru_stime) +
+35729:                        TimeValToMicroseconds(usage.ru_utime)) /
+35729:                         processor_count_;
+35729:   int64 time = TimeValToMicroseconds(now);
+35729: 
+35729:   if ((last_system_time_ == 0) || (last_time_ == 0)) {
+35729:     // First call, just set the last values.
+35729:     last_system_time_ = system_time;
+35729:     last_time_ = time;
+35729:     return 0;
+35729:   }
+35729: 
+35729:   int64 system_time_delta = system_time - last_system_time_;
+35729:   int64 time_delta = time - last_time_;
+35729:   DCHECK(time_delta != 0);
+35729:   if (time_delta == 0)
+35729:     return 0;
+35729: 
+35729:   // We add time_delta / 2 so the result is rounded.
+35729:   int cpu = static_cast<int>((system_time_delta * 100 + time_delta / 2) /
+35729:                              time_delta);
+35729: 
+35729:   last_system_time_ = system_time;
+35729:   last_time_ = time;
+35729: 
+35729:   return cpu;
+35729: }
+35729: 
+35729: bool GetAppOutput(const CommandLine& cl, std::string* output) {
+35729:   int pipe_fd[2];
+35729:   pid_t pid;
+35729: 
+80259:   // Illegal to allocate memory after fork and before execvp
+80259:   InjectiveMultimap fd_shuffle1, fd_shuffle2;
+80259:   fd_shuffle1.reserve(3);
+80259:   fd_shuffle2.reserve(3);
+80259:   const std::vector<std::string>& argv = cl.argv();
+80259:   scoped_array<char*> argv_cstr(new char*[argv.size() + 1]);
+80259: 
+35729:   if (pipe(pipe_fd) < 0)
+35729:     return false;
+35729: 
+35729:   switch (pid = fork()) {
+35729:     case -1:  // error
+35729:       close(pipe_fd[0]);
+35729:       close(pipe_fd[1]);
+35729:       return false;
+35729:     case 0:  // child
+35729:       {
+80259:         // Obscure fork() rule: in the child, if you don't end up doing exec*(),
+80259:         // you call _exit() instead of exit(). This is because _exit() does not
+80259:         // call any previously-registered (in the parent) exit handlers, which
+80259:         // might do things like block waiting for threads that don't even exist
+80259:         // in the child.
+35729:         int dev_null = open("/dev/null", O_WRONLY);
+35729:         if (dev_null < 0)
+80259:           _exit(127);
+35729: 
+80259:         fd_shuffle1.push_back(InjectionArc(pipe_fd[1], STDOUT_FILENO, true));
+80259:         fd_shuffle1.push_back(InjectionArc(dev_null, STDERR_FILENO, true));
+80259:         fd_shuffle1.push_back(InjectionArc(dev_null, STDIN_FILENO, true));
+80259:         // Adding another element here? Remeber to increase the argument to
+80259:         // reserve(), above.
+35729: 
+80259:         std::copy(fd_shuffle1.begin(), fd_shuffle1.end(),
+80259:                   std::back_inserter(fd_shuffle2));
+35729: 
+80259:         // fd_shuffle1 is mutated by this call because it cannot malloc.
+80259:         if (!ShuffleFileDescriptors(&fd_shuffle1))
+80259:           _exit(127);
+35729: 
+80259:         CloseSuperfluousFds(fd_shuffle2);
+80259: 
+35729:         for (size_t i = 0; i < argv.size(); i++)
+35729:           argv_cstr[i] = const_cast<char*>(argv[i].c_str());
+35729:         argv_cstr[argv.size()] = NULL;
+35729:         execvp(argv_cstr[0], argv_cstr.get());
+80259:         _exit(127);
+35729:       }
+35729:     default:  // parent
+35729:       {
+35729:         // Close our writing end of pipe now. Otherwise later read would not
+35729:         // be able to detect end of child's output (in theory we could still
+35729:         // write to the pipe).
+35729:         close(pipe_fd[1]);
+35729: 
+35729:         int exit_code = EXIT_FAILURE;
+35729:         bool success = WaitForExitCode(pid, &exit_code);
+35729:         if (!success || exit_code != EXIT_SUCCESS) {
+35729:           close(pipe_fd[0]);
+35729:           return false;
+35729:         }
+35729: 
+35729:         char buffer[256];
+35729:         std::string buf_output;
+35729: 
+35729:         while (true) {
+35729:           ssize_t bytes_read =
+35729:               HANDLE_EINTR(read(pipe_fd[0], buffer, sizeof(buffer)));
+35729:           if (bytes_read <= 0)
+35729:             break;
+35729:           buf_output.append(buffer, bytes_read);
+35729:         }
+35729:         output->swap(buf_output);
+35729:         close(pipe_fd[0]);
+35729:         return true;
+35729:       }
+35729:   }
+35729: }
+35729: 
+35729: int GetProcessCount(const std::wstring& executable_name,
+35729:                     const ProcessFilter* filter) {
+35729:   int count = 0;
+35729: 
+35729:   NamedProcessIterator iter(executable_name, filter);
+35729:   while (iter.NextProcessEntry())
+35729:     ++count;
+35729:   return count;
+35729: }
+35729: 
+35729: bool KillProcesses(const std::wstring& executable_name, int exit_code,
+35729:                    const ProcessFilter* filter) {
+35729:   bool result = true;
+35729:   const ProcessEntry* entry;
+35729: 
+35729:   NamedProcessIterator iter(executable_name, filter);
+35729:   while ((entry = iter.NextProcessEntry()) != NULL)
+35729:     result = KillProcess((*entry).pid, exit_code, true) && result;
+35729: 
+35729:   return result;
+35729: }
+35729: 
+35729: bool WaitForProcessesToExit(const std::wstring& executable_name,
+35729:                             int wait_milliseconds,
+35729:                             const ProcessFilter* filter) {
+35729:   bool result = false;
+35729: 
+35729:   // TODO(port): This is inefficient, but works if there are multiple procs.
+35729:   // TODO(port): use waitpid to avoid leaving zombies around
+35729: 
+35729:   base::Time end_time = base::Time::Now() +
+35729:       base::TimeDelta::FromMilliseconds(wait_milliseconds);
+35729:   do {
+35729:     NamedProcessIterator iter(executable_name, filter);
+35729:     if (!iter.NextProcessEntry()) {
+35729:       result = true;
+35729:       break;
+35729:     }
+35729:     PlatformThread::Sleep(100);
+35729:   } while ((base::Time::Now() - end_time) > base::TimeDelta());
+35729: 
+35729:   return result;
+35729: }
+35729: 
+35729: bool CleanupProcesses(const std::wstring& executable_name,
+35729:                       int wait_milliseconds,
+35729:                       int exit_code,
+35729:                       const ProcessFilter* filter) {
+35729:   bool exited_cleanly =
+35729:       WaitForProcessesToExit(executable_name, wait_milliseconds,
+35729:                            filter);
+35729:   if (!exited_cleanly)
+35729:     KillProcesses(executable_name, exit_code, filter);
+35729:   return exited_cleanly;
+35729: }
+35729: 
+35729: }  // namespace base

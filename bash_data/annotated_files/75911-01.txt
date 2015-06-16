@@ -1,0 +1,611 @@
+53178: /* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+53178:  * vim: set ts=4 sw=4 et tw=99:
+53178:  *
+53178:  * ***** BEGIN LICENSE BLOCK *****
+53168:  * Version: MPL 1.1/GPL 2.0/LGPL 2.1
+53168:  *
+53168:  * The contents of this file are subject to the Mozilla Public License Version
+53168:  * 1.1 (the "License"); you may not use this file except in compliance with
+53168:  * the License. You may obtain a copy of the License at
+53168:  * http://www.mozilla.org/MPL/
+53168:  *
+53168:  * Software distributed under the License is distributed on an "AS IS" basis,
+53168:  * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+53168:  * for the specific language governing rights and limitations under the
+53168:  * License.
+53168:  *
+53168:  * The Original Code is Mozilla Jaegermonkey.
+53168:  *
+53168:  * The Initial Developer of the Original Code is the Mozilla Foundation.
+53168:  *
+53168:  * Portions created by the Initial Developer are Copyright (C) 2010
+53168:  * the Initial Developer. All Rights Reserved.
+53168:  *
+53168:  * Contributor(s):
+53168:  *   Andrew Drake <drakedevel@gmail.com>
+53168:  *
+53168:  * Alternatively, the contents of this file may be used under the terms of
+53168:  * either the GNU General Public License Version 2 or later (the "GPL"), or
+53168:  * the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+53168:  * in which case the provisions of the GPL or the LGPL are applicable instead
+53168:  * of those above. If you wish to allow use of your version of this file only
+53168:  * under the terms of either the GPL or the LGPL, and not to allow others to
+53168:  * use your version of this file under the terms of the MPL, indicate your
+53168:  * decision by deleting the provisions above and replace them with the notice
+53168:  * and other provisions required by the GPL or the LGPL. If you do not delete
+53168:  * the provisions above, a recipient may use your version of this file under
+53168:  * the terms of any one of the MPL, the GPL or the LGPL.
+53168:  *
+53168:  * ***** END LICENSE BLOCK ***** */
+53168: 
+53168: #ifdef JS_METHODJIT
+53178: 
+53168: #include "Retcon.h"
+53168: #include "MethodJIT.h"
+53168: #include "Compiler.h"
+53168: #include "jsdbgapi.h"
+53168: #include "jsnum.h"
+75636: #include "assembler/assembler/LinkBuffer.h"
+75636: #include "assembler/assembler/RepatchBuffer.h"
+53168: 
+53168: #include "jscntxtinlines.h"
+75864: #include "jsinterpinlines.h"
+53168: 
+53168: using namespace js;
+53168: using namespace js::mjit;
+53168: 
+53168: namespace js {
+53168: namespace mjit {
+53168: 
+53168: AutoScriptRetrapper::~AutoScriptRetrapper()
+53168: {
+53168:     while (!traps.empty()) {
+53168:         jsbytecode *pc = traps.back();
+53168:         traps.popBack();
+53168:         *pc = JSOP_TRAP;
+53168:     }
+53168: }
+53168: 
+53168: bool
+53168: AutoScriptRetrapper::untrap(jsbytecode *pc)
+53168: {
+53168:     if (!traps.append(pc))
+53168:         return false;
+53168:     *pc = JS_GetTrapOpcode(cx, script, pc);
+53168:     return true;
+53168: }
+53168: 
+53168: Recompiler::PatchableAddress
+55503: Recompiler::findPatch(JITScript *jit, void **location)
+53168: { 
+55503:     uint8* codeStart = (uint8 *)jit->code.m_code.executableAddress();
+62075:     CallSite *callSites_ = jit->callSites();
+55503:     for (uint32 i = 0; i < jit->nCallSites; i++) {
+62075:         if (callSites_[i].codeOffset + codeStart == *location) {
+53168:             PatchableAddress result;
+53168:             result.location = location;
+62075:             result.callSite = callSites_[i];
+53168:             return result;
+53168:         }
+53168:     }
+53168: 
+53168:     JS_NOT_REACHED("failed to find call site");
+53168:     return PatchableAddress();
+53168: }
+53168: 
+75864: void *
+75864: Recompiler::findCallSite(JITScript *jit, const CallSite &callSite)
+75864: {
+75864:     JS_ASSERT(callSite.inlineIndex == uint32(-1));
+75864: 
+75864:     CallSite *callSites_ = jit->callSites();
+75864:     for (uint32 i = 0; i < jit->nCallSites; i++) {
+75864:         CallSite &cs = callSites_[i];
+75864:         if (cs.inlineIndex == uint32(-1) &&
+75864:             cs.pcOffset == callSite.pcOffset && cs.id == callSite.id) {
+75864:             uint8* codeStart = (uint8 *)jit->code.m_code.executableAddress();
+75864:             return codeStart + cs.codeOffset;
+75864:         }
+75864:     }
+75864: 
+75864:     /* We have no idea where to patch up to. */
+75864:     JS_NOT_REACHED("Call site vanished.");
+75864:     return NULL;
+75864: }
+75864: 
+53168: void
+75864: Recompiler::applyPatch(JITScript *jit, PatchableAddress& toPatch)
+53168: {
+75864:     void *result = findCallSite(jit, toPatch.callSite);
+53168:     JS_ASSERT(result);
+53168:     *toPatch.location = result;
+53168: }
+53168: 
+75636: Recompiler::PatchableNative
+75636: Recompiler::stealNative(JITScript *jit, jsbytecode *pc)
+75636: {
+75636:     /*
+75636:      * There is a native IC at pc which triggered a recompilation. The recompilation
+75636:      * could have been triggered either by the native call itself, or by a SplatApplyArgs
+75636:      * preparing for the native call. Either way, we don't want to patch up the call,
+75636:      * but will instead steal the pool for the native IC so it doesn't get freed
+75636:      * with the old script, and patch up the jump at the end to point to the slow join
+75636:      * point in the new script.
+75636:      */
+75636:     unsigned i;
+75716:     ic::CallICInfo *callICs = jit->callICs();
+75636:     for (i = 0; i < jit->nCallICs; i++) {
+75864:         CallSite *call = callICs[i].call;
+75864:         if (call->inlineIndex == uint32(-1) && call->pcOffset == uint32(pc - jit->script->code))
+75636:             break;
+75636:     }
+75636:     JS_ASSERT(i < jit->nCallICs);
+75716:     ic::CallICInfo &ic = callICs[i];
+75636:     JS_ASSERT(ic.fastGuardedNative);
+75636: 
+75636:     JSC::ExecutablePool *&pool = ic.pools[ic::CallICInfo::Pool_NativeStub];
+75636: 
+75636:     if (!pool) {
+75636:         /* Already stole this stub. */
+75636:         PatchableNative native;
+75636:         native.pc = NULL;
+75640:         native.guardedNative = NULL;
+75640:         native.pool = NULL;
+75636:         return native;
+75636:     }
+75636: 
+75636:     PatchableNative native;
+75636:     native.pc = pc;
+75636:     native.guardedNative = ic.fastGuardedNative;
+75636:     native.pool = pool;
+75636:     native.nativeStart = ic.nativeStart;
+75636:     native.nativeFunGuard = ic.nativeFunGuard;
+75636:     native.nativeJump = ic.nativeJump;
+75636: 
+75636:     /*
+75636:      * Mark as stolen in case there are multiple calls on the stack. Note that if
+75636:      * recompilation fails due to low memory then this pool will leak.
+75636:      */
+75636:     pool = NULL;
+75636: 
+75636:     return native;
+75636: }
+75636: 
+75636: void
+75636: Recompiler::patchNative(JITScript *jit, PatchableNative &native)
+75636: {
+75636:     if (!native.pc)
+75636:         return;
+75636: 
+75636:     unsigned i;
+75716:     ic::CallICInfo *callICs = jit->callICs();
+75636:     for (i = 0; i < jit->nCallICs; i++) {
+75864:         CallSite *call = callICs[i].call;
+75864:         if (call->inlineIndex == uint32(-1) && call->pcOffset == uint32(native.pc - jit->script->code))
+75636:             break;
+75636:     }
+75636:     JS_ASSERT(i < jit->nCallICs);
+75716:     ic::CallICInfo &ic = callICs[i];
+75636: 
+75636:     ic.fastGuardedNative = native.guardedNative;
+75636:     ic.pools[ic::CallICInfo::Pool_NativeStub] = native.pool;
+75636:     ic.nativeStart = native.nativeStart;
+75636:     ic.nativeFunGuard = native.nativeFunGuard;
+75636:     ic.nativeJump = native.nativeJump;
+75636: 
+75636:     /* Patch the jump on object identity to go to the native stub. */
+75636:     {
+75636:         uint8 *start = (uint8 *)ic.funJump.executableAddress();
+75716:         JSC::RepatchBuffer repatch(JSC::JITCode(start - 32, 64));
+75636:         repatch.relink(ic.funJump, ic.nativeStart);
+75636:     }
+75636: 
+75636:     /* Patch the native function guard to go to the slow path. */
+75636:     {
+75636:         uint8 *start = (uint8 *)native.nativeFunGuard.executableAddress();
+75716:         JSC::RepatchBuffer repatch(JSC::JITCode(start - 32, 64));
+75636:         repatch.relink(native.nativeFunGuard, ic.slowPathStart);
+75636:     }
+75636: 
+75636:     /* Patch the native fallthrough to go to the slow join point. */
+75636:     {
+75636:         JSC::CodeLocationLabel joinPoint = ic.slowPathStart.labelAtOffset(ic.slowJoinOffset);
+75636:         uint8 *start = (uint8 *)native.nativeJump.executableAddress();
+75716:         JSC::RepatchBuffer repatch(JSC::JITCode(start - 32, 64));
+75636:         repatch.relink(native.nativeJump, joinPoint);
+75636:     }
+75636: }
+75636: 
+75864: JSStackFrame *
+75864: Recompiler::expandInlineFrameChain(JSContext *cx, JSStackFrame *outer, InlineFrame *inner)
+75864: {
+75864:     JSStackFrame *parent;
+75864:     if (inner->parent)
+75864:         parent = expandInlineFrameChain(cx, outer, inner->parent);
+75864:     else
+75864:         parent = outer;
+75864: 
+75864:     JaegerSpew(JSpew_Recompile, "Expanding inline frame, %u unsynced entries\n",
+75864:                inner->nUnsyncedEntries);
+75864: 
+75864:     /*
+75864:      * Remat any slots in the parent frame which may not be fully synced.
+75864:      * Note that we need to do this *after* fixing the slots in parent frames,
+75864:      * as the parent's own parents may need to be coherent for, e.g. copies
+75864:      * of arguments to get the correct value.
+75864:      */
+75864:     for (unsigned i = 0; i < inner->nUnsyncedEntries; i++) {
+75864:         const UnsyncedEntry &e = inner->unsyncedEntries[i];
+75864:         Value *slot = (Value *) ((uint8 *)outer + e.offset);
+75864:         if (e.copy) {
+75864:             Value *copied = (Value *) ((uint8 *)outer + e.u.copiedOffset);
+75864:             *slot = *copied;
+75864:         } else if (e.constant) {
+75864:             *slot = e.u.value;
+75864:         } else if (e.knownType) {
+75864:             slot->boxNonDoubleFrom(e.u.type, (uint64 *) slot);
+75864:         }
+75864:     }
+75864: 
+75864:     JSStackFrame *fp = (JSStackFrame *) ((uint8 *)outer + sizeof(Value) * inner->depth);
+75864:     fp->initInlineFrame(inner->fun, parent, inner->parentpc);
+75864:     uint32 pcOffset = inner->parentpc - parent->script()->code;
+75864: 
+75864:     /*
+75879:      * We should have ensured during compilation that the erased frame has JIT
+75879:      * code with rejoin points added. We don't try to compile such code on
+75879:      * demand as this can trigger recompilations and a reentrant invocation of
+75879:      * expandInlineFrames. Note that the outer frame does not need to have
+75879:      * rejoin points, as it is definitely at an inline call and rejoin points
+75879:      * are always added for such calls.
+75864:      */
+75879:     JS_ASSERT(fp->jit() && fp->jit()->rejoinPoints);
+75864: 
+75864:     PatchableAddress patch;
+75864:     patch.location = fp->addressOfNativeReturnAddress();
+75864:     patch.callSite.initialize(0, uint32(-1), pcOffset, CallSite::NCODE_RETURN_ID);
+75864:     applyPatch(parent->jit(), patch);
+75864: 
+75864:     return fp;
+75864: }
+75864: 
+75864: /*
+75864:  * Expand all inlined frames within fp per 'inlined' and update next and regs
+75864:  * to refer to the new innermost frame.
+75864:  */
+75864: void
+75864: Recompiler::expandInlineFrames(JSContext *cx, JSStackFrame *fp, mjit::CallSite *inlined,
+75864:                                JSStackFrame *next, VMFrame *f)
+75864: {
+75864:     JS_ASSERT_IF(next, next->prev() == fp && next->prevInline() == inlined);
+75864: 
+75883:     /*
+75883:      * Treat any frame expansion as a recompilation event, so that f.jit() is
+75883:      * stable if no recompilations have occurred.
+75883:      */
+75883:     cx->compartment->types.frameExpansions++;
+75883: 
+75911:     /* Patch the VMFrame's return address if it is returning at the given inline site. */
+75864:     void **frameAddr = f->returnAddressLocation();
+75911:     uint8* codeStart = (uint8 *)fp->jit()->code.m_code.executableAddress();
+75911:     bool patchFrameReturn =
+75911:         (f->scratch != NATIVE_CALL_SCRATCH_VALUE) &&
+75911:         (*frameAddr == codeStart + inlined->codeOffset);
+75864: 
+75864:     InlineFrame *inner = &fp->jit()->inlineFrames()[inlined->inlineIndex];
+75864:     jsbytecode *innerpc = inner->fun->script()->code + inlined->pcOffset;
+75864: 
+75864:     JSStackFrame *innerfp = expandInlineFrameChain(cx, fp, inner);
+75864:     JITScript *jit = innerfp->jit();
+75864: 
+75864:     if (f->regs.fp == fp) {
+75864:         JS_ASSERT(f->regs.inlined == inlined);
+75864:         f->regs.fp = innerfp;
+75864:         f->regs.pc = innerpc;
+75864:         f->regs.inlined = NULL;
+75864:     }
+75864: 
+75864:     if (patchFrameReturn) {
+75864:         PatchableAddress patch;
+75864:         patch.location = frameAddr;
+75864:         patch.callSite.initialize(0, uint32(-1), inlined->pcOffset, inlined->id);
+75864:         applyPatch(jit, patch);
+75864:     }
+75864: 
+75864:     if (next) {
+75864:         next->resetInlinePrev(innerfp, innerpc);
+75864:         void **addr = next->addressOfNativeReturnAddress();
+75868:         if (*addr != NULL && *addr != JS_FUNC_TO_DATA_PTR(void *, JaegerTrampolineReturn)) {
+75864:             PatchableAddress patch;
+75864:             patch.location = addr;
+75864:             patch.callSite.initialize(0, uint32(-1), inlined->pcOffset, CallSite::NCODE_RETURN_ID);
+75864:             applyPatch(jit, patch);
+75864:         }
+75864:     }
+75864: }
+75864: 
+75864: void
+75864: ExpandInlineFrames(JSContext *cx, bool all)
+75864: {
+75864:     if (!all) {
+75864:         VMFrame *f = cx->compartment->jaegerCompartment->activeFrame();
+75864:         if (f && f->regs.inlined && cx->fp() == f->fp())
+75864:             mjit::Recompiler::expandInlineFrames(cx, f->fp(), f->regs.inlined, NULL, f);
+75864:         return;
+75864:     }
+75864: 
+75864:     for (VMFrame *f = cx->compartment->jaegerCompartment->activeFrame();
+75864:          f != NULL;
+75864:          f = f->previous) {
+75864: 
+75864:         if (f->regs.inlined) {
+75896:             StackSegment *seg = cx->stack().containingSegment(f->fp());
+75864:             JSFrameRegs *regs = seg->getCurrentRegs();
+75864:             if (regs->fp == f->fp()) {
+75864:                 JS_ASSERT(regs == &f->regs);
+75864:                 mjit::Recompiler::expandInlineFrames(cx, f->fp(), f->regs.inlined, NULL, f);
+75864:             } else {
+75864:                 JSStackFrame *nnext = seg->computeNextFrame(f->fp());
+75864:                 mjit::Recompiler::expandInlineFrames(cx, f->fp(), f->regs.inlined, nnext, f);
+75864:             }
+75864:         }
+75864: 
+75864:         JSStackFrame *end = f->entryfp->prev();
+75864:         JSStackFrame *next = NULL;
+75864:         for (JSStackFrame *fp = f->fp(); fp != end; fp = fp->prev()) {
+75864:             mjit::CallSite *inlined;
+75864:             fp->pc(cx, next, &inlined);
+75864:             if (next && inlined) {
+75864:                 mjit::Recompiler::expandInlineFrames(cx, fp, inlined, next, f);
+75864:                 fp = next;
+75864:                 next = NULL;
+75864:             } else {
+75864:                 next = fp;
+75864:             }
+75864:         }
+75864:     }
+75864: }
+75864: 
+53391: Recompiler::Recompiler(JSContext *cx, JSScript *script)
+53391:   : cx(cx), script(script)
+53168: {    
+53168: }
+53168: 
+53168: /*
+75636:  * Recompilation can be triggered either by the debugger (turning debug mode on for
+75636:  * a script or setting/clearing a trap), or by dynamic changes in type information
+75636:  * from type inference. When recompiling we also need to change any references to
+75636:  * the old version of the script to refer to the new version of the script, including
+75636:  * references on the JS stack. Things to do:
+75636:  *
+75636:  * - Purge scripted call inline caches calling into the old script.
+75636:  *
+75636:  * - For arg/local/stack slots in frames on the stack that are now inferred
+75636:  *   as (int | double), make sure they are actually doubles. Before recompilation
+75636:  *   they may have been inferred as integers and stored to the stack as integers,
+75636:  *   but slots inferred as (int | double) are required to be definitely double.
+75636:  *
+75636:  * - For frames with an ncode return address in the original script, update
+75636:  *   to point to the corresponding return address in the new script.
+75636:  *
+75636:  * - For VMFrames with a stub call return address in the original script,
+75636:  *   update to point to the corresponding return address in the new script.
+75636:  *   This requires that the recompiled script has a superset of the stub calls
+75636:  *   in the original script. Stub calls are keyed to the function being called,
+75636:  *   so with less precise type information the call to a stub can move around
+75636:  *   (e.g. from inline to OOL path or vice versa) but can't disappear, and
+75636:  *   further operation after the stub should be consistent across compilations.
+75636:  *
+75636:  * - For VMFrames with a native call return address in a call IC in the original
+75636:  *   script (the only place where IC code makes calls), make a new stub to throw
+75636:  *   an exception or jump to the call's slow path join point.
+75636:  */
+75636: bool
+75636: Recompiler::recompile()
+75636: {
+75636:     JS_ASSERT(script->hasJITCode());
+75636: 
+75636:     JaegerSpew(JSpew_Recompile, "recompiling script (file \"%s\") (line \"%d\") (length \"%d\")\n",
+75636:                script->filename, script->lineno, script->length);
+75636: 
+75892:     types::AutoEnterTypeInference enter(cx, true);
+75892: 
+75636:     /*
+53168:      * The strategy for this goes as follows:
+53168:      * 
+53168:      * 1) Scan the stack, looking at all return addresses that could go into JIT
+53168:      *    code.
+53168:      * 2) If an address corresponds to a call site registered by |callSite| during
+53168:      *    the last compilation, remember it.
+53168:      * 3) Purge the old compiled state and return if there were no active frames of 
+53168:      *    this script on the stack.
+53168:      * 4) Fix up the stack by replacing all saved addresses with the addresses the
+53168:      *    new compiler gives us for the call sites.
+53168:      */
+55503:     Vector<PatchableAddress> normalPatches(cx);
+55503:     Vector<PatchableAddress> ctorPatches(cx);
+75636:     Vector<PatchableNative> normalNatives(cx);
+75636:     Vector<PatchableNative> ctorNatives(cx);
+53168: 
+75708:     /* Frames containing data that may need to be patched from int to double. */
+75828:     Vector<PatchableFrame> normalFrames(cx);
+75828:     Vector<PatchableFrame> ctorFrames(cx);
+56854: 
+56854:     // Find all JIT'd stack frames to account for return addresses that will
+56854:     // need to be patched after recompilation.
+56854:     for (VMFrame *f = script->compartment->jaegerCompartment->activeFrame();
+56854:          f != NULL;
+56854:          f = f->previous) {
+56854: 
+56854:         // Scan all frames owned by this VMFrame.
+57308:         JSStackFrame *end = f->entryfp->prev();
+75636:         JSStackFrame *next = NULL;
+56854:         for (JSStackFrame *fp = f->fp(); fp != end; fp = fp->prev()) {
+75864:             if (fp->script() != script) {
+75864:                 next = fp;
+75864:                 continue;
+75864:             }
+75864: 
+75708:             // Remember every frame for each type of JIT'd code.
+75828:             PatchableFrame frame;
+75828:             frame.fp = fp;
+75828:             frame.pc = fp->pc(cx, next);
+75896:             frame.scriptedCall = false;
+56854: 
+75864:             if (next) {
+75636:                 // check for a scripted call returning into the recompiled script.
+75864:                 // this misses scanning the entry fp, which cannot return directly
+75864:                 // into JIT code.
+75864:                 void **addr = next->addressOfNativeReturnAddress();
+75864: 
+75864:                 if (!*addr) {
+75864:                     // next is an interpreted frame.
+75868:                 } else if (*addr == JS_FUNC_TO_DATA_PTR(void *, JaegerTrampolineReturn)) {
+75864:                     // next entered from the interpreter.
+75864:                 } else if (fp->isConstructing()) {
+75864:                     JS_ASSERT(script->jitCtor && script->jitCtor->isValidCode(*addr));
+75892:                     frame.scriptedCall = true;
+55503:                     if (!ctorPatches.append(findPatch(script->jitCtor, addr)))
+55503:                         return false;
+75864:                 } else {
+75864:                     JS_ASSERT(script->jitNormal && script->jitNormal->isValidCode(*addr));
+75892:                     frame.scriptedCall = true;
+55503:                     if (!normalPatches.append(findPatch(script->jitNormal, addr)))
+53168:                         return false;
+53168:                 }
+75864:             }
+75636: 
+75892:             if (fp->isConstructing() && !ctorFrames.append(frame))
+75892:                 return false;
+75892:             if (!fp->isConstructing() && !normalFrames.append(frame))
+75892:                 return false;
+75892: 
+75636:             next = fp;
+53168:         }
+53168: 
+75864:         /* Check if the VMFrame returns directly into the recompiled script. */
+75864:         JSStackFrame *fp = f->fp();
+55503:         void **addr = f->returnAddressLocation();
+75864:         if (f->scratch == NATIVE_CALL_SCRATCH_VALUE) {
+75636:             // Native call.
+75864:             if (fp->script() == script && fp->isConstructing()) {
+75864:                 if (!ctorNatives.append(stealNative(script->jitCtor, fp->pc(cx, NULL))))
+75636:                     return false;
+75864:             } else if (fp->script() == script) {
+75864:                 if (!normalNatives.append(stealNative(script->jitNormal, fp->pc(cx, NULL))))
+75636:                     return false;
+75636:             }
+75743:         } else if (script->jitCtor && script->jitCtor->isValidCode(*addr)) {
+75743:             if (!ctorPatches.append(findPatch(script->jitCtor, addr)))
+75743:                 return false;
+75743:         } else if (script->jitNormal && script->jitNormal->isValidCode(*addr)) {
+75743:             if (!normalPatches.append(findPatch(script->jitNormal, addr)))
+75743:                 return false;
+53168:         }
+53391:     }
+53168: 
+57766:     Vector<CallSite> normalSites(cx);
+57766:     Vector<CallSite> ctorSites(cx);
+57766: 
+75883:     if (script->jitNormal && !cleanup(script->jitNormal, &normalSites))
+57766:         return false;
+75883:     if (script->jitCtor && !cleanup(script->jitCtor, &ctorSites))
+57766:         return false;
+57766: 
+75898:     ReleaseScriptCode(cx, script, true);
+75898:     ReleaseScriptCode(cx, script, false);
+53168: 
+75910:     /*
+75910:      * Regenerate the code if there are JIT frames on the stack, if this script
+75910:      * has inline parents and thus always needs JIT code, or if it is a newly
+75910:      * pushed frame by e.g. the interpreter. :XXX: it would be nice if we could
+75910:      * ensure that compiling a script does not then trigger its recompilation.
+75910:      */
+75910:     JSStackFrame *top = (cx->fp() && cx->fp()->isScriptFrame()) ? cx->fp() : NULL;
+75910:     bool keepNormal = !normalFrames.empty() || script->inlineParents ||
+75910:         (top && top->script() == script && !top->isConstructing());
+75910:     bool keepCtor = !ctorFrames.empty() ||
+75910:         (top && top->script() == script && top->isConstructing());
+75910: 
+75910:     if (keepNormal && !recompile(script, false,
+75910:                                  normalFrames, normalPatches, normalSites, normalNatives)) {
+75910:         return false;
+75910:     }
+75910:     if (keepCtor && !recompile(script, true,
+75910:                                ctorFrames, ctorPatches, ctorSites, ctorNatives)) {
+55503:         return false;
+57766:     }
+55503: 
+75910:     JS_ASSERT_IF(keepNormal, script->jitNormal);
+75910:     JS_ASSERT_IF(keepCtor, script->jitCtor);
+75879: 
+75883:     cx->compartment->types.recompilations++;
+75883: 
+75892:     if (!cx->compartment->types.checkPendingRecompiles(cx))
+75892:         return Compile_Error;
+75892: 
+55490:     return true;
+55503: }
+55487: 
+55503: bool
+75883: Recompiler::cleanup(JITScript *jit, Vector<CallSite> *sites)
+57766: {
+75636:     while (!JS_CLIST_IS_EMPTY(&jit->callers)) {
+75636:         JaegerSpew(JSpew_Recompile, "Purging IC caller\n");
+75636: 
+75636:         JS_STATIC_ASSERT(offsetof(ic::CallICInfo, links) == 0);
+75636:         ic::CallICInfo *ic = (ic::CallICInfo *) jit->callers.next;
+75636: 
+75636:         uint8 *start = (uint8 *)ic->funGuard.executableAddress();
+75716:         JSC::RepatchBuffer repatch(JSC::JITCode(start - 32, 64));
+75636: 
+75636:         repatch.repatch(ic->funGuard, NULL);
+75636:         repatch.relink(ic->funJump, ic->slowPathStart);
+75636:         ic->purgeGuardedObject();
+75636:     }
+75636: 
+62075:     CallSite *callSites_ = jit->callSites();
+57766:     for (uint32 i = 0; i < jit->nCallSites; i++) {
+62075:         CallSite &site = callSites_[i];
+57766:         if (site.isTrap() && !sites->append(site))
+57766:             return false;
+57766:     }
+75636: 
+57766:     return true;
+57766: }
+57766: 
+57766: bool
+75910: Recompiler::recompile(JSScript *script, bool isConstructing,
+75910:                       Vector<PatchableFrame> &frames,
+75910:                       Vector<PatchableAddress> &patches, Vector<CallSite> &sites,
+75883:                       Vector<PatchableNative> &natives)
+55503: {
+75910:     JaegerSpew(JSpew_Recompile, "On stack recompilation, %u frames, %u patches, %u natives\n",
+75910:                frames.length(), patches.length(), natives.length());
+53391: 
+75864:     CompileStatus status = Compile_Retry;
+75864:     while (status == Compile_Retry) {
+75910:         Compiler cc(cx, script, isConstructing, &frames, true);
+75864:         if (!cc.loadOldTraps(sites))
+57766:             return false;
+75864:         status = cc.compile();
+75864:     }
+75864:     if (status != Compile_Okay)
+53168:         return false;
+53168: 
+75910:     JITScript *jit = script->getJIT(isConstructing);
+75636: 
+53168:     /* Perform the earlier scanned patches */
+55503:     for (uint32 i = 0; i < patches.length(); i++)
+75864:         applyPatch(jit, patches[i]);
+75636:     for (uint32 i = 0; i < natives.length(); i++)
+75864:         patchNative(jit, natives[i]);
+53168: 
+53168:     return true;
+53168: }
+53168: 
+53170: } /* namespace mjit */
+53170: } /* namespace js */
+53168: 
+53178: #endif /* JS_METHODJIT */
+53178: 

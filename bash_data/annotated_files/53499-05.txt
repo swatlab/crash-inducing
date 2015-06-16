@@ -1,0 +1,764 @@
+52560: /* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+52560:  * vim: set ts=4 sw=4 et tw=99:
+52560:  *
+52560:  * ***** BEGIN LICENSE BLOCK *****
+52560:  * Version: MPL 1.1/GPL 2.0/LGPL 2.1
+52560:  *
+52560:  * The contents of this file are subject to the Mozilla Public License Version
+52560:  * 1.1 (the "License"); you may not use this file except in compliance with
+52560:  * the License. You may obtain a copy of the License at
+52560:  * http://www.mozilla.org/MPL/
+52560:  *
+52560:  * Software distributed under the License is distributed on an "AS IS" basis,
+52560:  * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+52560:  * for the specific language governing rights and limitations under the
+52560:  * License.
+52560:  *
+52560:  * The Original Code is Mozilla SpiderMonkey JavaScript 1.9 code, released
+52560:  * May 28, 2008.
+52560:  *
+52560:  * The Initial Developer of the Original Code is
+52560:  *   Brendan Eich <brendan@mozilla.org>
+52560:  *
+52560:  * Contributor(s):
+52560:  *   David Anderson <danderson@mozilla.com>
+52560:  *
+52560:  * Alternatively, the contents of this file may be used under the terms of
+52560:  * either of the GNU General Public License Version 2 or later (the "GPL"),
+52560:  * or the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+52560:  * in which case the provisions of the GPL or the LGPL are applicable instead
+52560:  * of those above. If you wish to allow use of your version of this file only
+52560:  * under the terms of either the GPL or the LGPL, and not to allow others to
+52560:  * use your version of this file under the terms of the MPL, indicate your
+52560:  * decision by deleting the provisions above and replace them with the notice
+52560:  * and other provisions required by the GPL or the LGPL. If you do not delete
+52560:  * the provisions above, a recipient may use your version of this file under
+52560:  * the terms of any one of the MPL, the GPL or the LGPL.
+52560:  *
+52560:  * ***** END LICENSE BLOCK ***** */
+52560: 
+52560: #if !defined jsjaeger_framestate_h__ && defined JS_METHODJIT
+52560: #define jsjaeger_framestate_h__
+52560: 
+52560: #include "jsapi.h"
+52606: #include "methodjit/MachineRegs.h"
+52617: #include "methodjit/FrameEntry.h"
+52617: #include "CodeGenIncludes.h"
+52839: #include "ImmutableSync.h"
+52560: 
+52560: namespace js {
+52560: namespace mjit {
+52560: 
+52880: struct StateRemat {
+52880:     typedef JSC::MacroAssembler::RegisterID RegisterID;
+52880:     union {
+52884:         RegisterID reg : 31;
+52880:         uint32 offset  : 31;
+52880:     };
+52880:     bool inReg : 1;
+52880: };
+52880: 
+53087: struct Uses {
+53088:     explicit Uses(uint32 nuses)
+53087:       : nuses(nuses)
+53087:     { }
+53087:     uint32 nuses;
+53087: };
+53087: 
+53088: struct Changes {
+53088:     explicit Changes(uint32 nchanges)
+53088:       : nchanges(nchanges)
+53088:     { }
+53088:     uint32 nchanges;
+53088: };
+53088: 
+53152: class MaybeRegisterID {
+53152:     typedef JSC::MacroAssembler::RegisterID RegisterID;
+53152: 
+53152:   public:
+53152:     MaybeRegisterID()
+53152:       : reg_(Registers::ReturnReg), set(false)
+53152:     { }
+53152: 
+53152:     MaybeRegisterID(RegisterID reg)
+53152:       : reg_(reg), set(true)
+53152:     { }
+53152: 
+53152:     inline RegisterID reg() const { JS_ASSERT(set); return reg_; }
+53152:     inline void setReg(const RegisterID r) { reg_ = r; set = true; }
+53152:     inline bool isSet() const { return set; }
+53152: 
+53152:     MaybeRegisterID & operator =(const MaybeRegisterID &other) {
+53152:         set = other.set;
+53152:         reg_ = other.reg_;
+53152:         return *this;
+53152:     }
+53152: 
+53152:     MaybeRegisterID & operator =(RegisterID r) {
+53152:         setReg(r);
+53152:         return *this;
+53152:     }
+53152: 
+53152:   private:
+53152:     RegisterID reg_;
+53152:     bool set;
+53152: };
+53152: 
+52617: /*
+52617:  * The FrameState keeps track of values on the frame during compilation.
+52618:  * The compiler can query FrameState for information about arguments, locals,
+52618:  * and stack slots (all hereby referred to as "slots"). Slot information can
+52618:  * be requested in constant time. For each slot there is a FrameEntry *. If
+52618:  * this is non-NULL, it contains valid information and can be returned.
+52618:  *
+52620:  * The register allocator keeps track of registers as being in one of two
+52620:  * states. These are:
+52620:  *
+52620:  * 1) Unowned. Some code in the compiler is working on a register.
+52620:  * 2) Owned. The FrameState owns the register, and may spill it at any time.
+52620:  *
+52620:  * ------------------ Implementation Details ------------------
+52620:  * 
+52617:  * Observations:
+52617:  *
+52617:  * 1) We totally blow away known information quite often; branches, merge points.
+52618:  * 2) Every time we need a slow call, we must sync everything.
+52617:  * 3) Efficient side-exits need to quickly deltize state snapshots.
+52617:  * 4) Syncing is limited to constants and registers.
+52617:  * 5) Once a value is tracked, there is no reason to "forget" it until #1.
+52617:  * 
+52617:  * With these in mind, we want to make sure that the compiler doesn't degrade
+52617:  * badly as functions get larger.
+52617:  *
+52617:  * If the FE is NULL, a new one is allocated, initialized, and stored. They
+52617:  * are allocated from a pool such that (fe - pool) can be used to compute
+52617:  * the slot's Address.
+52617:  *
+52617:  * We keep a side vector of all tracked FrameEntry * to quickly generate
+52617:  * memory stores and clear the tracker.
+52617:  *
+52617:  * It is still possible to get really bad behavior with a very large script
+52617:  * that doesn't have branches or calls. That's okay, having this code in
+52617:  * minimizes damage and lets us introduce a hard cut-off point.
+52617:  */
+52560: class FrameState
+52560: {
+52839:     friend class ImmutableSync;
+52839: 
+52560:     typedef JSC::MacroAssembler::RegisterID RegisterID;
+52851:     typedef JSC::MacroAssembler::FPRegisterID FPRegisterID;
+52560:     typedef JSC::MacroAssembler::Address Address;
+52623:     typedef JSC::MacroAssembler::Jump Jump;
+52611:     typedef JSC::MacroAssembler::Imm32 Imm32;
+52617: 
+52691:     static const uint32 InvalidIndex = 0xFFFFFFFF;
+52691: 
+52617:     struct Tracker {
+52617:         Tracker()
+52617:           : entries(NULL), nentries(0)
+52617:         { }
+52617: 
+52705:         void add(FrameEntry *fe) {
+52705:             entries[nentries++] = fe;
+52617:         }
+52617: 
+52617:         void reset() {
+52617:             nentries = 0;
+52617:         }
+52617: 
+52705:         FrameEntry * operator [](uint32 n) const {
+52708:             JS_ASSERT(n < nentries);
+52617:             return entries[n];
+52617:         }
+52617: 
+52705:         FrameEntry **entries;
+52617:         uint32 nentries;
+52617:     };
+52617: 
+52617:     struct RegisterState {
+52617:         RegisterState()
+52617:         { }
+52617: 
+53002:         RegisterState(FrameEntry *fe, RematInfo::RematType type)
+53002:           : fe(fe), type(type)
+52617:         { }
+52617: 
+52617:         /* FrameEntry owning this register, or NULL if not owned by a frame. */
+52617:         FrameEntry *fe;
+52617: 
+52685:         /* Hack - simplifies register allocation for pairs. */
+52685:         FrameEntry *save;
+52685:         
+52617:         /* Part of the FrameEntry that owns the FE. */
+52617:         RematInfo::RematType type;
+52617:     };
+52560: 
+52560:   public:
+52617:     FrameState(JSContext *cx, JSScript *script, Assembler &masm);
+52560:     ~FrameState();
+52560:     bool init(uint32 nargs);
+52560: 
+52617:     /*
+52617:      * Pushes a synced slot.
+52617:      */
+52618:     inline void pushSynced();
+52617: 
+52617:     /*
+52617:      * Pushes a slot that has a known, synced type and payload.
+52617:      */
+53025:     inline void pushSyncedType(JSValueType type);
+52617: 
+52617:     /*
+52719:      * Pushes a slot that has a known, synced type and payload.
+52719:      */
+53025:     inline void pushSynced(JSValueType type, RegisterID reg);
+52719: 
+52719:     /*
+52617:      * Pushes a constant value.
+52617:      */
+52618:     inline void push(const Value &v);
+52617: 
+52617:     /*
+52617:      * Loads a value from memory and pushes it.
+52617:      */
+52618:     inline void push(Address address);
+52617: 
+52617:     /*
+52617:      * Pushes a known type and allocated payload onto the operation stack.
+52617:      */
+53025:     inline void pushTypedPayload(JSValueType type, RegisterID payload);
+52617: 
+52617:     /*
+52831:      * Pushes a type register and data register pair.
+52831:      */
+52831:     inline void pushRegs(RegisterID type, RegisterID data);
+52831: 
+52831:     /*
+52623:      * Pushes a known type and allocated payload onto the operation stack.
+52623:      * This must be used when the type is known, but cannot be propagated
+52623:      * because it is not known to be correct at a slow-path merge point.
+52960:      *
+52960:      * The caller guarantees that the tag was a fast-path check; that is,
+52960:      * the value it replaces on the stack had the same tag if the fast-path
+52960:      * was taken.
+52623:      */
+53181:     inline void pushUntypedPayload(JSValueType type, RegisterID payload);
+52623: 
+52623:     /*
+53153:      * Pushes a number onto the operation stack.
+53181:      *
+53181:      * If asInt32 is set to true, then the FS will attempt to optimize
+53181:      * syncing the type as int32. Only use this parameter when the fast-path
+53181:      * guaranteed that the stack slot was guarded to be an int32 originally.
+53181:      *
+53181:      * For example, checking LHS and RHS as ints guarantees that if the LHS
+53181:      * was synced, then popping both and pushing a maybe-int32 does not need
+53181:      * to be synced.
+53153:      */
+53181:     inline void pushNumber(MaybeRegisterID payload, bool asInt32 = false);
+53153: 
+53153:     /*
+53200:      * Pushes an int32 onto the operation stack. This is a specialized version
+53200:      * of pushNumber. The caller must guarantee that (a) an int32 is to be 
+53200:      * pushed on the inline path, and (b) if any slow path pushes a double,
+53200:      * the slow path also stores the double to memory.
+53200:      */
+53200:     inline void pushInt32(RegisterID payload);
+53200: 
+53200:     /*
+52617:      * Pops a value off the operation stack, freeing any of its resources.
+52617:      */
+52618:     inline void pop();
+52617: 
+52617:     /*
+52617:      * Pops a number of values off the operation stack, freeing any of their
+52617:      * resources.
+52617:      */
+52618:     inline void popn(uint32 n);
+52617: 
+52617:     /*
+53115:      * Returns true iff lhs and rhs are copies of the same FrameEntry.
+53115:      */
+53115:     inline bool haveSameBacking(FrameEntry *lhs, FrameEntry *rhs);
+53115: 
+53115:     /*
+52785:      * Temporarily increase and decrease local variable depth.
+52785:      */
+52785:     inline void enterBlock(uint32 n);
+52785:     inline void leaveBlock(uint32 n);
+52785: 
+52785:     /*
+52670:      * Pushes a copy of a local variable.
+52670:      */
+52670:     void pushLocal(uint32 n);
+52670: 
+52670:     /*
+52623:      * Allocates a temporary register for a FrameEntry's type. The register
+52623:      * can be spilled or clobbered by the frame. The compiler may only operate
+52623:      * on it temporarily, and must take care not to clobber it.
+52617:      */
+52618:     inline RegisterID tempRegForType(FrameEntry *fe);
+52617: 
+52617:     /*
+53137:      * Try to use a register already allocated for fe's type, but if one
+53137:      * is not already available, use fallback.
+53137:      *
+53137:      * Note: this does NOT change fe's type-register remat info. It's supposed
+53137:      * to be a super lightweight/transparent operation.
+53137:      */
+53137:     inline RegisterID tempRegForType(FrameEntry *fe, RegisterID fallback);
+53137: 
+53137:     /*
+52623:      * Returns a register that is guaranteed to contain the frame entry's
+52898:      * data payload. The compiler may not modify the contents of the register.
+52898:      * The compiler should NOT explicitly free it.
+52620:      */
+52620:     inline RegisterID tempRegForData(FrameEntry *fe);
+52620: 
+52620:     /*
+52685:      * Same as above, except register must match identically.
+52685:      */
+53156:     inline RegisterID tempRegInMaskForData(FrameEntry *fe, uint32 mask);
+52685: 
+52685:     /*
+53228:      * Same as above, except loads into reg (using masm) if the entry does not
+53228:      * already have a register, and does not change the frame state in doing so.
+53228:      */
+53228:     inline RegisterID tempRegForData(FrameEntry *fe, RegisterID reg, Assembler &masm) const;
+53228: 
+53228:     /*
+52962:      * Forcibly loads the type tag for the specified FrameEntry
+52962:      * into a register already marked as owning the type.
+52962:      */
+52962:     inline void emitLoadTypeTag(FrameEntry *fe, RegisterID reg) const;
+52962:     inline void emitLoadTypeTag(Assembler &masm, FrameEntry *fe, RegisterID reg) const;
+52962: 
+52962:     /*
+52962:      * Convert an integer to a double without applying
+52962:      * additional Register pressure.
+52962:      */
+52962:     inline void convertInt32ToDouble(Assembler &masm, FrameEntry *fe,
+52962:                                      FPRegisterID fpreg) const;
+52962: 
+52962:     /*
+52962:      * Dive into a FrameEntry and check whether it's in a register.
+52962:      */
+52962:     inline bool peekTypeInRegister(FrameEntry *fe) const;
+52962: 
+52962:     /*
+52620:      * Allocates a register for a FrameEntry's data, such that the compiler
+52623:      * can modify it in-place.
+52623:      *
+52623:      * The caller guarantees the FrameEntry will not be observed again. This
+52623:      * allows the compiler to avoid spilling. Only call this if the FE is
+52623:      * going to be popped before stubcc joins/guards or the end of the current
+52623:      * opcode.
+52620:      */
+52623:     RegisterID ownRegForData(FrameEntry *fe);
+52623: 
+52623:     /*
+52831:      * Allocates a register for a FrameEntry's type, such that the compiler
+52831:      * can modify it in-place.
+52831:      *
+52831:      * The caller guarantees the FrameEntry will not be observed again. This
+52831:      * allows the compiler to avoid spilling. Only call this if the FE is
+52831:      * going to be popped before stubcc joins/guards or the end of the current
+52831:      * opcode.
+52831:      */
+52831:     RegisterID ownRegForType(FrameEntry *fe);
+52831: 
+52831:     /*
+52623:      * Allocates a register for a FrameEntry's data, such that the compiler
+52623:      * can modify it in-place. The actual FE is not modified.
+52623:      */
+52846:     RegisterID copyDataIntoReg(FrameEntry *fe);
+53156:     void copyDataIntoReg(FrameEntry *fe, RegisterID exact);
+52962:     RegisterID copyDataIntoReg(Assembler &masm, FrameEntry *fe);
+52962: 
+52962:     /*
+52962:      * Allocates a FPRegister for a FrameEntry, such that the compiler
+52962:      * can modify it in-place. The FrameState is not modified.
+52962:      */
+52962:     FPRegisterID copyEntryIntoFPReg(FrameEntry *fe, FPRegisterID fpreg);
+52962:     FPRegisterID copyEntryIntoFPReg(Assembler &masm, FrameEntry *fe,
+52962:                                     FPRegisterID fpreg);
+52623: 
+52623:     /*
+52906:      * Allocates a register for a FrameEntry's type, such that the compiler
+52906:      * can modify it in-place. The actual FE is not modified.
+52906:      */
+52906:     RegisterID copyTypeIntoReg(FrameEntry *fe);
+52906: 
+52906:     /*
+53032:      * Returns a register that contains the constant Int32 value of the
+53031:      * frame entry's data payload.
+53031:      * Since the register is not bound to a FrameEntry,
+53031:      * it MUST be explicitly freed with freeReg().
+53031:      */
+53032:     RegisterID copyInt32ConstantIntoReg(FrameEntry *fe);
+53032:     RegisterID copyInt32ConstantIntoReg(Assembler &masm, FrameEntry *fe);
+53031: 
+53152:     struct BinaryAlloc {
+53152:         MaybeRegisterID lhsType;
+53152:         MaybeRegisterID lhsData;
+53152:         MaybeRegisterID rhsType;
+53152:         MaybeRegisterID rhsData;
+53152:         MaybeRegisterID extraFree;
+53152:         RegisterID result;  // mutable result reg
+53152:         bool resultHasRhs;  // whether the result has the RHS instead of the LHS
+53152:         bool lhsNeedsRemat; // whether LHS needs memory remat
+53152:         bool rhsNeedsRemat; // whether RHS needs memory remat
+53152:     };
+53152: 
+53152:     /*
+53152:      * Ensures that the two given FrameEntries have registers for both their
+53152:      * type and data. The register allocations are returned in a struct.
+53152:      *
+53152:      * One mutable register is allocated as well, holding the LHS payload. If
+53152:      * this would cause a spill that could be avoided by using a mutable RHS,
+53152:      * and the operation is commutative, then the resultHasRhs is set to true.
+53152:      */
+53201:     void allocForBinary(FrameEntry *lhs, FrameEntry *rhs, JSOp op, BinaryAlloc &alloc,
+53201:                         bool resultNeeded = true);
+53152: 
+53152:     /*
+53152:      * Similar to allocForBinary, except works when the LHS and RHS have the
+53152:      * same backing FE. Only a reduced subset of BinaryAlloc is used:
+53152:      *   lhsType
+53152:      *   lhsData
+53152:      *   result
+53152:      *   lhsNeedsRemat
+53152:      */
+53152:     void allocForSameBinary(FrameEntry *fe, JSOp op, BinaryAlloc &alloc);
+53152: 
+53152:     /* Loads an FE into an fp reg. */
+53152:     inline void loadDouble(FrameEntry *fe, FPRegisterID fpReg, Assembler &masm) const;
+53152: 
+53031:     /*
+53229:      * Slightly more specialized version when more precise register
+53229:      * information is known.
+53229:      */
+53229:     inline void loadDouble(RegisterID type, RegisterID data, FrameEntry *fe, FPRegisterID fpReg,
+53229:                            Assembler &masm) const;
+53229: 
+53229:     /*
+52623:      * Types don't always have to be in registers, sometimes the compiler
+52623:      * can use addresses and avoid spilling. If this FrameEntry has a synced
+52623:      * address and no register, this returns true.
+52623:      */
+52623:     inline bool shouldAvoidTypeRemat(FrameEntry *fe);
+52620: 
+52620:     /*
+52620:      * Payloads don't always have to be in registers, sometimes the compiler
+52620:      * can use addresses and avoid spilling. If this FrameEntry has a synced
+52620:      * address and no register, this returns true.
+52620:      */
+52620:     inline bool shouldAvoidDataRemat(FrameEntry *fe);
+52620: 
+52620:     /*
+52617:      * Frees a temporary register. If this register is being tracked, then it
+52617:      * is not spilled; the backing data becomes invalidated!
+52617:      */
+52618:     inline void freeReg(RegisterID reg);
+52617: 
+52617:     /*
+52617:      * Allocates a register. If none are free, one may be spilled from the
+52617:      * tracker. If there are none available for spilling in the tracker,
+52617:      * then this is considered a compiler bug and an assert will fire.
+52617:      */
+52618:     inline RegisterID allocReg();
+52617: 
+52617:     /*
+52653:      * Allocates a register, except using a mask.
+52653:      */
+52653:     inline RegisterID allocReg(uint32 mask);
+52653: 
+52653:     /*
+52652:      * Allocates a specific register, evicting it if it's not avaliable.
+52652:      */
+52652:     void takeReg(RegisterID reg);
+52652: 
+52652:     /*
+52617:      * Returns a FrameEntry * for a slot on the operation stack.
+52617:      */
+52618:     inline FrameEntry *peek(int32 depth);
+52617: 
+52617:     /*
+52617:      * Fully stores a FrameEntry at an arbitrary address. popHint specifies
+52617:      * how hard the register allocator should try to keep the FE in registers.
+52617:      */
+52617:     void storeTo(FrameEntry *fe, Address address, bool popHint);
+52617: 
+52617:     /*
+52691:      * Stores the top stack slot back to a local variable.
+52670:      */
+52961:     void storeLocal(uint32 n, bool popGuaranteed = false, bool typeChange = true);
+52670: 
+52670:     /*
+52620:      * Restores state from a slow path.
+52620:      */
+53088:     void merge(Assembler &masm, Changes changes) const;
+52620: 
+52620:     /*
+52619:      * Writes unsynced stores to an arbitrary buffer.
+52619:      */
+53088:     void sync(Assembler &masm, Uses uses) const;
+52619: 
+52619:     /*
+52617:      * Syncs all outstanding stores to memory and possibly kills regs in the
+52617:      * process.
+52617:      */
+53087:     void syncAndKill(Registers kill, Uses uses); 
+52617: 
+52617:     /*
+53087:      * Reset the register state.
+52878:      */
+53087:     void resetRegState();
+52878: 
+52878:     /*
+52617:      * Clear all tracker entries, syncing all outstanding stores in the process.
+52617:      * The stack depth is in case some merge points' edges did not immediately
+52617:      * precede the current instruction.
+52617:      */
+52618:     inline void forgetEverything(uint32 newStackDepth);
+52617: 
+52617:     /*
+52617:      * Same as above, except the stack depth is not changed. This is used for
+52617:      * branching opcodes.
+52617:      */
+52617:     void forgetEverything();
+52617: 
+52617:     /*
+52847:      * Throw away the entire frame state, without syncing anything.
+52847:      */
+52847:     void throwaway();
+52847: 
+52847:     /*
+52619:      * Mark an existing slot with a type.
+52619:      */
+53025:     inline void learnType(FrameEntry *fe, JSValueType type);
+52619: 
+52619:     /*
+52804:      * Forget a type, syncing in the process.
+52804:      */
+52804:     inline void forgetType(FrameEntry *fe);
+52804: 
+52804:     /*
+53004:      * Helper function. Tests if a slot's type is null. Condition should
+53004:      * be Equal or NotEqual.
+53004:      */
+53004:     inline Jump testNull(Assembler::Condition cond, FrameEntry *fe);
+53004: 
+53004:     /*
+52623:      * Helper function. Tests if a slot's type is an integer. Condition should
+52623:      * be Equal or NotEqual.
+52623:      */
+52623:     inline Jump testInt32(Assembler::Condition cond, FrameEntry *fe);
+52623: 
+52623:     /*
+52823:      * Helper function. Tests if a slot's type is a double. Condition should
+52823:      * be Equal or Not Equal.
+52823:      */
+52823:     inline Jump testDouble(Assembler::Condition cond, FrameEntry *fe);
+52823: 
+52823:     /*
+53137:      * Helper function. Tests if a slot's type is a boolean. Condition should
+52734:      * be Equal or NotEqual.
+52734:      */
+52734:     inline Jump testBoolean(Assembler::Condition cond, FrameEntry *fe);
+52734: 
+52734:     /*
+53137:      * Helper function. Tests if a slot's type is a string. Condition should
+53137:      * be Equal or NotEqual.
+53137:      */
+53137:     inline Jump testString(Assembler::Condition cond, FrameEntry *fe);
+53137: 
+53137:     /*
+52838:      * Helper function. Tests if a slot's type is a non-funobj. Condition should
+52838:      * be Equal or NotEqual.
+52838:      */
+53023:     inline Jump testObject(Assembler::Condition cond, FrameEntry *fe);
+52850: 
+52850:     /*
+52894:      * Helper function. Tests if a slot's type is primitve. Condition should
+52894:      * be Equal or NotEqual.
+52894:      */
+52894:     inline Jump testPrimitive(Assembler::Condition cond, FrameEntry *fe);
+52894: 
+52894:     /*
+52685:      * Marks a register such that it cannot be spilled by the register
+52685:      * allocator. Any pinned registers must be unpinned at the end of the op.
+52685:      * Note: This function should only be used on registers tied to FEs.
+52685:      */
+52685:     inline void pinReg(RegisterID reg);
+52685: 
+52685:     /*
+52685:      * Unpins a previously pinned register.
+52685:      */
+52685:     inline void unpinReg(RegisterID reg);
+52685: 
+52685:     /*
+52714:      * Dups the top item on the stack.
+52714:      */
+52714:     inline void dup();
+52714: 
+52714:     /*
+52715:      * Dups the top 2 items on the stack.
+52715:      */
+52715:     inline void dup2();
+52715: 
+52715:     /*
+52916:      * Dups an item n-deep in the stack. n must be < 0
+52916:      */
+52916:     inline void dupAt(int32 n);
+52916: 
+52916:     /*
+53052:      * If the frameentry is a copy, give it its own registers.
+53052:      * This may only be called on the topmost fe.
+53052:      */
+53052:     inline void giveOwnRegs(FrameEntry *fe);
+53052: 
+53052:     /*
+52617:      * Returns the current stack depth of the frame.
+52617:      */
+52617:     uint32 stackDepth() const { return sp - spBase; }
+52686:     uint32 frameDepth() const { return stackDepth() + script->nfixed; }
+52705:     inline FrameEntry *tosFe() const;
+52617: 
+52617: #ifdef DEBUG
+52617:     void assertValidRegisterState() const;
+52617: #endif
+52617: 
+52620:     Address addressOf(const FrameEntry *fe) const;
+53497:     Address addressForDataRemat(const FrameEntry *fe) const;
+52620: 
+52880:     inline StateRemat dataRematInfo(const FrameEntry *fe) const;
+52880: 
+52838:     /*
+52838:      * This is similar to freeReg(ownRegForData(fe)) - except no movement takes place.
+52838:      * The fe is simply invalidated as if it were popped. This can be used to free
+52838:      * registers in the working area of the stack. Obviously, this can only be called
+52838:      * in infallible code that will pop these entries soon after.
+52838:      */
+52838:     inline void eviscerate(FrameEntry *fe);
+52838: 
+52838:     /*
+52838:      * Moves the top of the stack down N slots, popping each item above it.
+52838:      * Caller guarantees the slots below have been observed and eviscerated.
+52838:      */
+52838:     void shimmy(uint32 n);
+52838: 
+52896:     /*
+52896:      * Stores the top item on the stack to a stack slot, count down from the
+52896:      * current stack depth. For example, to move the top (-1) to -3, you would
+52896:      * call shift(-2).
+52896:      */
+52896:     void shift(int32 n);
+52896: 
+53499:     /*
+53499:      * Notifies the frame of a slot that can escape. Returns whether or not
+53499:      * the slot was added.
+53499:      */
+53499:     inline bool addEscaping(uint32 local);
+52878: 
+53113:     inline void setInTryBlock(bool inTryBlock) {
+53113:         this->inTryBlock = inTryBlock;
+53113:     }
+53113: 
+52617:   private:
+53002:     inline RegisterID allocReg(FrameEntry *fe, RematInfo::RematType type);
+52972:     inline void forgetReg(RegisterID reg);
+52846:     RegisterID evictSomeReg(uint32 mask);
+52652:     void evictReg(RegisterID reg);
+52618:     inline FrameEntry *rawPush();
+52618:     inline FrameEntry *addToTracker(uint32 index);
+52670:     inline void syncType(const FrameEntry *fe, Address to, Assembler &masm) const;
+52670:     inline void syncData(const FrameEntry *fe, Address to, Assembler &masm) const;
+52670:     inline FrameEntry *getLocal(uint32 slot);
+52846:     inline void forgetAllRegs(FrameEntry *fe);
+52708:     inline void swapInTracker(FrameEntry *lhs, FrameEntry *rhs);
+52714:     inline uint32 localIndex(uint32 n);
+52714:     void pushCopyOf(uint32 index);
+53113:     void syncFancy(Assembler &masm, Registers avail, uint32 resumeAt,
+53113:                    FrameEntry *bottom) const;
+53229:     inline bool tryFastDoubleLoad(FrameEntry *fe, FPRegisterID fpReg, Assembler &masm) const;
+52691: 
+52691:     /*
+52691:      * "Uncopies" the backing store of a FrameEntry that has been copied. The
+52691:      * original FrameEntry is not invalidated; this is the responsibility of
+52691:      * the caller. The caller can check isCopied() to see if the registers
+52691:      * were moved to a copy.
+53243:      *
+53243:      * Later addition: uncopy() returns the first copy found.
+52691:      */
+53243:     FrameEntry *uncopy(FrameEntry *original);
+52617: 
+52670:     FrameEntry *entryFor(uint32 index) const {
+52670:         JS_ASSERT(base[index]);
+52670:         return &entries[index];
+52670:     }
+52670: 
+52670:     void moveOwnership(RegisterID reg, FrameEntry *newFe) {
+52664:         regstate[reg].fe = newFe;
+52664:     }
+52664: 
+52846:     RegisterID evictSomeReg() {
+52846:         return evictSomeReg(Registers::AvailRegs);
+52653:     }
+52653: 
+52617:     uint32 indexOf(int32 depth) {
+52617:         return uint32((sp + depth) - base);
+52560:     }
+52560: 
+52691:     uint32 indexOfFe(FrameEntry *fe) {
+52691:         return uint32(fe - entries);
+52691:     }
+52691: 
+52560:   private:
+52560:     JSContext *cx;
+52560:     JSScript *script;
+52617:     uint32 nargs;
+52608:     Assembler &masm;
+52611: 
+52617:     /* All allocated registers. */
+52617:     Registers freeRegs;
+52617: 
+52617:     /* Cache of FrameEntry objects. */
+52617:     FrameEntry *entries;
+52617: 
+52617:     /* Base pointer of the FrameEntry vector. */
+52617:     FrameEntry **base;
+52617: 
+52617:     /* Base pointer for arguments. */
+52617:     FrameEntry **args;
+52617: 
+52617:     /* Base pointer for local variables. */
+52617:     FrameEntry **locals;
+52617: 
+52617:     /* Base pointer for the stack. */
+52617:     FrameEntry **spBase;
+52617: 
+52617:     /* Dynamic stack pointer. */
+52617:     FrameEntry **sp;
+52617: 
+52617:     /* Vector of tracked slot indexes. */
+52617:     Tracker tracker;
+52617: 
+52617:     /*
+52617:      * Register ownership state. This can't be used alone; to find whether an
+52617:      * entry is active, you must check the allocated registers.
+52617:      */
+52617:     RegisterState regstate[Assembler::TotalRegisters];
+52839: 
+52839:     mutable ImmutableSync reifier;
+52878: 
+52878:     uint32 *escaping;
+52878:     bool eval;
+53113:     bool inTryBlock;
+52560: };
+52560: 
+52560: } /* namespace mjit */
+52560: } /* namespace js */
+52560: 
+52560: #endif /* jsjaeger_framestate_h__ */
+52560: 

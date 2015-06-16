@@ -1,0 +1,839 @@
+35740: /* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+35740:  * vim: sw=4 ts=4 et :
+35740:  * ***** BEGIN LICENSE BLOCK *****
+35740:  * Version: MPL 1.1/GPL 2.0/LGPL 2.1
+35740:  *
+35740:  * The contents of this file are subject to the Mozilla Public License Version
+35740:  * 1.1 (the "License"); you may not use this file except in compliance with
+35740:  * the License. You may obtain a copy of the License at
+35740:  * http://www.mozilla.org/MPL/
+35740:  *
+35740:  * Software distributed under the License is distributed on an "AS IS" basis,
+35740:  * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+35740:  * for the specific language governing rights and limitations under the
+35740:  * License.
+35740:  *
+35740:  * The Original Code is Mozilla Plugin App.
+35740:  *
+35740:  * The Initial Developer of the Original Code is
+35740:  *   Chris Jones <jones.chris.g@gmail.com>
+35740:  * Portions created by the Initial Developer are Copyright (C) 2009
+35740:  * the Initial Developer. All Rights Reserved.
+35740:  *
+35740:  * Contributor(s):
+35740:  *
+35740:  * Alternatively, the contents of this file may be used under the terms of
+35740:  * either the GNU General Public License Version 2 or later (the "GPL"), or
+35740:  * the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+35740:  * in which case the provisions of the GPL or the LGPL are applicable instead
+35740:  * of those above. If you wish to allow use of your version of this file only
+35740:  * under the terms of either the GPL or the LGPL, and not to allow others to
+35740:  * use your version of this file under the terms of the MPL, indicate your
+35740:  * decision by deleting the provisions above and replace them with the notice
+35740:  * and other provisions required by the GPL or the LGPL. If you do not delete
+35740:  * the provisions above, a recipient may use your version of this file under
+35740:  * the terms of any one of the MPL, the GPL or the LGPL.
+35740:  *
+35740:  * ***** END LICENSE BLOCK ***** */
+35740: 
+38121: #include "base/process_util.h"
+38121: 
+38121: #include "mozilla/ipc/SyncChannel.h"
+35893: #include "mozilla/plugins/PluginModuleParent.h"
+35895: #include "mozilla/plugins/BrowserStreamParent.h"
+35746: 
+38121: #include "nsContentUtils.h"
+37384: #include "nsCRT.h"
+35913: #include "nsNPAPIPlugin.h"
+35913: 
+38121: using base::KillProcess;
+38121: 
+36010: using mozilla::PluginLibrary;
+35913: using mozilla::ipc::NPRemoteIdentifier;
+38121: using mozilla::ipc::SyncChannel;
+35913: 
+35913: using namespace mozilla::plugins;
+35913: 
+38121: static const char kTimeoutPref[] = "dom.ipc.plugins.timeoutSecs";
+38121: 
+35913: PR_STATIC_ASSERT(sizeof(NPIdentifier) == sizeof(void*));
+35890: 
+38121: template<>
+38121: struct RunnableMethodTraits<mozilla::plugins::PluginModuleParent>
+38121: {
+38121:     typedef mozilla::plugins::PluginModuleParent Class;
+38121:     static void RetainCallee(Class* obj) { }
+38121:     static void ReleaseCallee(Class* obj) { }
+38121: };
+38121: 
+38026: class PluginCrashed : public nsRunnable
+38026: {
+38026: public:
+38026:     PluginCrashed(nsNPAPIPlugin* plugin,
+38026:                   const nsString& dumpID)
+38026:         : mDumpID(dumpID),
+38026:           mPlugin(plugin) { }
+38026: 
+38026:     NS_IMETHOD Run() {
+38026:         mPlugin->PluginCrashed(mDumpID);
+38026:         return NS_OK;
+38026:     }
+38026: 
+38026: private:
+38026:     nsNPAPIPlugin* mPlugin;
+38026:     nsString mDumpID;
+38026: };
+38026: 
+36063: // static
+36010: PluginLibrary*
+36010: PluginModuleParent::LoadModule(const char* aFilePath)
+35740: {
+37099:     PLUGIN_LOG_DEBUG_FUNCTION;
+35740: 
+35740:     // Block on the child process being launched and initialized.
+35893:     PluginModuleParent* parent = new PluginModuleParent(aFilePath);
+36063:     parent->mSubprocess->Launch();
+36063:     parent->Open(parent->mSubprocess->GetChannel(),
+36063:                  parent->mSubprocess->GetChildProcessHandle());
+35740: 
+38121:     TimeoutChanged(kTimeoutPref, parent);
+38121: 
+36010:     return parent;
+35740: }
+35740: 
+35740: 
+36063: PluginModuleParent::PluginModuleParent(const char* aFilePath)
+36145:     : mSubprocess(new PluginProcessParent(aFilePath))
+36145:     , mShutdown(false)
+36145:     , mNPNIface(NULL)
+36304:     , mPlugin(NULL)
+37384:     , mProcessStartTime(time(NULL))
+35740: {
+36063:     NS_ASSERTION(mSubprocess, "Out of memory!");
+36063: 
+36145:     if (!mValidIdentifiers.Init()) {
+36145:         NS_ERROR("Out of memory");
+36145:     }
+38121: 
+38121:     nsContentUtils::RegisterPrefCallback(kTimeoutPref, TimeoutChanged, this);
+35740: }
+35740: 
+35893: PluginModuleParent::~PluginModuleParent()
+35740: {
+36145:     if (!mShutdown) {
+36145:         NS_WARNING("Plugin host deleted the module without shutting down.");
+36145:         NPError err;
+36145:         NP_Shutdown(&err);
+36145:     }
+36145:     NS_ASSERTION(mShutdown, "NP_Shutdown didn't");
+36145: 
+36063:     if (mSubprocess) {
+36063:         mSubprocess->Delete();
+36063:         mSubprocess = nsnull;
+36063:     }
+38121: 
+38121:     nsContentUtils::UnregisterPrefCallback(kTimeoutPref, TimeoutChanged, this);
+35740: }
+35740: 
+36145: void
+37384: PluginModuleParent::WriteExtraDataEntry(nsIFileOutputStream* stream,
+37384:                                         const char* key,
+37384:                                         const char* value)
+37384: {
+37384:     PRUint32 written;
+37384:     stream->Write(key, strlen(key), &written);
+37384:     stream->Write("=", 1, &written);
+37384:     stream->Write(value, strlen(value), &written);
+37384:     stream->Write("\n", 1, &written);
+37384: }
+37384: 
+37384: void
+37384: PluginModuleParent::WriteExtraDataForMinidump(nsIFile* dumpFile)
+37384: {
+37384:     // get a reference to the extra file, and add some more entries
+37384:     nsCOMPtr<nsIFile> extraFile;
+37384:     nsresult rv = dumpFile->Clone(getter_AddRefs(extraFile));
+37384:     if (NS_FAILED(rv))
+37384:         return;
+37384: 
+37384:     nsAutoString leafName;
+37384:     rv = extraFile->GetLeafName(leafName);
+37384:     if (NS_FAILED(rv))
+37384:         return;
+37384: 
+37384:     leafName.Replace(leafName.Length() - 3, 3,
+37384:                      NS_LITERAL_STRING("extra"));
+37384:     rv = extraFile->SetLeafName(leafName);
+37384:     if (NS_FAILED(rv))
+37384:         return;
+37384: 
+37384:     nsCOMPtr<nsIFileOutputStream> stream =
+37384:         do_CreateInstance("@mozilla.org/network/file-output-stream;1");
+37384:     // PR_WRONLY | PR_APPEND
+37384:     rv = stream->Init(extraFile, 0x12, 0600, 0);
+37384:     if (NS_FAILED(rv))
+37384:         return;
+37384:     WriteExtraDataEntry(stream, "ProcessType", "plugin");
+37384:     char startTime[32];
+37384:     sprintf(startTime, "%lld", static_cast<PRInt64>(mProcessStartTime));
+37384:     WriteExtraDataEntry(stream, "StartupTime", startTime);
+37384: 
+37384:     // Get the plugin filename, try to get just the file leafname
+37384:     const std::string& pluginFile = mSubprocess->GetPluginFilePath();
+37384:     size_t filePos = pluginFile.rfind(FILE_PATH_SEPARATOR);
+37384:     if (filePos == std::string::npos)
+37384:         filePos = 0;
+37384:     else
+37384:         filePos++;
+37384:     WriteExtraDataEntry(stream, "PluginFilename",
+37384:                         pluginFile.substr(filePos).c_str());
+37384:     //TODO: add plugin name and version: bug 539841
+37384:     // (as PluginName, PluginVersion)
+37858:     WriteExtraDataEntry(stream, "PluginName", "");
+37858:     WriteExtraDataEntry(stream, "PluginVersion", "");
+37384:     stream->Close();
+37384: }
+37384: 
+38121: int
+38121: PluginModuleParent::TimeoutChanged(const char* aPref, void* aModule)
+38121: {
+38121:     AssertPluginThread();
+38121:     NS_ABORT_IF_FALSE(!strcmp(aPref, kTimeoutPref),
+38121:                       "unexpected pref callback");
+38121: 
+38121:     PRInt32 timeoutSecs = nsContentUtils::GetIntPref(kTimeoutPref, 0);
+38121:     int32 timeoutMs = (timeoutSecs > 0) ? (1000 * timeoutSecs) :
+38121:                       SyncChannel::kNoTimeout;
+38121: 
+38121:     static_cast<PluginModuleParent*>(aModule)->SetReplyTimeoutMs(timeoutMs);
+38121:     return 0;
+38121: }
+38121: 
+38121: void
+38121: PluginModuleParent::CleanupFromTimeout()
+38121: {
+38121:     if (!mShutdown)
+38121:         Close();
+38121: }
+38121: 
+38121: bool
+38121: PluginModuleParent::ShouldContinueFromReplyTimeout()
+38121: {
+38121:     // FIXME/bug 544095: pop up a dialog asking the user what to do
+38121:     bool waitMoar = false;
+38121: 
+38121:     if (!waitMoar) {
+38121:         // We can't depend on the IO thread notifying us of a channel
+38121:         // error, because there's an inherent race between killing the
+38121:         // subprocess and shutting down the socket.  It would be nice
+38121:         // to call Close() here and do all the IPDL cleanup
+38121:         // immediately, but we might have arbitrary junk below us on
+38121:         // the stack.  So, a compromise: enqueue an event now that
+38121:         // will Close(), *before* killing the child process.  This
+38121:         // guarantees that the Close() event will be processed before
+38121:         // the IO error event, if it's delivered.
+38121:         MessageLoop::current()->PostTask(
+38121:             FROM_HERE,
+38121:             NewRunnableMethod(this, &PluginModuleParent::CleanupFromTimeout));
+38121: 
+38121:         // FIXME/bug 544095: kill the subprocess in a way that
+38121:         // triggers breakpad, and also capture a minidump for this
+38121:         // process
+38121:         KillProcess(ChildProcessHandle(), 1, false);
+38121:     }
+38121:     
+38121: 
+38121:     return waitMoar;
+38121: }
+38121: 
+37384: void
+36145: PluginModuleParent::ActorDestroy(ActorDestroyReason why)
+36145: {
+36145:     switch (why) {
+37384:     case AbnormalShutdown: {
+37384:         nsCOMPtr<nsIFile> dump;
+38026:         nsAutoString dumpID;
+37384:         if (GetMinidump(getter_AddRefs(dump))) {
+37384:             WriteExtraDataForMinidump(dump);
+38026:             if (NS_SUCCEEDED(dump->GetLeafName(dumpID))) {
+38026:                 dumpID.Replace(dumpID.Length() - 4, 4,
+38026:                                NS_LITERAL_STRING(""));
+38026:             }
+37384:         }
+37384:         else {
+37384:             NS_WARNING("[PluginModuleParent::ActorDestroy] abnormal shutdown without minidump!");
+37384:         }
+37384: 
+36304:         mShutdown = true;
+36304:         // Defer the PluginCrashed method so that we don't re-enter
+36304:         // and potentially modify the actor child list while enumerating it.
+36304:         if (mPlugin) {
+36304:             nsCOMPtr<nsIRunnable> r =
+38026:                 new PluginCrashed(mPlugin, dumpID);
+36304:             NS_DispatchToMainThread(r);
+36304:         }
+36304:         break;
+37384:     }
+36145:     case NormalShutdown:
+36145:         mShutdown = true;
+36145:         break;
+36145: 
+36145:     default:
+36145:         NS_ERROR("Unexpected shutdown reason for toplevel actor.");
+36145:     }
+36145: }
+36145: 
+35898: PPluginInstanceParent*
+35943: PluginModuleParent::AllocPPluginInstance(const nsCString& aMimeType,
+35746:                                          const uint16_t& aMode,
+35820:                                          const nsTArray<nsCString>& aNames,
+35820:                                          const nsTArray<nsCString>& aValues,
+35746:                                          NPError* rv)
+35740: {
+35890:     NS_ERROR("Not reachable!");
+35890:     return NULL;
+35740: }
+35740: 
+35926: bool
+36138: PluginModuleParent::DeallocPPluginInstance(PPluginInstanceParent* aActor)
+35746: {
+37099:     PLUGIN_LOG_DEBUG_METHOD;
+35893:     delete aActor;
+35926:     return true;
+35746: }
+35746: 
+35746: void
+35893: PluginModuleParent::SetPluginFuncs(NPPluginFuncs* aFuncs)
+35746: {
+35746:     aFuncs->version = (NP_VERSION_MAJOR << 8) | NP_VERSION_MINOR;
+35746:     aFuncs->javaClass = nsnull;
+35746: 
+36010:     aFuncs->newp = nsnull; // Gecko should always call this through a PluginLibrary object
+35910:     aFuncs->destroy = NPP_Destroy;
+35910:     aFuncs->setwindow = NPP_SetWindow;
+35910:     aFuncs->newstream = NPP_NewStream;
+35910:     aFuncs->destroystream = NPP_DestroyStream;
+35910:     aFuncs->asfile = NPP_StreamAsFile;
+35910:     aFuncs->writeready = NPP_WriteReady;
+35910:     aFuncs->write = NPP_Write;
+35910:     aFuncs->print = NPP_Print;
+35910:     aFuncs->event = NPP_HandleEvent;
+35910:     aFuncs->urlnotify = NPP_URLNotify;
+35910:     aFuncs->getvalue = NPP_GetValue;
+35910:     aFuncs->setvalue = NPP_SetValue;
+35746: }
+35746: 
+35747: NPError
+35893: PluginModuleParent::NPP_Destroy(NPP instance,
+37311:                                 NPSavedData** /*saved*/)
+35747: {
+35747:     // FIXME/cjones:
+35747:     //  (1) send a "destroy" message to the child
+35747:     //  (2) the child shuts down its instance
+35747:     //  (3) remove both parent and child IDs from map
+35747:     //  (4) free parent
+37099:     PLUGIN_LOG_DEBUG_FUNCTION;
+35747: 
+35893:     PluginInstanceParent* parentInstance =
+35893:         static_cast<PluginInstanceParent*>(instance->pdata);
+35747: 
+36101:     if (!parentInstance)
+36101:         return NPERR_NO_ERROR;
+36101: 
+37311:     NPError retval = parentInstance->Destroy();
+35747:     instance->pdata = nsnull;
+35747: 
+37477:     (void) PluginInstanceParent::Call__delete__(parentInstance);
+37311:     return retval;
+35740: }
+35740: 
+35945: bool
+35945: PluginModuleParent::EnsureValidNPIdentifier(NPIdentifier aIdentifier)
+35945: {
+35945:     if (!mValidIdentifiers.GetEntry(aIdentifier)) {
+35945:         nsVoidPtrHashKey* newEntry = mValidIdentifiers.PutEntry(aIdentifier);
+35945:         if (!newEntry) {
+35945:             NS_ERROR("Out of memory?");
+35945:             return false;
+35945:         }
+35945:     }
+35945:     return true;
+35945: }
+35945: 
+35913: NPIdentifier
+35913: PluginModuleParent::GetValidNPIdentifier(NPRemoteIdentifier aRemoteIdentifier)
+35910: {
+35913:     NS_ASSERTION(mValidIdentifiers.IsInitialized(), "Not initialized!");
+35913:     if (aRemoteIdentifier &&
+35913:         mValidIdentifiers.GetEntry((NPIdentifier)aRemoteIdentifier)) {
+35913:         return (NPIdentifier)aRemoteIdentifier;
+35913:     }
+35913:     return 0;
+35910: }
+35910: 
+35910: NPError
+35910: PluginModuleParent::NPP_NewStream(NPP instance, NPMIMEType type,
+35910:                                   NPStream* stream, NPBool seekable,
+35910:                                   uint16_t* stype)
+35910: {
+36144:     PluginInstanceParent* i = InstCast(instance);
+36144:     if (!i)
+36144:         return NPERR_GENERIC_ERROR;
+36144: 
+36144:     return i->NPP_NewStream(type, stream, seekable,
+35910:                             stype);
+35910: }
+35910: 
+35910: NPError
+35913: PluginModuleParent::NPP_SetWindow(NPP instance, NPWindow* window)
+35913: {
+36144:     PluginInstanceParent* i = InstCast(instance);
+36144:     if (!i)
+36144:         return NPERR_GENERIC_ERROR;
+36144: 
+36144:     return i->NPP_SetWindow(window);
+35913: }
+35913: 
+35913: NPError
+35910: PluginModuleParent::NPP_DestroyStream(NPP instance,
+35910:                                       NPStream* stream,
+35910:                                       NPReason reason)
+35910: {
+36144:     PluginInstanceParent* i = InstCast(instance);
+36144:     if (!i)
+36144:         return NPERR_GENERIC_ERROR;
+36144: 
+36144:     return i->NPP_DestroyStream(stream, reason);
+35910: }
+35910: 
+35910: int32_t
+35910: PluginModuleParent::NPP_WriteReady(NPP instance,
+35910:                                    NPStream* stream)
+35910: {
+36144:     BrowserStreamParent* s = StreamCast(instance, stream);
+36144:     if (!s)
+36144:         return -1;
+36144: 
+36144:     return s->WriteReady();
+35910: }
+35910: 
+35910: int32_t
+35910: PluginModuleParent::NPP_Write(NPP instance,
+35910:                               NPStream* stream,
+35910:                               int32_t offset,
+35910:                               int32_t len,
+35910:                               void* buffer)
+35910: {
+36144:     BrowserStreamParent* s = StreamCast(instance, stream);
+36144:     if (!s)
+36144:         return -1;
+36144: 
+36144:     return s->Write(offset, len, buffer);
+35910: }
+35910: 
+35910: void
+35910: PluginModuleParent::NPP_StreamAsFile(NPP instance,
+35910:                                      NPStream* stream,
+35910:                                      const char* fname)
+35910: {
+36144:     BrowserStreamParent* s = StreamCast(instance, stream);
+36144:     if (!s)
+36144:         return;
+36144: 
+36144:     s->StreamAsFile(fname);
+35910: }
+35910: 
+35910: void
+35910: PluginModuleParent::NPP_Print(NPP instance, NPPrint* platformPrint)
+35910: {
+36144:     PluginInstanceParent* i = InstCast(instance);
+36144:     if (i)
+36144:         i->NPP_Print(platformPrint);
+35910: }
+35910: 
+35910: int16_t
+35910: PluginModuleParent::NPP_HandleEvent(NPP instance, void* event)
+35910: {
+36144:     PluginInstanceParent* i = InstCast(instance);
+36144:     if (!i)
+36144:         return false;
+36144: 
+36144:     return i->NPP_HandleEvent(event);
+35910: }
+35910: 
+35910: void
+35910: PluginModuleParent::NPP_URLNotify(NPP instance, const char* url,
+35910:                                   NPReason reason, void* notifyData)
+35910: {
+36144:     PluginInstanceParent* i = InstCast(instance);
+36144:     if (!i)
+36144:         return;
+36144: 
+36144:     i->NPP_URLNotify(url, reason, notifyData);
+35910: }
+35910: 
+35910: NPError
+35910: PluginModuleParent::NPP_GetValue(NPP instance,
+35910:                                  NPPVariable variable, void *ret_value)
+35910: {
+36144:     PluginInstanceParent* i = InstCast(instance);
+36144:     if (!i)
+36144:         return NPERR_GENERIC_ERROR;
+36144: 
+36144:     return i->NPP_GetValue(variable, ret_value);
+35910: }
+35910: 
+35910: NPError
+35910: PluginModuleParent::NPP_SetValue(NPP instance, NPNVariable variable,
+35910:                                  void *value)
+35910: {
+36144:     PluginInstanceParent* i = InstCast(instance);
+36144:     if (!i)
+36144:         return NPERR_GENERIC_ERROR;
+36144: 
+36144:     return i->NPP_SetValue(variable, value);
+35910: }
+35910: 
+35926: bool
+35968: PluginModuleParent::AnswerNPN_UserAgent(nsCString* userAgent)
+35968: {
+36125:     *userAgent = NullableString(mNPNIface->uagent(nsnull));
+35968:     return true;
+35968: }
+35968: 
+35968: bool
+35893: PluginModuleParent::RecvNPN_GetStringIdentifier(const nsCString& aString,
+35835:                                                 NPRemoteIdentifier* aId)
+35835: {
+35934:     if (aString.IsVoid()) {
+35934:         NS_ERROR("Someone sent over a void string?!");
+35927:         return false;
+35934:     }
+35913: 
+36125:     NPIdentifier ident =
+36125:         mozilla::plugins::parent::_getstringidentifier(aString.BeginReading());
+35927:     if (!ident) {
+35927:         *aId = 0;
+35927:         return true;
+35927:     }
+35913: 
+35945:     if (!EnsureValidNPIdentifier(ident)) {
+35934:         NS_ERROR("Out of memory?");
+35927:         return false;
+35934:     }
+35913: 
+35913:     *aId = (NPRemoteIdentifier)ident;
+35926:     return true;
+35835: }
+35740: 
+35926: bool
+35893: PluginModuleParent::RecvNPN_GetIntIdentifier(const int32_t& aInt,
+35835:                                              NPRemoteIdentifier* aId)
+35835: {
+36125:     NPIdentifier ident = mozilla::plugins::parent::_getintidentifier(aInt);
+35927:     if (!ident) {
+35927:         *aId = 0;
+35927:         return true;
+35927:     }
+35913: 
+35945:     if (!EnsureValidNPIdentifier(ident)) {
+35934:         NS_ERROR("Out of memory?");
+35927:         return false;
+35934:     }
+35913: 
+35913:     *aId = (NPRemoteIdentifier)ident;
+35926:     return true;
+35835: }
+35740: 
+35926: bool
+35893: PluginModuleParent::RecvNPN_UTF8FromIdentifier(const NPRemoteIdentifier& aId,
+35927:                                                NPError *err,
+35835:                                                nsCString* aString)
+35835: {
+35913:     NPIdentifier ident = GetValidNPIdentifier(aId);
+35927:     if (!ident) {
+35927:         *err = NPERR_INVALID_PARAM;
+35927:         return true;
+35927:     }
+35913: 
+36125:     NPUTF8* val = mozilla::plugins::parent::_utf8fromidentifier(ident);
+35927:     if (!val) {
+35927:         *err = NPERR_INVALID_PARAM;
+35927:         return true;
+35927:     }
+35913: 
+35913:     aString->Assign(val);
+35927:     *err = NPERR_NO_ERROR;
+35926:     return true;
+35835: }
+35740: 
+35926: bool
+35893: PluginModuleParent::RecvNPN_IntFromIdentifier(const NPRemoteIdentifier& aId,
+35927:                                               NPError* err,
+35835:                                               int32_t* aInt)
+35835: {
+35913:     NPIdentifier ident = GetValidNPIdentifier(aId);
+35927:     if (!ident) {
+35927:         *err = NPERR_INVALID_PARAM;
+35927:         return true;
+35927:     }
+35913: 
+36125:     *aInt = mozilla::plugins::parent::_intfromidentifier(ident);
+35927:     *err = NPERR_NO_ERROR;
+35926:     return true;
+35835: }
+35835: 
+35926: bool
+35893: PluginModuleParent::RecvNPN_IdentifierIsString(const NPRemoteIdentifier& aId,
+35835:                                                bool* aIsString)
+35835: {
+35913:     NPIdentifier ident = GetValidNPIdentifier(aId);
+35927:     if (!ident) {
+35927:         *aIsString = false;
+35927:         return true;
+35927:     }
+35913: 
+36125:     *aIsString = mozilla::plugins::parent::_identifierisstring(ident);
+35926:     return true;
+35835: }
+35835: 
+35926: bool
+35913: PluginModuleParent::RecvNPN_GetStringIdentifiers(const nsTArray<nsCString>& aNames,
+35835:                                                  nsTArray<NPRemoteIdentifier>* aIds)
+35835: {
+35913:     NS_ASSERTION(aIds->IsEmpty(), "Non-empty array!");
+35913: 
+35913:     PRUint32 count = aNames.Length();
+35934:     if (!count) {
+35934:         NS_ERROR("No names to get!");
+35934:         return false;
+35934:     }
+35913: 
+38646:     nsTArray<NPUTF8*> buffers;
+38646:     nsTArray<NPIdentifier> ids;
+35913: 
+35934:     if (!(buffers.SetLength(count) &&
+38646:           ids.SetLength(count))) {
+35934:         NS_ERROR("Out of memory?");
+35934:         return false;
+35934:     }
+35913: 
+38646:     for (PRUint32 index = 0; index < count; ++index)
+38646:         buffers[index] = const_cast<NPUTF8*>(NullableStringGet(aNames[index]));
+35913: 
+36125:     mozilla::plugins::parent::_getstringidentifiers(
+36125:         const_cast<const NPUTF8**>(buffers.Elements()), count, ids.Elements());
+35913: 
+35913:     for (PRUint32 index = 0; index < count; index++) {
+35913:         NPIdentifier& id = ids[index];
+35913:         if (id) {
+35945:             if (!EnsureValidNPIdentifier(id)) {
+35934:                 NS_ERROR("Out of memory?");
+35934:                 return false;
+35913:             }
+35934:         }
+35913:         aIds->AppendElement((NPRemoteIdentifier)id);
+35913:     }
+35913: 
+35926:     return true;
+35835: }
+35890: 
+35893: PluginInstanceParent*
+35893: PluginModuleParent::InstCast(NPP instance)
+35890: {
+35893:     PluginInstanceParent* ip =
+35893:         static_cast<PluginInstanceParent*>(instance->pdata);
+36144: 
+36144:     // If the plugin crashed and the PluginInstanceParent was deleted,
+36144:     // instance->pdata will be NULL.
+36144:     if (!ip)
+36144:         return NULL;
+36144: 
+35893:     if (instance != ip->mNPP) {
+35890:         NS_RUNTIMEABORT("Corrupted plugin data.");
+35893:     }
+35890:     return ip;
+35890: }
+35890: 
+35895: BrowserStreamParent*
+35893: PluginModuleParent::StreamCast(NPP instance,
+35893:                                NPStream* s)
+35890: {
+35893:     PluginInstanceParent* ip = InstCast(instance);
+36144:     if (!ip)
+36144:         return NULL;
+36144: 
+35895:     BrowserStreamParent* sp =
+35938:         static_cast<BrowserStreamParent*>(static_cast<AStream*>(s->pdata));
+35893:     if (sp->mNPP != ip || s != sp->mStream) {
+35890:         NS_RUNTIMEABORT("Corrupted plugin stream data.");
+35893:     }
+35890:     return sp;
+35890: }
+35890: 
+36010: bool
+36010: PluginModuleParent::HasRequiredFunctions()
+36010: {
+36010:     return true;
+36010: }
+36010: 
+36010: #if defined(XP_UNIX) && !defined(XP_MACOSX)
+36010: nsresult
+36010: PluginModuleParent::NP_Initialize(NPNetscapeFuncs* bFuncs, NPPluginFuncs* pFuncs, NPError* error)
+36010: {
+37099:     PLUGIN_LOG_DEBUG_METHOD;
+36010: 
+36010:     mNPNIface = bFuncs;
+36010: 
+36145:     if (mShutdown) {
+36145:         *error = NPERR_GENERIC_ERROR;
+36145:         return NS_ERROR_FAILURE;
+36145:     }
+36145: 
+36010:     if (!CallNP_Initialize(error)) {
+36102:         return NS_ERROR_FAILURE;
+36010:     }
+36010:     else if (*error != NPERR_NO_ERROR) {
+36010:         return NS_OK;
+36010:     }
+36010: 
+36010:     SetPluginFuncs(pFuncs);
+36010:     return NS_OK;
+36010: }
+36010: #else
+36010: nsresult
+36010: PluginModuleParent::NP_Initialize(NPNetscapeFuncs* bFuncs, NPError* error)
+36010: {
+37099:     PLUGIN_LOG_DEBUG_METHOD;
+36010: 
+36010:     mNPNIface = bFuncs;
+36010: 
+36145:     if (mShutdown) {
+36145:         *error = NPERR_GENERIC_ERROR;
+36145:         return NS_ERROR_FAILURE;
+36145:     }
+36145: 
+36010:     if (!CallNP_Initialize(error))
+36102:         return NS_ERROR_FAILURE;
+36010: 
+36010:     return NS_OK;
+36010: }
+36010: #endif
+36010: 
+36010: nsresult
+36010: PluginModuleParent::NP_Shutdown(NPError* error)
+36010: {
+37099:     PLUGIN_LOG_DEBUG_METHOD;
+36010: 
+36145:     if (mShutdown) {
+36145:         *error = NPERR_GENERIC_ERROR;
+36145:         return NS_ERROR_FAILURE;
+36145:     }
+36145: 
+36140:     bool ok = CallNP_Shutdown(error);
+36010: 
+36140:     // if NP_Shutdown() is nested within another RPC call, this will
+36140:     // break things.  but lord help us if we're doing that anyway; the
+36140:     // plugin dso will have been unloaded on the other side by the
+36140:     // CallNP_Shutdown() message
+36039:     Close();
+36039: 
+36039:     return ok ? NS_OK : NS_ERROR_FAILURE;
+36010: }
+36010: 
+36010: nsresult
+37635: PluginModuleParent::NP_GetMIMEDescription(const char** mimeDesc)
+36010: {
+37099:     PLUGIN_LOG_DEBUG_METHOD;
+36010: 
+37635:     *mimeDesc = "application/x-foobar";
+36010:     return NS_OK;
+36010: }
+36010: 
+36010: nsresult
+36010: PluginModuleParent::NP_GetValue(void *future, NPPVariable aVariable,
+36010:                                    void *aValue, NPError* error)
+36010: {
+37099:     PR_LOG(gPluginLog, PR_LOG_WARNING, ("%s Not implemented, requested variable %i", __FUNCTION__,
+37099:                                         (int) aVariable));
+36010: 
+36010:     //TODO: implement this correctly
+36010:     *error = NPERR_GENERIC_ERROR;
+36010:     return NS_OK;
+36010: }
+36010: 
+36764: #if defined(XP_WIN) || defined(XP_MACOSX) || defined(XP_OS2)
+36010: nsresult
+36010: PluginModuleParent::NP_GetEntryPoints(NPPluginFuncs* pFuncs, NPError* error)
+36010: {
+36010:     NS_ASSERTION(pFuncs, "Null pointer!");
+36010: 
+36010:     SetPluginFuncs(pFuncs);
+36010:     *error = NPERR_NO_ERROR;
+36010:     return NS_OK;
+36010: }
+36010: #endif
+36010: 
+36010: nsresult
+36010: PluginModuleParent::NPP_New(NPMIMEType pluginType, NPP instance,
+36010:                             uint16_t mode, int16_t argc, char* argn[],
+36010:                             char* argv[], NPSavedData* saved,
+36010:                             NPError* error)
+36010: {
+37099:     PLUGIN_LOG_DEBUG_METHOD;
+36010: 
+36145:     if (mShutdown) {
+36145:         *error = NPERR_GENERIC_ERROR;
+36145:         return NS_ERROR_FAILURE;
+36145:     }
+36145: 
+36010:     // create the instance on the other side
+36010:     nsTArray<nsCString> names;
+36010:     nsTArray<nsCString> values;
+36010: 
+36010:     for (int i = 0; i < argc; ++i) {
+36010:         names.AppendElement(NullableString(argn[i]));
+36010:         values.AppendElement(NullableString(argv[i]));
+36010:     }
+36010: 
+36098:     PluginInstanceParent* parentInstance =
+36098:         new PluginInstanceParent(this, instance, mNPNIface);
+36010: 
+37311:     if (!parentInstance->Init()) {
+37311:         delete parentInstance;
+37311:         return NS_ERROR_FAILURE;
+37311:     }
+37311: 
+36098:     instance->pdata = parentInstance;
+36010: 
+36010:     if (!CallPPluginInstanceConstructor(parentInstance,
+36010:                                         nsDependentCString(pluginType), mode,
+36098:                                         names, values, error)) {
+36098:         // |parentInstance| is automatically deleted.
+36098:         instance->pdata = nsnull;
+36101:         // if IPC is down, we'll get an immediate "failed" return, but
+36101:         // without *error being set.  So make sure that the error
+36101:         // condition is signaled to nsNPAPIPluginInstance
+36101:         if (NPERR_NO_ERROR == *error)
+36101:             *error = NPERR_GENERIC_ERROR;
+36010:         return NS_ERROR_FAILURE;
+36098:     }
+36010: 
+36098:     if (*error != NPERR_NO_ERROR) {
+37311:         NPP_Destroy(instance, 0);
+37311:         return *error;
+36098:     }
+36010: 
+36010:     return NS_OK;
+36010: }
+36010: 
+36125: bool
+36125: PluginModuleParent::AnswerNPN_GetValue_WithBoolReturn(const NPNVariable& aVariable,
+36125:                                                       NPError* aError,
+36125:                                                       bool* aBoolVal)
+36125: {
+36125:     NPBool boolVal = false;
+36125:     *aError = mozilla::plugins::parent::_getvalue(nsnull, aVariable, &boolVal);
+36125:     *aBoolVal = boolVal ? true : false;
+36125:     return true;
+36125: }

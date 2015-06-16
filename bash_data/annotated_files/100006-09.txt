@@ -1,0 +1,598 @@
+82129: /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+82129:  * vim: set ts=8 sw=4 et tw=78:
+82129:  *
+98983:  * This Source Code Form is subject to the terms of the Mozilla Public
+98983:  * License, v. 2.0. If a copy of the MPL was not distributed with this
+98983:  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+82129: 
+82129: #ifndef jsgc_barrier_h___
+82129: #define jsgc_barrier_h___
+82129: 
+82129: #include "jsapi.h"
+82129: 
+97570: #include "gc/Heap.h"
+82129: #include "js/HashTable.h"
+82129: 
+82129: /*
+82129:  * A write barrier is a mechanism used by incremental or generation GCs to
+82129:  * ensure that every value that needs to be marked is marked. In general, the
+82129:  * write barrier should be invoked whenever a write can cause the set of things
+82129:  * traced through by the GC to change. This includes:
+82129:  *   - writes to object properties
+82129:  *   - writes to array slots
+86523:  *   - writes to fields like JSObject::shape_ that we trace through
+82129:  *   - writes to fields in private data, like JSGenerator::obj
+82129:  *   - writes to non-markable fields like JSObject::private that point to
+82129:  *     markable data
+82129:  * The last category is the trickiest. Even though the private pointers does not
+82129:  * point to a GC thing, changing the private pointer may change the set of
+82129:  * objects that are traced by the GC. Therefore it needs a write barrier.
+82129:  *
+82129:  * Every barriered write should have the following form:
+82129:  *   <pre-barrier>
+82129:  *   obj->field = value; // do the actual write
+82129:  *   <post-barrier>
+82129:  * The pre-barrier is used for incremental GC and the post-barrier is for
+82129:  * generational GC.
+82129:  *
+82129:  *                               PRE-BARRIER
+82129:  *
+82129:  * To understand the pre-barrier, let's consider how incremental GC works. The
+82129:  * GC itself is divided into "slices". Between each slice, JS code is allowed to
+82129:  * run. Each slice should be short so that the user doesn't notice the
+82129:  * interruptions. In our GC, the structure of the slices is as follows:
+82129:  *
+82129:  * 1. ... JS work, which leads to a request to do GC ...
+82129:  * 2. [first GC slice, which performs all root marking and possibly more marking]
+82129:  * 3. ... more JS work is allowed to run ...
+82129:  * 4. [GC mark slice, which runs entirely in drainMarkStack]
+82129:  * 5. ... more JS work ...
+82129:  * 6. [GC mark slice, which runs entirely in drainMarkStack]
+82129:  * 7. ... more JS work ...
+82129:  * 8. [GC marking finishes; sweeping done non-incrementally; GC is done]
+82129:  * 9. ... JS continues uninterrupted now that GC is finishes ...
+82129:  *
+82129:  * Of course, there may be a different number of slices depending on how much
+82129:  * marking is to be done.
+82129:  *
+82129:  * The danger inherent in this scheme is that the JS code in steps 3, 5, and 7
+82129:  * might change the heap in a way that causes the GC to collect an object that
+82129:  * is actually reachable. The write barrier prevents this from happening. We use
+82129:  * a variant of incremental GC called "snapshot at the beginning." This approach
+82129:  * guarantees the invariant that if an object is reachable in step 2, then we
+82129:  * will mark it eventually. The name comes from the idea that we take a
+82129:  * theoretical "snapshot" of all reachable objects in step 2; all objects in
+82129:  * that snapshot should eventually be marked. (Note that the write barrier
+82129:  * verifier code takes an actual snapshot.)
+82129:  *
+82129:  * The basic correctness invariant of a snapshot-at-the-beginning collector is
+82129:  * that any object reachable at the end of the GC (step 9) must either:
+82129:  *   (1) have been reachable at the beginning (step 2) and thus in the snapshot
+82129:  *   (2) or must have been newly allocated, in steps 3, 5, or 7.
+82129:  * To deal with case (2), any objects allocated during an incremental GC are
+82129:  * automatically marked black.
+82129:  *
+82129:  * This strategy is actually somewhat conservative: if an object becomes
+82129:  * unreachable between steps 2 and 8, it would be safe to collect it. We won't,
+82129:  * mainly for simplicity. (Also, note that the snapshot is entirely
+82129:  * theoretical. We don't actually do anything special in step 2 that we wouldn't
+82129:  * do in a non-incremental GC.
+82129:  *
+82129:  * It's the pre-barrier's job to maintain the snapshot invariant. Consider the
+82129:  * write "obj->field = value". Let the prior value of obj->field be
+82129:  * value0. Since it's possible that value0 may have been what obj->field
+82129:  * contained in step 2, when the snapshot was taken, the barrier marks
+82129:  * value0. Note that it only does this if we're in the middle of an incremental
+82129:  * GC. Since this is rare, the cost of the write barrier is usually just an
+82129:  * extra branch.
+82129:  *
+82129:  * In practice, we implement the pre-barrier differently based on the type of
+82129:  * value0. E.g., see JSObject::writeBarrierPre, which is used if obj->field is
+82129:  * a JSObject*. It takes value0 as a parameter.
+82129:  *
+82129:  *                                POST-BARRIER
+82129:  *
+82129:  * These are not yet implemented. Once we get generational GC, they will allow
+82129:  * us to keep track of pointers from non-nursery space into the nursery.
+82129:  *
+82129:  *                            IMPLEMENTATION DETAILS
+82129:  *
+82129:  * Since it would be awkward to change every write to memory into a function
+82129:  * call, this file contains a bunch of C++ classes and templates that use
+82129:  * operator overloading to take care of barriers automatically. In many cases,
+82129:  * all that's necessary to make some field be barriered is to replace
+82129:  *     Type *field;
+82129:  * with
+82129:  *     HeapPtr<Type> field;
+82129:  * There are also special classes HeapValue and HeapId, which barrier js::Value
+82129:  * and jsid, respectively.
+82129:  *
+82129:  * One additional note: not all object writes need to be barriered. Writes to
+97329:  * newly allocated objects do not need a pre-barrier.  In these cases, we use
+97329:  * the "obj->field.init(value)" method instead of "obj->field = value". We use
+97329:  * the init naming idiom in many places to signify that a field is being
+97329:  * assigned for the first time.
+82129:  */
+82129: 
+90966: struct JSXML;
+90966: 
+82129: namespace js {
+82129: 
+82129: template<class T, typename Unioned = uintptr_t>
+98931: class EncapsulatedPtr
+82129: {
+98931:   protected:
+82129:     union {
+82129:         T *value;
+82129:         Unioned other;
+82129:     };
+82129: 
+82129:   public:
+98931:     EncapsulatedPtr() : value(NULL) {}
+98931:     explicit EncapsulatedPtr(T *v) : value(v) {}
+98931:     explicit EncapsulatedPtr(const EncapsulatedPtr<T> &v) : value(v.value) {}
+82129: 
+98931:     ~EncapsulatedPtr() { pre(); }
+82129: 
+82129:     /* Use to set the pointer to NULL. */
+82129:     void clear() {
+82129:         pre();
+82129:         value = NULL;
+82129:     }
+82129: 
+98931:     EncapsulatedPtr<T, Unioned> &operator=(T *v) {
+98931:         pre();
+98931:         JS_ASSERT(!IsPoisonedPtr<T>(v));
+98931:         value = v;
+98931:         return *this;
+98931:     }
+98931: 
+98931:     EncapsulatedPtr<T, Unioned> &operator=(const EncapsulatedPtr<T> &v) {
+98931:         pre();
+98931:         JS_ASSERT(!IsPoisonedPtr<T>(v.value));
+98931:         value = v.value;
+98931:         return *this;
+98931:     }
+98931: 
+82129:     /* Use this if the automatic coercion to T* isn't working. */
+82129:     T *get() const { return value; }
+82129: 
+82129:     /*
+82129:      * Use these if you want to change the value without invoking the barrier.
+82129:      * Obviously this is dangerous unless you know the barrier is not needed.
+82129:      */
+82129:     T **unsafeGet() { return &value; }
+82129:     void unsafeSet(T *v) { value = v; }
+82129: 
+82129:     Unioned *unsafeGetUnioned() { return &other; }
+82129: 
+98931:     T &operator*() const { return *value; }
+98931:     T *operator->() const { return value; }
+98931: 
+98931:     operator T*() const { return value; }
+98931: 
+98931:   protected:
+98931:     void pre() { T::writeBarrierPre(value); }
+98931: };
+98931: 
+98931: template <class T, class Unioned = uintptr_t>
+98931: class HeapPtr : public EncapsulatedPtr<T, Unioned>
+98931: {
+98931:   public:
+98931:     HeapPtr() : EncapsulatedPtr<T>(NULL) {}
+98931:     explicit HeapPtr(T *v) : EncapsulatedPtr<T>(v) { post(); }
+98931:     explicit HeapPtr(const HeapPtr<T> &v)
+98931:       : EncapsulatedPtr<T>(v) { post(); }
+98931: 
+98931:     void init(T *v) {
+98931:         JS_ASSERT(!IsPoisonedPtr<T>(v));
+98931:         this->value = v;
+98931:         post();
+98931:     }
+98931: 
+82129:     HeapPtr<T, Unioned> &operator=(T *v) {
+98931:         this->pre();
+86437:         JS_ASSERT(!IsPoisonedPtr<T>(v));
+98931:         this->value = v;
+82129:         post();
+82129:         return *this;
+82129:     }
+82129: 
+82129:     HeapPtr<T, Unioned> &operator=(const HeapPtr<T> &v) {
+98931:         this->pre();
+86437:         JS_ASSERT(!IsPoisonedPtr<T>(v.value));
+98931:         this->value = v.value;
+82129:         post();
+82129:         return *this;
+82129:     }
+82129: 
+98931:   protected:
+98931:     void post() { T::writeBarrierPost(this->value, (void *)&this->value); }
+82129: 
+82129:     /* Make this friend so it can access pre() and post(). */
+82129:     template<class T1, class T2>
+82129:     friend inline void
+82129:     BarrieredSetPair(JSCompartment *comp,
+82129:                      HeapPtr<T1> &v1, T1 *val1,
+82129:                      HeapPtr<T2> &v2, T2 *val2);
+82129: };
+82129: 
+98931: template <class T>
+98931: class RelocatablePtr : public EncapsulatedPtr<T>
+98931: {
+98931:   public:
+98931:     RelocatablePtr() : EncapsulatedPtr<T>(NULL) {}
+98931:     explicit RelocatablePtr(T *v) : EncapsulatedPtr<T>(v) { post(); }
+98931:     explicit RelocatablePtr(const RelocatablePtr<T> &v)
+98931:       : EncapsulatedPtr<T>(v) { post(); }
+98931: 
+98931:     ~RelocatablePtr() {
+98931:         this->pre();
+98931:         relocate();
+98931:     }
+98931: 
+98931:     RelocatablePtr<T> &operator=(T *v) {
+98931:         this->pre();
+98931:         JS_ASSERT(!IsPoisonedPtr<T>(v));
+98931:         this->value = v;
+98931:         post();
+98931:         return *this;
+98931:     }
+98931: 
+98931:     RelocatablePtr<T> &operator=(const RelocatablePtr<T> &v) {
+98931:         this->pre();
+98931:         JS_ASSERT(!IsPoisonedPtr<T>(v.value));
+98931:         this->value = v.value;
+98931:         post();
+98931:         return *this;
+98931:     }
+98931: 
+98931:   protected:
+98931:     void post() { T::writeBarrierRelocPost(this->value, (void *)&this->value); }
+98931:     void relocate() { T::writeBarrierRelocated(this->value, (void *)&this->value); }
+98931: };
+98931: 
+82129: /*
+82129:  * This is a hack for RegExpStatics::updateFromMatch. It allows us to do two
+82129:  * barriers with only one branch to check if we're in an incremental GC.
+82129:  */
+82129: template<class T1, class T2>
+82129: static inline void
+82129: BarrieredSetPair(JSCompartment *comp,
+82129:                  HeapPtr<T1> &v1, T1 *val1,
+82129:                  HeapPtr<T2> &v2, T2 *val2)
+82129: {
+82129:     if (T1::needWriteBarrierPre(comp)) {
+82129:         v1.pre();
+82129:         v2.pre();
+82129:     }
+82129:     v1.unsafeSet(val1);
+82129:     v2.unsafeSet(val2);
+82129:     v1.post();
+82129:     v2.post();
+82129: }
+82129: 
+90966: struct Shape;
+90966: class BaseShape;
+90966: namespace types { struct TypeObject; }
+90966: 
+98931: typedef RelocatablePtr<JSObject> RelocatablePtrObject;
+98931: typedef RelocatablePtr<JSScript> RelocatablePtrScript;
+98931: 
+82129: typedef HeapPtr<JSObject> HeapPtrObject;
+82129: typedef HeapPtr<JSFunction> HeapPtrFunction;
+82129: typedef HeapPtr<JSString> HeapPtrString;
+82129: typedef HeapPtr<JSScript> HeapPtrScript;
+82129: typedef HeapPtr<Shape> HeapPtrShape;
+83301: typedef HeapPtr<BaseShape> HeapPtrBaseShape;
+83334: typedef HeapPtr<types::TypeObject> HeapPtrTypeObject;
+82129: typedef HeapPtr<JSXML> HeapPtrXML;
+82129: 
+82129: /* Useful for hashtables with a HeapPtr as key. */
+82129: template<class T>
+82129: struct HeapPtrHasher
+82129: {
+82129:     typedef HeapPtr<T> Key;
+82129:     typedef T *Lookup;
+82129: 
+82129:     static HashNumber hash(Lookup obj) { return DefaultHasher<T *>::hash(obj); }
+82129:     static bool match(const Key &k, Lookup l) { return k.get() == l; }
+82129: };
+82129: 
+82129: /* Specialized hashing policy for HeapPtrs. */
+82129: template <class T>
+82129: struct DefaultHasher< HeapPtr<T> > : HeapPtrHasher<T> { };
+82129: 
+91146: class EncapsulatedValue
+82129: {
+91146:   protected:
+82129:     Value value;
+82129: 
+91146:     /*
+91146:      * Ensure that EncapsulatedValue is not constructable, except by our
+91146:      * implementations.
+91146:      */
+91146:     EncapsulatedValue() MOZ_DELETE;
+91146:     EncapsulatedValue(const EncapsulatedValue &v) MOZ_DELETE;
+91146:     EncapsulatedValue &operator=(const Value &v) MOZ_DELETE;
+91146:     EncapsulatedValue &operator=(const EncapsulatedValue &v) MOZ_DELETE;
+91146: 
+91146:     EncapsulatedValue(const Value &v) : value(v) {}
+91146:     ~EncapsulatedValue() {}
+91146: 
+82129:   public:
+96830:     inline bool operator==(const EncapsulatedValue &v) const { return value == v.value; }
+96830:     inline bool operator!=(const EncapsulatedValue &v) const { return value != v.value; }
+96830: 
+82129:     const Value &get() const { return value; }
+90302:     Value *unsafeGet() { return &value; }
+82129:     operator const Value &() const { return value; }
+82129: 
+82129:     bool isUndefined() const { return value.isUndefined(); }
+87812:     bool isNull() const { return value.isNull(); }
+87812:     bool isBoolean() const { return value.isBoolean(); }
+82129:     bool isTrue() const { return value.isTrue(); }
+82129:     bool isFalse() const { return value.isFalse(); }
+87812:     bool isNumber() const { return value.isNumber(); }
+82129:     bool isInt32() const { return value.isInt32(); }
+90546:     bool isDouble() const { return value.isDouble(); }
+87812:     bool isString() const { return value.isString(); }
+87812:     bool isObject() const { return value.isObject(); }
+87812:     bool isMagic(JSWhyMagic why) const { return value.isMagic(why); }
+87812:     bool isGCThing() const { return value.isGCThing(); }
+87812:     bool isMarkable() const { return value.isMarkable(); }
+82129: 
+87812:     bool toBoolean() const { return value.toBoolean(); }
+87812:     double toNumber() const { return value.toNumber(); }
+87812:     int32_t toInt32() const { return value.toInt32(); }
+87812:     double toDouble() const { return value.toDouble(); }
+87812:     JSString *toString() const { return value.toString(); }
+82129:     JSObject &toObject() const { return value.toObject(); }
+82129:     JSObject *toObjectOrNull() const { return value.toObjectOrNull(); }
+82129:     void *toGCThing() const { return value.toGCThing(); }
+82129: 
+82659:     JSGCTraceKind gcKind() const { return value.gcKind(); }
+82129: 
+87812:     uint64_t asRawBits() const { return value.asRawBits(); }
+87812: 
+82129: #ifdef DEBUG
+82129:     JSWhyMagic whyMagic() const { return value.whyMagic(); }
+82129: #endif
+82129: 
+82129:     static inline void writeBarrierPre(const Value &v);
+91146:     static inline void writeBarrierPre(JSCompartment *comp, const Value &v);
+91146: 
+91146:   protected:
+91146:     inline void pre();
+91146:     inline void pre(JSCompartment *comp);
+91146: };
+91146: 
+91146: class HeapValue : public EncapsulatedValue
+91146: {
+91146:   public:
+91146:     explicit inline HeapValue();
+91146:     explicit inline HeapValue(const Value &v);
+91146:     explicit inline HeapValue(const HeapValue &v);
+91146:     inline ~HeapValue();
+91146: 
+91146:     inline void init(const Value &v);
+91146:     inline void init(JSCompartment *comp, const Value &v);
+91146: 
+91146:     inline HeapValue &operator=(const Value &v);
+91146:     inline HeapValue &operator=(const HeapValue &v);
+91146: 
+91146:     /*
+91146:      * This is a faster version of operator=. Normally, operator= has to
+91146:      * determine the compartment of the value before it can decide whether to do
+91146:      * the barrier. If you already know the compartment, it's faster to pass it
+91146:      * in.
+91146:      */
+91146:     inline void set(JSCompartment *comp, const Value &v);
+91146: 
+98265:     static inline void writeBarrierPost(const Value &v, Value *addr);
+98265:     static inline void writeBarrierPost(JSCompartment *comp, const Value &v, Value *addr);
+82129: 
+82129:   private:
+82129:     inline void post();
+82129:     inline void post(JSCompartment *comp);
+82129: };
+82129: 
+96830: class RelocatableValue : public EncapsulatedValue
+96830: {
+96830:   public:
+96830:     explicit inline RelocatableValue();
+96830:     explicit inline RelocatableValue(const Value &v);
+96830:     explicit inline RelocatableValue(const RelocatableValue &v);
+96830:     inline ~RelocatableValue();
+96830: 
+96830:     inline RelocatableValue &operator=(const Value &v);
+96830:     inline RelocatableValue &operator=(const RelocatableValue &v);
+98265: 
+98265:   private:
+98265:     inline void post();
+98265:     inline void post(JSCompartment *comp);
+98265:     inline void relocate();
+96830: };
+96830: 
+91146: class HeapSlot : public EncapsulatedValue
+91146: {
+91146:     /*
+91146:      * Operator= is not valid for HeapSlot because is must take the object and
+91146:      * slot offset to provide to the post/generational barrier.
+91146:      */
+91146:     inline HeapSlot &operator=(const Value &v) MOZ_DELETE;
+91146:     inline HeapSlot &operator=(const HeapValue &v) MOZ_DELETE;
+91146:     inline HeapSlot &operator=(const HeapSlot &v) MOZ_DELETE;
+91146: 
+91146:   public:
+91146:     explicit inline HeapSlot() MOZ_DELETE;
+91146:     explicit inline HeapSlot(JSObject *obj, uint32_t slot, const Value &v);
+91146:     explicit inline HeapSlot(JSObject *obj, uint32_t slot, const HeapSlot &v);
+91146:     inline ~HeapSlot();
+91146: 
+91146:     inline void init(JSObject *owner, uint32_t slot, const Value &v);
+91146:     inline void init(JSCompartment *comp, JSObject *owner, uint32_t slot, const Value &v);
+91146: 
+91146:     inline void set(JSObject *owner, uint32_t slot, const Value &v);
+91146:     inline void set(JSCompartment *comp, JSObject *owner, uint32_t slot, const Value &v);
+91146: 
+91146:     static inline void writeBarrierPost(JSObject *obj, uint32_t slot);
+91146:     static inline void writeBarrierPost(JSCompartment *comp, JSObject *obj, uint32_t slotno);
+91146: 
+91146:   private:
+91146:     inline void post(JSObject *owner, uint32_t slot);
+91146:     inline void post(JSCompartment *comp, JSObject *owner, uint32_t slot);
+91146: };
+91146: 
+94882: /*
+94882:  * NOTE: This is a placeholder for bug 619558.
+94882:  *
+94882:  * Run a post write barrier that encompasses multiple contiguous slots in a
+94882:  * single step.
+94882:  */
+98931: inline void
+94882: SlotRangeWriteBarrierPost(JSCompartment *comp, JSObject *obj, uint32_t start, uint32_t count)
+94882: {
+94882: }
+94882: 
+82129: static inline const Value *
+91146: Valueify(const EncapsulatedValue *array)
+82129: {
+91146:     JS_STATIC_ASSERT(sizeof(HeapValue) == sizeof(Value));
+91146:     JS_STATIC_ASSERT(sizeof(HeapSlot) == sizeof(Value));
+82129:     return (const Value *)array;
+82129: }
+82129: 
+91146: class HeapSlotArray
+82129: {
+91146:     HeapSlot *array;
+82129: 
+82129:   public:
+91146:     HeapSlotArray(HeapSlot *array) : array(array) {}
+82129: 
+82129:     operator const Value *() const { return Valueify(array); }
+91146:     operator HeapSlot *() const { return array; }
+82129: 
+91146:     HeapSlotArray operator +(int offset) const { return HeapSlotArray(array + offset); }
+91146:     HeapSlotArray operator +(uint32_t offset) const { return HeapSlotArray(array + offset); }
+82129: };
+82129: 
+97032: class EncapsulatedId
+82129: {
+97032:   protected:
+82129:     jsid value;
+82129: 
+97032:     explicit EncapsulatedId() : value(JSID_VOID) {}
+97032:     explicit inline EncapsulatedId(jsid id) : value(id) {}
+97032:     ~EncapsulatedId() {}
+97032: 
+97032:   private:
+97032:     EncapsulatedId(const EncapsulatedId &v) MOZ_DELETE;
+97032:     EncapsulatedId &operator=(const EncapsulatedId &v) MOZ_DELETE;
+97032: 
+82129:   public:
+97032:     bool operator==(jsid id) const { return value == id; }
+97032:     bool operator!=(jsid id) const { return value != id; }
+97032: 
+97032:     jsid get() const { return value; }
+97032:     jsid *unsafeGet() { return &value; }
+97032:     operator jsid() const { return value; }
+97032: 
+97032:   protected:
+97032:     inline void pre();
+97032: };
+97032: 
+97032: class RelocatableId : public EncapsulatedId
+97032: {
+97032:   public:
+97032:     explicit RelocatableId() : EncapsulatedId() {}
+97032:     explicit inline RelocatableId(jsid id) : EncapsulatedId(id) {}
+97032:     inline ~RelocatableId();
+97032: 
+97032:     inline RelocatableId &operator=(jsid id);
+97032:     inline RelocatableId &operator=(const RelocatableId &v);
+97032: };
+97032: 
+97032: class HeapId : public EncapsulatedId
+97032: {
+97032:   public:
+97032:     explicit HeapId() : EncapsulatedId() {}
+82129:     explicit inline HeapId(jsid id);
+82129:     inline ~HeapId();
+82129: 
+82129:     inline void init(jsid id);
+82129: 
+82129:     inline HeapId &operator=(jsid id);
+82129:     inline HeapId &operator=(const HeapId &v);
+82129: 
+82129:   private:
+82129:     inline void post();
+82129: 
+97032:     HeapId(const HeapId &v) MOZ_DELETE;
+82129: };
+82129: 
+82129: /*
+82129:  * Incremental GC requires that weak pointers have read barriers. This is mostly
+82129:  * an issue for empty shapes stored in JSCompartment. The problem happens when,
+82129:  * during an incremental GC, some JS code stores one of the compartment's empty
+82129:  * shapes into an object already marked black. Normally, this would not be a
+82129:  * problem, because the empty shape would have been part of the initial snapshot
+82129:  * when the GC started. However, since this is a weak pointer, it isn't. So we
+82129:  * may collect the empty shape even though a live object points to it. To fix
+82129:  * this, we mark these empty shapes black whenever they get read out.
+82129:  */
+82129: template<class T>
+82129: class ReadBarriered
+82129: {
+82129:     T *value;
+82129: 
+82129:   public:
+86321:     ReadBarriered() : value(NULL) {}
+82129:     ReadBarriered(T *value) : value(value) {}
+82129: 
+82129:     T *get() const {
+82129:         if (!value)
+82129:             return NULL;
+82129:         T::readBarrier(value);
+82129:         return value;
+82129:     }
+82129: 
+82129:     operator T*() const { return get(); }
+82129: 
+86321:     T &operator*() const { return *get(); }
+86321:     T *operator->() const { return get(); }
+86321: 
+99246:     T **unsafeGet() { return &value; }
+82129: 
+82129:     void set(T *v) { value = v; }
+82129: 
+82129:     operator bool() { return !!value; }
+82129: };
+82129: 
+90410: class ReadBarrieredValue
+90410: {
+90410:     Value value;
+90410: 
+90410:   public:
+90410:     ReadBarrieredValue() : value(UndefinedValue()) {}
+90410:     ReadBarrieredValue(const Value &value) : value(value) {}
+90410: 
+90410:     inline const Value &get() const;
+99246:     Value *unsafeGet() { return &value; }
+90410:     inline operator const Value &() const;
+90410: 
+90410:     inline JSObject &toObject() const;
+90410: };
+90410: 
+95232: namespace tl {
+95232: 
+98931: template <class T> struct IsRelocatableHeapType<HeapPtr<T> >
+98931:                                                     { static const bool result = false; };
+98931: template <> struct IsRelocatableHeapType<HeapSlot>  { static const bool result = false; };
+98931: template <> struct IsRelocatableHeapType<HeapValue> { static const bool result = false; };
+98931: template <> struct IsRelocatableHeapType<HeapId>    { static const bool result = false; };
+95232: 
+95232: } /* namespace tl */
+95232: } /* namespace js */
+82129: 
+82129: #endif /* jsgc_barrier_h___ */

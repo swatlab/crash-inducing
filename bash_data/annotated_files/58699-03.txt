@@ -1,0 +1,1589 @@
+50491: /*
+50491:  * Copyright (C) 2009 Apple Inc. All rights reserved.
+50491:  *
+50491:  * Redistribution and use in source and binary forms, with or without
+50491:  * modification, are permitted provided that the following conditions
+50491:  * are met:
+50491:  * 1. Redistributions of source code must retain the above copyright
+50491:  *    notice, this list of conditions and the following disclaimer.
+50491:  * 2. Redistributions in binary form must reproduce the above copyright
+50491:  *    notice, this list of conditions and the following disclaimer in the
+50491:  *    documentation and/or other materials provided with the distribution.
+50491:  *
+50491:  * THIS SOFTWARE IS PROVIDED BY APPLE INC. ``AS IS'' AND ANY
+50491:  * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+50491:  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+50491:  * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL APPLE INC. OR
+50491:  * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+50491:  * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+50491:  * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+50491:  * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+50491:  * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+50491:  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+50491:  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. 
+50491:  */
+50491: 
+50491: #include "RegexJIT.h"
+50491: 
+50608: #if ENABLE_ASSEMBLER
+50608: 
+50491: #include "assembler/assembler/LinkBuffer.h"
+50491: #include "assembler/assembler/MacroAssembler.h"
+50491: #include "RegexCompiler.h"
+50491: 
+50491: #include "yarr/pcre/pcre.h" // temporary, remove when fallback is removed.
+50491: 
+50491: using namespace WTF;
+50491: 
+50491: namespace JSC { namespace Yarr {
+50491: 
+50491: class JSGlobalData;
+50491: 
+50491: class RegexGenerator : private MacroAssembler {
+50491:     friend void jitCompileRegex(JSGlobalData* globalData, RegexCodeBlock& jitObject, const UString& pattern, unsigned& numSubpatterns, const char*& error, bool ignoreCase, bool multiline);
+50491: 
+50491: #if WTF_CPU_ARM
+50491:     static const RegisterID input = ARMRegisters::r0;
+50491:     static const RegisterID index = ARMRegisters::r1;
+50491:     static const RegisterID length = ARMRegisters::r2;
+50491:     static const RegisterID output = ARMRegisters::r4;
+50491: 
+50491:     static const RegisterID regT0 = ARMRegisters::r5;
+50491:     static const RegisterID regT1 = ARMRegisters::r6;
+50491: 
+50491:     static const RegisterID returnRegister = ARMRegisters::r0;
+50491: #elif WTF_CPU_MIPS
+50491:     static const RegisterID input = MIPSRegisters::a0;
+50491:     static const RegisterID index = MIPSRegisters::a1;
+50491:     static const RegisterID length = MIPSRegisters::a2;
+50491:     static const RegisterID output = MIPSRegisters::a3;
+50491: 
+50491:     static const RegisterID regT0 = MIPSRegisters::t4;
+50491:     static const RegisterID regT1 = MIPSRegisters::t5;
+50491: 
+50491:     static const RegisterID returnRegister = MIPSRegisters::v0;
+50491: #elif WTF_CPU_X86
+50491:     static const RegisterID input = X86Registers::eax;
+50491:     static const RegisterID index = X86Registers::edx;
+50491:     static const RegisterID length = X86Registers::ecx;
+50491:     static const RegisterID output = X86Registers::edi;
+50491: 
+50491:     static const RegisterID regT0 = X86Registers::ebx;
+50491:     static const RegisterID regT1 = X86Registers::esi;
+50491: 
+50491:     static const RegisterID returnRegister = X86Registers::eax;
+50491: #elif WTF_CPU_X86_64
+51114: #if WTF_PLATFORM_WIN
+51114:     static const RegisterID input = X86Registers::ecx;
+51114:     static const RegisterID index = X86Registers::edx;
+51114:     static const RegisterID length = X86Registers::r8;
+51114:     static const RegisterID output = X86Registers::r9;
+51114: #else
+50491:     static const RegisterID input = X86Registers::edi;
+50491:     static const RegisterID index = X86Registers::esi;
+50491:     static const RegisterID length = X86Registers::edx;
+50491:     static const RegisterID output = X86Registers::ecx;
+51114: #endif
+50491: 
+50491:     static const RegisterID regT0 = X86Registers::eax;
+50491:     static const RegisterID regT1 = X86Registers::ebx;
+50491: 
+50491:     static const RegisterID returnRegister = X86Registers::eax;
+50491: #endif
+50491: 
+50491:     void optimizeAlternative(PatternAlternative* alternative)
+50491:     {
+50491:         if (!alternative->m_terms.length())
+50491:             return;
+50491: 
+50491:         for (unsigned i = 0; i < alternative->m_terms.length() - 1; ++i) {
+50491:             PatternTerm& term = alternative->m_terms[i];
+50491:             PatternTerm& nextTerm = alternative->m_terms[i + 1];
+50491: 
+50491:             if ((term.type == PatternTerm::TypeCharacterClass)
+50491:                 && (term.quantityType == QuantifierFixedCount)
+50491:                 && (nextTerm.type == PatternTerm::TypePatternCharacter)
+50491:                 && (nextTerm.quantityType == QuantifierFixedCount)) {
+50491:                 PatternTerm termCopy = term;
+50491:                 alternative->m_terms[i] = nextTerm;
+50491:                 alternative->m_terms[i + 1] = termCopy;
+50491:             }
+50491:         }
+50491:     }
+50491: 
+50491:     void matchCharacterClassRange(RegisterID character, JumpList& failures, JumpList& matchDest, const CharacterRange* ranges, unsigned count, unsigned* matchIndex, const UChar* matches, unsigned matchCount)
+50491:     {
+50491:         do {
+50491:             // pick which range we're going to generate
+50491:             int which = count >> 1;
+50491:             char lo = ranges[which].begin;
+50491:             char hi = ranges[which].end;
+50491:             
+50491:             // check if there are any ranges or matches below lo.  If not, just jl to failure -
+50491:             // if there is anything else to check, check that first, if it falls through jmp to failure.
+50491:             if ((*matchIndex < matchCount) && (matches[*matchIndex] < lo)) {
+50491:                 Jump loOrAbove = branch32(GreaterThanOrEqual, character, Imm32((unsigned short)lo));
+50491:                 
+50491:                 // generate code for all ranges before this one
+50491:                 if (which)
+50491:                     matchCharacterClassRange(character, failures, matchDest, ranges, which, matchIndex, matches, matchCount);
+50491:                 
+50491:                 while ((*matchIndex < matchCount) && (matches[*matchIndex] < lo)) {
+50491:                     matchDest.append(branch32(Equal, character, Imm32((unsigned short)matches[*matchIndex])));
+50491:                     ++*matchIndex;
+50491:                 }
+50491:                 failures.append(jump());
+50491: 
+50491:                 loOrAbove.link(this);
+50491:             } else if (which) {
+50491:                 Jump loOrAbove = branch32(GreaterThanOrEqual, character, Imm32((unsigned short)lo));
+50491: 
+50491:                 matchCharacterClassRange(character, failures, matchDest, ranges, which, matchIndex, matches, matchCount);
+50491:                 failures.append(jump());
+50491: 
+50491:                 loOrAbove.link(this);
+50491:             } else
+50491:                 failures.append(branch32(LessThan, character, Imm32((unsigned short)lo)));
+50491: 
+50491:             while ((*matchIndex < matchCount) && (matches[*matchIndex] <= hi))
+50491:                 ++*matchIndex;
+50491: 
+50491:             matchDest.append(branch32(LessThanOrEqual, character, Imm32((unsigned short)hi)));
+50491:             // fall through to here, the value is above hi.
+50491: 
+50491:             // shuffle along & loop around if there are any more matches to handle.
+50491:             unsigned next = which + 1;
+50491:             ranges += next;
+50491:             count -= next;
+50491:         } while (count);
+50491:     }
+50491: 
+50491:     void matchCharacterClass(RegisterID character, JumpList& matchDest, const CharacterClass* charClass)
+50491:     {
+50491:         if (charClass->m_table) {
+50491:             ExtendedAddress tableEntry(character, reinterpret_cast<intptr_t>(charClass->m_table->m_table));
+50491:             matchDest.append(branchTest8(charClass->m_table->m_inverted ? Zero : NonZero, tableEntry));   
+50491:             return;
+50491:         }
+50491:         Jump unicodeFail;
+50491:         if (charClass->m_matchesUnicode.length() || charClass->m_rangesUnicode.length()) {
+50491:             Jump isAscii = branch32(LessThanOrEqual, character, Imm32(0x7f));
+50491:         
+50491:             if (charClass->m_matchesUnicode.length()) {
+50491:                 for (unsigned i = 0; i < charClass->m_matchesUnicode.length(); ++i) {
+50491:                     UChar ch = charClass->m_matchesUnicode[i];
+50491:                     matchDest.append(branch32(Equal, character, Imm32(ch)));
+50491:                 }
+50491:             }
+50491:             
+50491:             if (charClass->m_rangesUnicode.length()) {
+50491:                 for (unsigned i = 0; i < charClass->m_rangesUnicode.length(); ++i) {
+50491:                     UChar lo = charClass->m_rangesUnicode[i].begin;
+50491:                     UChar hi = charClass->m_rangesUnicode[i].end;
+50491:                     
+50491:                     Jump below = branch32(LessThan, character, Imm32(lo));
+50491:                     matchDest.append(branch32(LessThanOrEqual, character, Imm32(hi)));
+50491:                     below.link(this);
+50491:                 }
+50491:             }
+50491: 
+50491:             unicodeFail = jump();
+50491:             isAscii.link(this);
+50491:         }
+50491: 
+50491:         if (charClass->m_ranges.length()) {
+50491:             unsigned matchIndex = 0;
+50491:             JumpList failures; 
+50491:             matchCharacterClassRange(character, failures, matchDest, charClass->m_ranges.begin(), charClass->m_ranges.length(), &matchIndex, charClass->m_matches.begin(), charClass->m_matches.length());
+50491:             while (matchIndex < charClass->m_matches.length())
+50491:                 matchDest.append(branch32(Equal, character, Imm32((unsigned short)charClass->m_matches[matchIndex++])));
+50491: 
+50491:             failures.link(this);
+50491:         } else if (charClass->m_matches.length()) {
+50491:             // optimization: gather 'a','A' etc back together, can mask & test once.
+50491:             js::Vector<char, 16, js::SystemAllocPolicy> matchesAZaz;
+50491: 
+50491:             for (unsigned i = 0; i < charClass->m_matches.length(); ++i) {
+50491:                 char ch = charClass->m_matches[i];
+50491:                 if (m_pattern.m_ignoreCase) {
+50491:                     if (isASCIILower(ch)) {
+50491:                         matchesAZaz.append(ch);
+50491:                         continue;
+50491:                     }
+50491:                     if (isASCIIUpper(ch))
+50491:                         continue;
+50491:                 }
+50491:                 matchDest.append(branch32(Equal, character, Imm32((unsigned short)ch)));
+50491:             }
+50491: 
+50491:             if (unsigned countAZaz = matchesAZaz.length()) {
+50491:                 or32(Imm32(32), character);
+50491:                 for (unsigned i = 0; i < countAZaz; ++i)
+50491:                     matchDest.append(branch32(Equal, character, Imm32(matchesAZaz[i])));
+50491:             }
+50491:         }
+50491: 
+50491:         if (charClass->m_matchesUnicode.length() || charClass->m_rangesUnicode.length())
+50491:             unicodeFail.link(this);
+50491:     }
+50491: 
+50491:     // Jumps if input not available; will have (incorrectly) incremented already!
+50491:     Jump jumpIfNoAvailableInput(unsigned countToCheck)
+50491:     {
+50491:         add32(Imm32(countToCheck), index);
+50491:         return branch32(Above, index, length);
+50491:     }
+50491: 
+50491:     Jump jumpIfAvailableInput(unsigned countToCheck)
+50491:     {
+50491:         add32(Imm32(countToCheck), index);
+50491:         return branch32(BelowOrEqual, index, length);
+50491:     }
+50491: 
+50491:     Jump checkInput()
+50491:     {
+50491:         return branch32(BelowOrEqual, index, length);
+50491:     }
+50491: 
+50491:     Jump atEndOfInput()
+50491:     {
+50491:         return branch32(Equal, index, length);
+50491:     }
+50491: 
+50491:     Jump notAtEndOfInput()
+50491:     {
+50491:         return branch32(NotEqual, index, length);
+50491:     }
+50491: 
+50491:     Jump jumpIfCharEquals(UChar ch, int inputPosition)
+50491:     {
+50491:         return branch16(Equal, BaseIndex(input, index, TimesTwo, inputPosition * sizeof(UChar)), Imm32(ch));
+50491:     }
+50491: 
+50491:     Jump jumpIfCharNotEquals(UChar ch, int inputPosition)
+50491:     {
+50491:         return branch16(NotEqual, BaseIndex(input, index, TimesTwo, inputPosition * sizeof(UChar)), Imm32(ch));
+50491:     }
+50491: 
+50491:     void readCharacter(int inputPosition, RegisterID reg)
+50491:     {
+50491:         load16(BaseIndex(input, index, TimesTwo, inputPosition * sizeof(UChar)), reg);
+50491:     }
+50491: 
+50491:     void storeToFrame(RegisterID reg, unsigned frameLocation)
+50491:     {
+50491:         poke(reg, frameLocation);
+50491:     }
+50491: 
+50491:     void storeToFrame(Imm32 imm, unsigned frameLocation)
+50491:     {
+50491:         poke(imm, frameLocation);
+50491:     }
+50491: 
+50491:     DataLabelPtr storeToFrameWithPatch(unsigned frameLocation)
+50491:     {
+50491:         return storePtrWithPatch(ImmPtr(0), Address(stackPointerRegister, frameLocation * sizeof(void*)));
+50491:     }
+50491: 
+50491:     void loadFromFrame(unsigned frameLocation, RegisterID reg)
+50491:     {
+50491:         peek(reg, frameLocation);
+50491:     }
+50491: 
+50491:     void loadFromFrameAndJump(unsigned frameLocation)
+50491:     {
+50491:         jump(Address(stackPointerRegister, frameLocation * sizeof(void*)));
+50491:     }
+50491: 
+50491:     struct AlternativeBacktrackRecord {
+50491:         DataLabelPtr dataLabel;
+50491:         Label backtrackLocation;
+50491: 
+50491:         AlternativeBacktrackRecord(DataLabelPtr dataLabel, Label backtrackLocation)
+50491:             : dataLabel(dataLabel)
+50491:             , backtrackLocation(backtrackLocation)
+50491:         {
+50491:         }
+50491:     };
+50491: 
+50491:     struct TermGenerationState {
+50491:         TermGenerationState(PatternDisjunction* disjunction, unsigned checkedTotal)
+50491:             : disjunction(disjunction)
+50491:             , checkedTotal(checkedTotal)
+50491:         {
+50491:         }
+50491: 
+50491:         void resetAlternative()
+50491:         {
+50491:             isBackTrackGenerated = false;
+50491:             alt = 0;
+50491:         }
+50491:         bool alternativeValid()
+50491:         {
+50491:             return alt < disjunction->m_alternatives.length();
+50491:         }
+50491:         void nextAlternative()
+50491:         {
+50491:             ++alt;
+50491:         }
+50491:         PatternAlternative* alternative()
+50491:         {
+50491:             return disjunction->m_alternatives[alt];
+50491:         }
+50491: 
+50491:         void resetTerm()
+50491:         {
+50491:             ASSERT(alternativeValid());
+50491:             t = 0;
+50491:         }
+50491:         bool termValid()
+50491:         {
+50491:             ASSERT(alternativeValid());
+50491:             return t < alternative()->m_terms.length();
+50491:         }
+50491:         void nextTerm()
+50491:         {
+50491:             ASSERT(alternativeValid());
+50491:             ++t;
+50491:         }
+50491:         PatternTerm& term()
+50491:         {
+50491:             ASSERT(alternativeValid());
+50491:             return alternative()->m_terms[t];
+50491:         }
+50491:         bool isLastTerm()
+50491:         {
+50491:             ASSERT(alternativeValid());
+50491:             return (t + 1) == alternative()->m_terms.length();
+50491:         }
+50491:         bool isMainDisjunction()
+50491:         {
+50491:             return !disjunction->m_parent;
+50491:         }
+50491: 
+50491:         PatternTerm& lookaheadTerm()
+50491:         {
+50491:             ASSERT(alternativeValid());
+50491:             ASSERT((t + 1) < alternative()->m_terms.length());
+50491:             return alternative()->m_terms[t + 1];
+50491:         }
+50491:         bool isSinglePatternCharacterLookaheadTerm()
+50491:         {
+50491:             ASSERT(alternativeValid());
+50491:             return ((t + 1) < alternative()->m_terms.length())
+50491:                 && (lookaheadTerm().type == PatternTerm::TypePatternCharacter)
+50491:                 && (lookaheadTerm().quantityType == QuantifierFixedCount)
+50491:                 && (lookaheadTerm().quantityCount == 1);
+50491:         }
+50491: 
+50491:         int inputOffset()
+50491:         {
+50491:             return term().inputPosition - checkedTotal;
+50491:         }
+50491: 
+50491:         void jumpToBacktrack(Jump jump, MacroAssembler* masm)
+50491:         {
+50491:             if (isBackTrackGenerated)
+50491:                 jump.linkTo(backtrackLabel, masm);
+50491:             else
+50491:                 backTrackJumps.append(jump);
+50491:         }
+50491:         void jumpToBacktrack(JumpList& jumps, MacroAssembler* masm)
+50491:         {
+50491:             if (isBackTrackGenerated)
+50491:                 jumps.linkTo(backtrackLabel, masm);
+50491:             else
+50491:                 backTrackJumps.append(jumps);
+50491:         }
+50491:         bool plantJumpToBacktrackIfExists(MacroAssembler* masm)
+50491:         {
+50491:             if (isBackTrackGenerated) {
+50491:                 masm->jump(backtrackLabel);
+50491:                 return true;
+50491:             }
+50491:             return false;
+50491:         }
+50491:         void addBacktrackJump(Jump jump)
+50491:         {
+50491:             backTrackJumps.append(jump);
+50491:         }
+50491:         void setBacktrackGenerated(Label label)
+50491:         {
+50491:             isBackTrackGenerated = true;
+50491:             backtrackLabel = label;
+50491:         }
+50491:         void linkAlternativeBacktracks(MacroAssembler* masm)
+50491:         {
+50491:             isBackTrackGenerated = false;
+50491:             backTrackJumps.link(masm);
+50491:         }
+50491:         void linkAlternativeBacktracksTo(Label label, MacroAssembler* masm)
+50491:         {
+50491:             isBackTrackGenerated = false;
+50491:             backTrackJumps.linkTo(label, masm);
+50491:         }
+50491:         void propagateBacktrackingFrom(TermGenerationState& nestedParenthesesState, MacroAssembler* masm)
+50491:         {
+50491:             jumpToBacktrack(nestedParenthesesState.backTrackJumps, masm);
+50491:             if (nestedParenthesesState.isBackTrackGenerated)
+50491:                 setBacktrackGenerated(nestedParenthesesState.backtrackLabel);
+50491:         }
+50491: 
+50491:         PatternDisjunction* disjunction;
+50491:         int checkedTotal;
+50491:     private:
+50491:         unsigned alt;
+50491:         unsigned t;
+50491:         JumpList backTrackJumps;
+50491:         Label backtrackLabel;
+50491:         bool isBackTrackGenerated;
+50491:     };
+50491: 
+50491:     void generateAssertionBOL(TermGenerationState& state)
+50491:     {
+50491:         PatternTerm& term = state.term();
+50491: 
+50491:         if (m_pattern.m_multiline) {
+50491:             const RegisterID character = regT0;
+50491: 
+50491:             JumpList matchDest;
+50491:             if (!term.inputPosition)
+50491:                 matchDest.append(branch32(Equal, index, Imm32(state.checkedTotal)));
+50491: 
+50491:             readCharacter(state.inputOffset() - 1, character);
+50491:             matchCharacterClass(character, matchDest, m_pattern.newlineCharacterClass());
+50491:             state.jumpToBacktrack(jump(), this);
+50491: 
+50491:             matchDest.link(this);
+50491:         } else {
+50491:             // Erk, really should poison out these alternatives early. :-/
+50491:             if (term.inputPosition)
+50491:                 state.jumpToBacktrack(jump(), this);
+50491:             else
+50491:                 state.jumpToBacktrack(branch32(NotEqual, index, Imm32(state.checkedTotal)), this);
+50491:         }
+50491:     }
+50491: 
+50491:     void generateAssertionEOL(TermGenerationState& state)
+50491:     {
+50491:         PatternTerm& term = state.term();
+50491: 
+50491:         if (m_pattern.m_multiline) {
+50491:             const RegisterID character = regT0;
+50491: 
+50491:             JumpList matchDest;
+50491:             if (term.inputPosition == state.checkedTotal)
+50491:                 matchDest.append(atEndOfInput());
+50491: 
+50491:             readCharacter(state.inputOffset(), character);
+50491:             matchCharacterClass(character, matchDest, m_pattern.newlineCharacterClass());
+50491:             state.jumpToBacktrack(jump(), this);
+50491: 
+50491:             matchDest.link(this);
+50491:         } else {
+50491:             if (term.inputPosition == state.checkedTotal)
+50491:                 state.jumpToBacktrack(notAtEndOfInput(), this);
+50491:             // Erk, really should poison out these alternatives early. :-/
+50491:             else
+50491:                 state.jumpToBacktrack(jump(), this);
+50491:         }
+50491:     }
+50491: 
+50491:     // Also falls though on nextIsNotWordChar.
+50491:     void matchAssertionWordchar(TermGenerationState& state, JumpList& nextIsWordChar, JumpList& nextIsNotWordChar)
+50491:     {
+50491:         const RegisterID character = regT0;
+50491:         PatternTerm& term = state.term();
+50491: 
+50491:         if (term.inputPosition == state.checkedTotal)
+50491:             nextIsNotWordChar.append(atEndOfInput());
+50491: 
+50491:         readCharacter(state.inputOffset(), character);
+50491:         matchCharacterClass(character, nextIsWordChar, m_pattern.wordcharCharacterClass());
+50491:     }
+50491: 
+50491:     void generateAssertionWordBoundary(TermGenerationState& state)
+50491:     {
+50491:         const RegisterID character = regT0;
+50491:         PatternTerm& term = state.term();
+50491: 
+50491:         Jump atBegin;
+50491:         JumpList matchDest;
+50491:         if (!term.inputPosition)
+50491:             atBegin = branch32(Equal, index, Imm32(state.checkedTotal));
+50491:         readCharacter(state.inputOffset() - 1, character);
+50491:         matchCharacterClass(character, matchDest, m_pattern.wordcharCharacterClass());
+50491:         if (!term.inputPosition)
+50491:             atBegin.link(this);
+50491: 
+50491:         // We fall through to here if the last character was not a wordchar.
+50491:         JumpList nonWordCharThenWordChar;
+50491:         JumpList nonWordCharThenNonWordChar;
+50491:         if (term.invertOrCapture) {
+50491:             matchAssertionWordchar(state, nonWordCharThenNonWordChar, nonWordCharThenWordChar);
+50491:             nonWordCharThenWordChar.append(jump());
+50491:         } else {
+50491:             matchAssertionWordchar(state, nonWordCharThenWordChar, nonWordCharThenNonWordChar);
+50491:             nonWordCharThenNonWordChar.append(jump());
+50491:         }
+50491:         state.jumpToBacktrack(nonWordCharThenNonWordChar, this);
+50491: 
+50491:         // We jump here if the last character was a wordchar.
+50491:         matchDest.link(this);
+50491:         JumpList wordCharThenWordChar;
+50491:         JumpList wordCharThenNonWordChar;
+50491:         if (term.invertOrCapture) {
+50491:             matchAssertionWordchar(state, wordCharThenNonWordChar, wordCharThenWordChar);
+50491:             wordCharThenWordChar.append(jump());
+50491:         } else {
+50491:             matchAssertionWordchar(state, wordCharThenWordChar, wordCharThenNonWordChar);
+50491:             // This can fall-though!
+50491:         }
+50491: 
+50491:         state.jumpToBacktrack(wordCharThenWordChar, this);
+50491:         
+50491:         nonWordCharThenWordChar.link(this);
+50491:         wordCharThenNonWordChar.link(this);
+50491:     }
+50491: 
+50491:     void generatePatternCharacterSingle(TermGenerationState& state)
+50491:     {
+50491:         const RegisterID character = regT0;
+50491:         UChar ch = state.term().patternCharacter;
+50491: 
+50491:         if (m_pattern.m_ignoreCase && isASCIIAlpha(ch)) {
+50491:             readCharacter(state.inputOffset(), character);
+50491:             or32(Imm32(32), character);
+50491:             state.jumpToBacktrack(branch32(NotEqual, character, Imm32(Unicode::toLower(ch))), this);
+50491:         } else {
+50491:             ASSERT(!m_pattern.m_ignoreCase || (Unicode::toLower(ch) == Unicode::toUpper(ch)));
+50491:             state.jumpToBacktrack(jumpIfCharNotEquals(ch, state.inputOffset()), this);
+50491:         }
+50491:     }
+50491: 
+50491:     void generatePatternCharacterPair(TermGenerationState& state)
+50491:     {
+50491:         const RegisterID character = regT0;
+50491:         UChar ch1 = state.term().patternCharacter;
+50491:         UChar ch2 = state.lookaheadTerm().patternCharacter;
+50491: 
+50491:         int mask = 0;
+50491:         int chPair = ch1 | (ch2 << 16);
+50491:         
+50491:         if (m_pattern.m_ignoreCase) {
+50491:             if (isASCIIAlpha(ch1))
+50491:                 mask |= 32;
+50491:             if (isASCIIAlpha(ch2))
+50491:                 mask |= 32 << 16;
+50491:         }
+50491: 
+50491:         if (mask) {
+50491:             load32WithUnalignedHalfWords(BaseIndex(input, index, TimesTwo, state.inputOffset() * sizeof(UChar)), character);
+50491:             or32(Imm32(mask), character);
+50491:             state.jumpToBacktrack(branch32(NotEqual, character, Imm32(chPair | mask)), this);
+50491:         } else
+50491:             state.jumpToBacktrack(branch32WithUnalignedHalfWords(NotEqual, BaseIndex(input, index, TimesTwo, state.inputOffset() * sizeof(UChar)), Imm32(chPair)), this);
+50491:     }
+50491: 
+50491:     void generatePatternCharacterFixed(TermGenerationState& state)
+50491:     {
+50491:         const RegisterID character = regT0;
+50491:         const RegisterID countRegister = regT1;
+50491:         PatternTerm& term = state.term();
+50491:         UChar ch = term.patternCharacter;
+50491: 
+50491:         move(index, countRegister);
+50491:         sub32(Imm32(term.quantityCount), countRegister);
+50491: 
+50491:         Label loop(this);
+50491:         if (m_pattern.m_ignoreCase && isASCIIAlpha(ch)) {
+50491:             load16(BaseIndex(input, countRegister, TimesTwo, (state.inputOffset() + term.quantityCount) * sizeof(UChar)), character);
+50491:             or32(Imm32(32), character);
+50491:             state.jumpToBacktrack(branch32(NotEqual, character, Imm32(Unicode::toLower(ch))), this);
+50491:         } else {
+50491:             ASSERT(!m_pattern.m_ignoreCase || (Unicode::toLower(ch) == Unicode::toUpper(ch)));
+50491:             state.jumpToBacktrack(branch16(NotEqual, BaseIndex(input, countRegister, TimesTwo, (state.inputOffset() + term.quantityCount) * sizeof(UChar)), Imm32(ch)), this);
+50491:         }
+50491:         add32(Imm32(1), countRegister);
+50491:         branch32(NotEqual, countRegister, index).linkTo(loop, this);
+50491:     }
+50491: 
+50491:     void generatePatternCharacterGreedy(TermGenerationState& state)
+50491:     {
+50491:         const RegisterID character = regT0;
+50491:         const RegisterID countRegister = regT1;
+50491:         PatternTerm& term = state.term();
+50491:         UChar ch = term.patternCharacter;
+50491:     
+50491:         move(Imm32(0), countRegister);
+50491: 
+50491:         JumpList failures;
+50491:         Label loop(this);
+50491:         failures.append(atEndOfInput());
+50491:         if (m_pattern.m_ignoreCase && isASCIIAlpha(ch)) {
+50491:             readCharacter(state.inputOffset(), character);
+50491:             or32(Imm32(32), character);
+50491:             failures.append(branch32(NotEqual, character, Imm32(Unicode::toLower(ch))));
+50491:         } else {
+50491:             ASSERT(!m_pattern.m_ignoreCase || (Unicode::toLower(ch) == Unicode::toUpper(ch)));
+50491:             failures.append(jumpIfCharNotEquals(ch, state.inputOffset()));
+50491:         }
+50491: 
+50491:         add32(Imm32(1), countRegister);
+50491:         add32(Imm32(1), index);
+50491:         if (term.quantityCount != 0xffffffff) {
+50491:             branch32(NotEqual, countRegister, Imm32(term.quantityCount)).linkTo(loop, this);
+50491:             failures.append(jump());
+50491:         } else
+50491:             jump(loop);
+50491: 
+50491:         Label backtrackBegin(this);
+50491:         loadFromFrame(term.frameLocation, countRegister);
+50491:         state.jumpToBacktrack(branchTest32(Zero, countRegister), this);
+50491:         sub32(Imm32(1), countRegister);
+50491:         sub32(Imm32(1), index);
+50491: 
+50491:         failures.link(this);
+50491: 
+50491:         storeToFrame(countRegister, term.frameLocation);
+50491: 
+50491:         state.setBacktrackGenerated(backtrackBegin);
+50491:     }
+50491: 
+50491:     void generatePatternCharacterNonGreedy(TermGenerationState& state)
+50491:     {
+50491:         const RegisterID character = regT0;
+50491:         const RegisterID countRegister = regT1;
+50491:         PatternTerm& term = state.term();
+50491:         UChar ch = term.patternCharacter;
+50491:     
+50491:         move(Imm32(0), countRegister);
+50491: 
+50491:         Jump firstTimeDoNothing = jump();
+50491: 
+50491:         Label hardFail(this);
+50491:         sub32(countRegister, index);
+50491:         state.jumpToBacktrack(jump(), this);
+50491: 
+50491:         Label backtrackBegin(this);
+50491:         loadFromFrame(term.frameLocation, countRegister);
+50491: 
+50491:         atEndOfInput().linkTo(hardFail, this);
+50491:         if (term.quantityCount != 0xffffffff)
+50491:             branch32(Equal, countRegister, Imm32(term.quantityCount), hardFail);
+50491:         if (m_pattern.m_ignoreCase && isASCIIAlpha(ch)) {
+50491:             readCharacter(state.inputOffset(), character);
+50491:             or32(Imm32(32), character);
+50491:             branch32(NotEqual, character, Imm32(Unicode::toLower(ch))).linkTo(hardFail, this);
+50491:         } else {
+50491:             ASSERT(!m_pattern.m_ignoreCase || (Unicode::toLower(ch) == Unicode::toUpper(ch)));
+50491:             jumpIfCharNotEquals(ch, state.inputOffset()).linkTo(hardFail, this);
+50491:         }
+50491: 
+50491:         add32(Imm32(1), countRegister);
+50491:         add32(Imm32(1), index);
+50491: 
+50491:         firstTimeDoNothing.link(this);
+50491:         storeToFrame(countRegister, term.frameLocation);
+50491: 
+50491:         state.setBacktrackGenerated(backtrackBegin);
+50491:     }
+50491: 
+50491:     void generateCharacterClassSingle(TermGenerationState& state)
+50491:     {
+50491:         const RegisterID character = regT0;
+50491:         PatternTerm& term = state.term();
+50491: 
+50491:         JumpList matchDest;
+50491:         readCharacter(state.inputOffset(), character);
+50491:         matchCharacterClass(character, matchDest, term.characterClass);
+50491: 
+50491:         if (term.invertOrCapture)
+50491:             state.jumpToBacktrack(matchDest, this);
+50491:         else {
+50491:             state.jumpToBacktrack(jump(), this);
+50491:             matchDest.link(this);
+50491:         }
+50491:     }
+50491: 
+50491:     void generateCharacterClassFixed(TermGenerationState& state)
+50491:     {
+50491:         const RegisterID character = regT0;
+50491:         const RegisterID countRegister = regT1;
+50491:         PatternTerm& term = state.term();
+50491: 
+50491:         move(index, countRegister);
+50491:         sub32(Imm32(term.quantityCount), countRegister);
+50491: 
+50491:         Label loop(this);
+50491:         JumpList matchDest;
+50491:         load16(BaseIndex(input, countRegister, TimesTwo, (state.inputOffset() + term.quantityCount) * sizeof(UChar)), character);
+50491:         matchCharacterClass(character, matchDest, term.characterClass);
+50491: 
+50491:         if (term.invertOrCapture)
+50491:             state.jumpToBacktrack(matchDest, this);
+50491:         else {
+50491:             state.jumpToBacktrack(jump(), this);
+50491:             matchDest.link(this);
+50491:         }
+50491: 
+50491:         add32(Imm32(1), countRegister);
+50491:         branch32(NotEqual, countRegister, index).linkTo(loop, this);
+50491:     }
+50491: 
+50491:     void generateCharacterClassGreedy(TermGenerationState& state)
+50491:     {
+50491:         const RegisterID character = regT0;
+50491:         const RegisterID countRegister = regT1;
+50491:         PatternTerm& term = state.term();
+50491:     
+50491:         move(Imm32(0), countRegister);
+50491: 
+50491:         JumpList failures;
+50491:         Label loop(this);
+50491:         failures.append(atEndOfInput());
+50491: 
+50491:         if (term.invertOrCapture) {
+50491:             readCharacter(state.inputOffset(), character);
+50491:             matchCharacterClass(character, failures, term.characterClass);
+50491:         } else {
+50491:             JumpList matchDest;
+50491:             readCharacter(state.inputOffset(), character);
+50491:             matchCharacterClass(character, matchDest, term.characterClass);
+50491:             failures.append(jump());
+50491:             matchDest.link(this);
+50491:         }
+50491: 
+50491:         add32(Imm32(1), countRegister);
+50491:         add32(Imm32(1), index);
+50491:         if (term.quantityCount != 0xffffffff) {
+50491:             branch32(NotEqual, countRegister, Imm32(term.quantityCount)).linkTo(loop, this);
+50491:             failures.append(jump());
+50491:         } else
+50491:             jump(loop);
+50491: 
+50491:         Label backtrackBegin(this);
+50491:         loadFromFrame(term.frameLocation, countRegister);
+50491:         state.jumpToBacktrack(branchTest32(Zero, countRegister), this);
+50491:         sub32(Imm32(1), countRegister);
+50491:         sub32(Imm32(1), index);
+50491: 
+50491:         failures.link(this);
+50491: 
+50491:         storeToFrame(countRegister, term.frameLocation);
+50491: 
+50491:         state.setBacktrackGenerated(backtrackBegin);
+50491:     }
+50491: 
+50491:     void generateCharacterClassNonGreedy(TermGenerationState& state)
+50491:     {
+50491:         const RegisterID character = regT0;
+50491:         const RegisterID countRegister = regT1;
+50491:         PatternTerm& term = state.term();
+50491:     
+50491:         move(Imm32(0), countRegister);
+50491: 
+50491:         Jump firstTimeDoNothing = jump();
+50491: 
+50491:         Label hardFail(this);
+50491:         sub32(countRegister, index);
+50491:         state.jumpToBacktrack(jump(), this);
+50491: 
+50491:         Label backtrackBegin(this);
+50491:         loadFromFrame(term.frameLocation, countRegister);
+50491: 
+50491:         atEndOfInput().linkTo(hardFail, this);
+50491:         branch32(Equal, countRegister, Imm32(term.quantityCount), hardFail);
+50491: 
+50491:         JumpList matchDest;
+50491:         readCharacter(state.inputOffset(), character);
+50491:         matchCharacterClass(character, matchDest, term.characterClass);
+50491: 
+50491:         if (term.invertOrCapture)
+50491:             matchDest.linkTo(hardFail, this);
+50491:         else {
+50491:             jump(hardFail);
+50491:             matchDest.link(this);
+50491:         }
+50491: 
+50491:         add32(Imm32(1), countRegister);
+50491:         add32(Imm32(1), index);
+50491: 
+50491:         firstTimeDoNothing.link(this);
+50491:         storeToFrame(countRegister, term.frameLocation);
+50491: 
+50491:         state.setBacktrackGenerated(backtrackBegin);
+50491:     }
+50491: 
+50491:     void generateParenthesesDisjunction(PatternTerm& parenthesesTerm, TermGenerationState& state, unsigned alternativeFrameLocation)
+50491:     {
+50491:         ASSERT((parenthesesTerm.type == PatternTerm::TypeParenthesesSubpattern) || (parenthesesTerm.type == PatternTerm::TypeParentheticalAssertion));
+50491:         ASSERT(parenthesesTerm.quantityCount == 1);
+50491:     
+50491:         PatternDisjunction* disjunction = parenthesesTerm.parentheses.disjunction;
+50491:         unsigned preCheckedCount = ((parenthesesTerm.quantityType == QuantifierFixedCount) && (parenthesesTerm.type != PatternTerm::TypeParentheticalAssertion)) ? disjunction->m_minimumSize : 0;
+50491: 
+50491:         if (disjunction->m_alternatives.length() == 1) {
+50491:             state.resetAlternative();
+50491:             ASSERT(state.alternativeValid());
+50491:             PatternAlternative* alternative = state.alternative();
+50491:             optimizeAlternative(alternative);
+50491: 
+50491:             int countToCheck = alternative->m_minimumSize - preCheckedCount;
+50491:             if (countToCheck) {
+50491:                 ASSERT((parenthesesTerm.type == PatternTerm::TypeParentheticalAssertion) || (parenthesesTerm.quantityType != QuantifierFixedCount));
+50491: 
+50491:                 // FIXME: This is quite horrible.  The call to 'plantJumpToBacktrackIfExists'
+50491:                 // will be forced to always trampoline into here, just to decrement the index.
+50491:                 // Ick. 
+50491:                 Jump skip = jump();
+50491: 
+50491:                 Label backtrackBegin(this);
+50491:                 sub32(Imm32(countToCheck), index);
+50491:                 state.addBacktrackJump(jump());
+50491:                 
+50491:                 skip.link(this);
+50491: 
+50491:                 state.setBacktrackGenerated(backtrackBegin);
+50491: 
+50491:                 state.jumpToBacktrack(jumpIfNoAvailableInput(countToCheck), this);
+50491:                 state.checkedTotal += countToCheck;
+50491:             }
+50491: 
+50491:             for (state.resetTerm(); state.termValid(); state.nextTerm())
+50491:                 generateTerm(state);
+50491: 
+50491:             state.checkedTotal -= countToCheck;
+50491:         } else {
+50491:             JumpList successes;
+50491: 
+50491:             for (state.resetAlternative(); state.alternativeValid(); state.nextAlternative()) {
+50491: 
+50491:                 PatternAlternative* alternative = state.alternative();
+50491:                 optimizeAlternative(alternative);
+50491: 
+50491:                 ASSERT(alternative->m_minimumSize >= preCheckedCount);
+50491:                 int countToCheck = alternative->m_minimumSize - preCheckedCount;
+50491:                 if (countToCheck) {
+50491:                     state.addBacktrackJump(jumpIfNoAvailableInput(countToCheck));
+50491:                     state.checkedTotal += countToCheck;
+50491:                 }
+50491: 
+50491:                 for (state.resetTerm(); state.termValid(); state.nextTerm())
+50491:                     generateTerm(state);
+50491: 
+50491:                 // Matched an alternative.
+50491:                 DataLabelPtr dataLabel = storeToFrameWithPatch(alternativeFrameLocation);
+50491:                 successes.append(jump());
+50491: 
+50491:                 // Alternative did not match.
+50491:                 Label backtrackLocation(this);
+50491:                 
+50491:                 // Can we backtrack the alternative? - if so, do so.  If not, just fall through to the next one.
+50491:                 state.plantJumpToBacktrackIfExists(this);
+50491:                 
+50491:                 state.linkAlternativeBacktracks(this);
+50491: 
+50491:                 if (countToCheck) {
+50491:                     sub32(Imm32(countToCheck), index);
+50491:                     state.checkedTotal -= countToCheck;
+50491:                 }
+50491: 
+50491:                 m_backtrackRecords.append(AlternativeBacktrackRecord(dataLabel, backtrackLocation));
+50491:             }
+50491:             // We fall through to here when the last alternative fails.
+50491:             // Add a backtrack out of here for the parenthese handling code to link up.
+50491:             state.addBacktrackJump(jump());
+50491: 
+50491:             // Generate a trampoline for the parens code to backtrack to, to retry the
+50491:             // next alternative.
+50491:             state.setBacktrackGenerated(label());
+50491:             loadFromFrameAndJump(alternativeFrameLocation);
+50491: 
+50491:             // FIXME: both of the above hooks are a little inefficient, in that you
+50491:             // may end up trampolining here, just to trampoline back out to the
+50491:             // parentheses code, or vice versa.  We can probably eliminate a jump
+50491:             // by restructuring, but coding this way for now for simplicity during
+50491:             // development.
+50491: 
+50491:             successes.link(this);
+50491:         }
+50491:     }
+50491: 
+50491:     void generateParenthesesSingle(TermGenerationState& state)
+50491:     {
+50491:         const RegisterID indexTemporary = regT0;
+50491:         PatternTerm& term = state.term();
+50491:         PatternDisjunction* disjunction = term.parentheses.disjunction;
+50491:         ASSERT(term.quantityCount == 1);
+50491: 
+50491:         if (term.parentheses.isCopy) {
+50491:             m_shouldFallBack = true;
+50491:             return;
+50491:         }
+50491: 
+50491:         unsigned preCheckedCount = ((term.quantityCount == 1) && (term.quantityType == QuantifierFixedCount)) ? disjunction->m_minimumSize : 0;
+50491: 
+50491:         unsigned parenthesesFrameLocation = term.frameLocation;
+50491:         unsigned alternativeFrameLocation = parenthesesFrameLocation;
+50491:         if (term.quantityType != QuantifierFixedCount)
+50491:             alternativeFrameLocation += RegexStackSpaceForBackTrackInfoParenthesesOnce;
+50491: 
+50491:         // optimized case - no capture & no quantifier can be handled in a light-weight manner.
+50491:         if (!term.invertOrCapture && (term.quantityType == QuantifierFixedCount)) {
+50491:             TermGenerationState parenthesesState(disjunction, state.checkedTotal);
+50491:             generateParenthesesDisjunction(state.term(), parenthesesState, alternativeFrameLocation);
+50491:             // this expects that any backtracks back out of the parentheses will be in the
+50491:             // parenthesesState's backTrackJumps vector, and that if they need backtracking
+50491:             // they will have set an entry point on the parenthesesState's backtrackLabel.
+50491:             state.propagateBacktrackingFrom(parenthesesState, this);
+50491:         } else {
+50491:             Jump nonGreedySkipParentheses;
+50491:             Label nonGreedyTryParentheses;
+50491:             if (term.quantityType == QuantifierGreedy)
+50491:                 storeToFrame(Imm32(1), parenthesesFrameLocation);
+50491:             else if (term.quantityType == QuantifierNonGreedy) {
+50491:                 storeToFrame(Imm32(0), parenthesesFrameLocation);
+50491:                 nonGreedySkipParentheses = jump();
+50491:                 nonGreedyTryParentheses = label();
+50491:                 storeToFrame(Imm32(1), parenthesesFrameLocation);
+50491:             }
+50491: 
+50491:             // store the match start index
+50491:             if (term.invertOrCapture) {
+50491:                 int inputOffset = state.inputOffset() - preCheckedCount;
+50491:                 if (inputOffset) {
+50491:                     move(index, indexTemporary);
+50491:                     add32(Imm32(inputOffset), indexTemporary);
+50491:                     store32(indexTemporary, Address(output, (term.parentheses.subpatternId << 1) * sizeof(int)));
+50491:                 } else
+50491:                     store32(index, Address(output, (term.parentheses.subpatternId << 1) * sizeof(int)));
+50491:             }
+50491: 
+50491:             // generate the body of the parentheses
+50491:             TermGenerationState parenthesesState(disjunction, state.checkedTotal);
+50491:             generateParenthesesDisjunction(state.term(), parenthesesState, alternativeFrameLocation);
+50491: 
+50491:             // store the match end index
+50491:             if (term.invertOrCapture) {
+50491:                 int inputOffset = state.inputOffset();
+50491:                 if (inputOffset) {
+50491:                     move(index, indexTemporary);
+50491:                     add32(Imm32(state.inputOffset()), indexTemporary);
+50491:                     store32(indexTemporary, Address(output, ((term.parentheses.subpatternId << 1) + 1) * sizeof(int)));
+50491:                 } else
+50491:                     store32(index, Address(output, ((term.parentheses.subpatternId << 1) + 1) * sizeof(int)));
+50491:             }
+50491:             Jump success = jump();
+50491: 
+50491:             // A failure AFTER the parens jumps here
+50491:             Label backtrackFromAfterParens(this);
+50491: 
+50491:             if (term.quantityType == QuantifierGreedy) {
+50491:                 // If this is zero we have now tested with both with and without the parens.
+50491:                 loadFromFrame(parenthesesFrameLocation, indexTemporary);
+50491:                 state.jumpToBacktrack(branchTest32(Zero, indexTemporary), this);
+50491:             } else if (term.quantityType == QuantifierNonGreedy) {
+50491:                 // If this is zero we have now tested with both with and without the parens.
+50491:                 loadFromFrame(parenthesesFrameLocation, indexTemporary);
+50491:                 branchTest32(Zero, indexTemporary).linkTo(nonGreedyTryParentheses, this);
+50491:             }
+50491: 
+50491:             parenthesesState.plantJumpToBacktrackIfExists(this);
+50491:             // A failure WITHIN the parens jumps here
+50491:             parenthesesState.linkAlternativeBacktracks(this);
+50491:             if (term.invertOrCapture) {
+50491:                 store32(Imm32(-1), Address(output, (term.parentheses.subpatternId << 1) * sizeof(int)));
+58699: #if 0
+50491:                 store32(Imm32(-1), Address(output, ((term.parentheses.subpatternId << 1) + 1) * sizeof(int)));
+55533: #endif
+50491:             }
+50491: 
+50491:             if (term.quantityType == QuantifierGreedy)
+50491:                 storeToFrame(Imm32(0), parenthesesFrameLocation);
+50491:             else
+50491:                 state.jumpToBacktrack(jump(), this);
+50491: 
+50491:             state.setBacktrackGenerated(backtrackFromAfterParens);
+50491:             if (term.quantityType == QuantifierNonGreedy)
+50491:                 nonGreedySkipParentheses.link(this);
+50491:             success.link(this);
+50491:         }
+50491:     }
+50491: 
+50491:     void generateParenthesesGreedyNoBacktrack(TermGenerationState& state)
+50491:     {
+50491:         PatternTerm& parenthesesTerm = state.term();
+50491:         PatternDisjunction* disjunction = parenthesesTerm.parentheses.disjunction;
+50491:         ASSERT(parenthesesTerm.type == PatternTerm::TypeParenthesesSubpattern);
+50491:         ASSERT(parenthesesTerm.quantityCount != 1); // Handled by generateParenthesesSingle.
+50491: 
+50491:         // Capturing not yet implemented!
+50491:         if (parenthesesTerm.invertOrCapture) {
+50491:             m_shouldFallBack = true;
+50491:             return;
+50491:         }
+50491: 
+50491:         // Quantification limit not yet implemented!
+50491:         if (parenthesesTerm.quantityCount != 0xffffffff) {
+50491:             m_shouldFallBack = true;
+50491:             return;
+50491:         }
+50491: 
+50491:         // Need to reset nested subpatterns between iterations...
+50491:         // for the minute this crude check rejects all patterns with any subpatterns!
+50491:         if (m_pattern.m_numSubpatterns) {
+50491:             m_shouldFallBack = true;
+50491:             return;
+50491:         }
+50491: 
+50491:         TermGenerationState parenthesesState(disjunction, state.checkedTotal);
+50491: 
+50491:         Label matchAgain(this);
+50491: 
+50491:         storeToFrame(index, parenthesesTerm.frameLocation); // Save the current index to check for zero len matches later.
+50491: 
+50491:         for (parenthesesState.resetAlternative(); parenthesesState.alternativeValid(); parenthesesState.nextAlternative()) {
+50491: 
+50491:             PatternAlternative* alternative = parenthesesState.alternative();
+50491:             optimizeAlternative(alternative);
+50491: 
+50491:             int countToCheck = alternative->m_minimumSize;
+50491:             if (countToCheck) {
+50491:                 parenthesesState.addBacktrackJump(jumpIfNoAvailableInput(countToCheck));
+50491:                 parenthesesState.checkedTotal += countToCheck;
+50491:             }
+50491: 
+50491:             for (parenthesesState.resetTerm(); parenthesesState.termValid(); parenthesesState.nextTerm())
+50491:                 generateTerm(parenthesesState);
+50491: 
+50491:             // If we get here, we matched! If the index advanced then try to match more since limit isn't supported yet.
+50491:             branch32(GreaterThan, index, Address(stackPointerRegister, (parenthesesTerm.frameLocation * sizeof(void*))), matchAgain);
+50491: 
+50491:             parenthesesState.linkAlternativeBacktracks(this);
+50491:             // We get here if the alternative fails to match - fall through to the next iteration, or out of the loop.
+50491: 
+50491:             if (countToCheck) {
+50491:                 sub32(Imm32(countToCheck), index);
+50491:                 parenthesesState.checkedTotal -= countToCheck;
+50491:             }
+50491:         }
+50491: 
+50491:         // If the last alternative falls through to here, we have a failed match...
+50491:         // Which means that we match whatever we have matched up to this point (even if nothing).
+50491:     }
+50491: 
+50491:     void generateParentheticalAssertion(TermGenerationState& state)
+50491:     {
+50491:         PatternTerm& term = state.term();
+50491:         PatternDisjunction* disjunction = term.parentheses.disjunction;
+50491:         ASSERT(term.quantityCount == 1);
+50491:         ASSERT(term.quantityType == QuantifierFixedCount);
+50491: 
+50491:         unsigned parenthesesFrameLocation = term.frameLocation;
+50491:         unsigned alternativeFrameLocation = parenthesesFrameLocation + RegexStackSpaceForBackTrackInfoParentheticalAssertion;
+50491: 
+50491:         int countCheckedAfterAssertion = state.checkedTotal - term.inputPosition;
+50491: 
+50491:         if (term.invertOrCapture) {
+50491:             // Inverted case
+50491:             storeToFrame(index, parenthesesFrameLocation);
+50491: 
+50491:             state.checkedTotal -= countCheckedAfterAssertion;
+50491:             if (countCheckedAfterAssertion)
+50491:                 sub32(Imm32(countCheckedAfterAssertion), index);
+50491: 
+50491:             TermGenerationState parenthesesState(disjunction, state.checkedTotal);
+50491:             generateParenthesesDisjunction(state.term(), parenthesesState, alternativeFrameLocation);
+50491:             // Success! - which means - Fail!
+50491:             loadFromFrame(parenthesesFrameLocation, index);
+50491:             state.jumpToBacktrack(jump(), this);
+50491: 
+50491:             // And fail means success.
+50491:             parenthesesState.linkAlternativeBacktracks(this);
+50491:             loadFromFrame(parenthesesFrameLocation, index);
+50491: 
+50491:             state.checkedTotal += countCheckedAfterAssertion;
+50491:         } else {
+50491:             // Normal case
+50491:             storeToFrame(index, parenthesesFrameLocation);
+50491: 
+50491:             state.checkedTotal -= countCheckedAfterAssertion;
+50491:             if (countCheckedAfterAssertion)
+50491:                 sub32(Imm32(countCheckedAfterAssertion), index);
+50491: 
+50491:             TermGenerationState parenthesesState(disjunction, state.checkedTotal);
+50491:             generateParenthesesDisjunction(state.term(), parenthesesState, alternativeFrameLocation);
+50491:             // Success! - which means - Success!
+50491:             loadFromFrame(parenthesesFrameLocation, index);
+50491:             Jump success = jump();
+50491: 
+50491:             parenthesesState.linkAlternativeBacktracks(this);
+50491:             loadFromFrame(parenthesesFrameLocation, index);
+50491:             state.jumpToBacktrack(jump(), this);
+50491: 
+50491:             success.link(this);
+50491: 
+50491:             state.checkedTotal += countCheckedAfterAssertion;
+50491:         }
+50491:     }
+50491: 
+50491:     void generateTerm(TermGenerationState& state)
+50491:     {
+50491:         PatternTerm& term = state.term();
+50491: 
+50491:         switch (term.type) {
+50491:         case PatternTerm::TypeAssertionBOL:
+50491:             generateAssertionBOL(state);
+50491:             break;
+50491:         
+50491:         case PatternTerm::TypeAssertionEOL:
+50491:             generateAssertionEOL(state);
+50491:             break;
+50491:         
+50491:         case PatternTerm::TypeAssertionWordBoundary:
+50491:             generateAssertionWordBoundary(state);
+50491:             break;
+50491:         
+50491:         case PatternTerm::TypePatternCharacter:
+50491:             switch (term.quantityType) {
+50491:             case QuantifierFixedCount:
+50491:                 if (term.quantityCount == 1) {
+50491:                     if (state.isSinglePatternCharacterLookaheadTerm() && (state.lookaheadTerm().inputPosition == (term.inputPosition + 1))) {
+50491:                         generatePatternCharacterPair(state);
+50491:                         state.nextTerm();
+50491:                     } else
+50491:                         generatePatternCharacterSingle(state);
+50491:                 } else
+50491:                     generatePatternCharacterFixed(state);
+50491:                 break;
+50491:             case QuantifierGreedy:
+50491:                 generatePatternCharacterGreedy(state);
+50491:                 break;
+50491:             case QuantifierNonGreedy:
+50491:                 generatePatternCharacterNonGreedy(state);
+50491:                 break;
+50491:             }
+50491:             break;
+50491: 
+50491:         case PatternTerm::TypeCharacterClass:
+50491:             switch (term.quantityType) {
+50491:             case QuantifierFixedCount:
+50491:                 if (term.quantityCount == 1)
+50491:                     generateCharacterClassSingle(state);
+50491:                 else
+50491:                     generateCharacterClassFixed(state);
+50491:                 break;
+50491:             case QuantifierGreedy:
+50491:                 generateCharacterClassGreedy(state);
+50491:                 break;
+50491:             case QuantifierNonGreedy:
+50491:                 generateCharacterClassNonGreedy(state);
+50491:                 break;
+50491:             }
+50491:             break;
+50491: 
+50491:         case PatternTerm::TypeBackReference:
+50491:             m_shouldFallBack = true;
+50491:             break;
+50491: 
+50491:         case PatternTerm::TypeForwardReference:
+50491:             break;
+50491: 
+50491:         case PatternTerm::TypeParenthesesSubpattern:
+50491:             if (term.quantityCount == 1) {
+50491:                 generateParenthesesSingle(state);
+50491:                 break;
+50491:             } else if (state.isLastTerm() && state.isMainDisjunction()) { // Is this is the last term of the main disjunction?
+50491:                 // If this has a greedy quantifier, then it will never need to backtrack!
+50491:                 if (term.quantityType == QuantifierGreedy) {
+50491:                     generateParenthesesGreedyNoBacktrack(state);
+50491:                     break;
+50491:                 }
+50491:             }
+50491:             m_shouldFallBack = true;
+50491:             break;
+50491: 
+50491:         case PatternTerm::TypeParentheticalAssertion:
+50491:             generateParentheticalAssertion(state);
+50491:             break;
+50491:         }
+50491:     }
+50491: 
+50491:     void generateDisjunction(PatternDisjunction* disjunction)
+50491:     {
+50491:         TermGenerationState state(disjunction, 0);
+50491:         state.resetAlternative();
+50491: 
+50491:         // check availability for the next alternative
+50491:         int countCheckedForCurrentAlternative = 0;
+50491:         int countToCheckForFirstAlternative = 0;
+50491:         bool hasShorterAlternatives = false;
+55533:         bool setRepeatAlternativeLabels = false;
+50491:         JumpList notEnoughInputForPreviousAlternative;
+55533:         Label firstAlternative;
+55533:         Label firstAlternativeInputChecked;
+55533: 
+55533:         // The label 'firstAlternative' is used to plant a check to see if there is 
+55533:         // sufficient input available to run the first repeating alternative.
+55533:         // The label 'firstAlternativeInputChecked' will jump directly to matching 
+55533:         // the first repeating alternative having skipped this check.
+50491:         
+50491:         if (state.alternativeValid()) {
+50491:             PatternAlternative* alternative = state.alternative();
+55533:             if (!alternative->onceThrough()) {
+55533:                 firstAlternative = Label(this);
+55533:                 setRepeatAlternativeLabels = true;
+55533:             }
+50491:             countToCheckForFirstAlternative = alternative->m_minimumSize;
+50491:             state.checkedTotal += countToCheckForFirstAlternative;
+50491:             if (countToCheckForFirstAlternative)
+50491:                 notEnoughInputForPreviousAlternative.append(jumpIfNoAvailableInput(countToCheckForFirstAlternative));
+50491:             countCheckedForCurrentAlternative = countToCheckForFirstAlternative;
+50491:         }
+50491: 
+55533:         if (setRepeatAlternativeLabels)
+55533:             firstAlternativeInputChecked = Label(this);
+50491: 
+50491:         while (state.alternativeValid()) {
+50491:             PatternAlternative* alternative = state.alternative();
+50491:             optimizeAlternative(alternative);
+50491: 
+55533:             // Track whether any alternatives are shorter than the first one.
+55533:             if (!alternative->onceThrough())
+55533:                 hasShorterAlternatives = hasShorterAlternatives || (countCheckedForCurrentAlternative < countToCheckForFirstAlternative);
+55533:             
+50491:             for (state.resetTerm(); state.termValid(); state.nextTerm())
+50491:                 generateTerm(state);
+50491: 
+50491:             // If we get here, the alternative matched.
+50491:             if (m_pattern.m_body->m_callFrameSize)
+50491:                 addPtr(Imm32(m_pattern.m_body->m_callFrameSize * sizeof(void*)), stackPointerRegister);
+50491: 
+50491:             ASSERT(index != returnRegister);
+50491:             if (m_pattern.m_body->m_hasFixedSize) {
+50491:                 move(index, returnRegister);
+50491:                 if (alternative->m_minimumSize)
+50491:                     sub32(Imm32(alternative->m_minimumSize), returnRegister);
+50491: 
+50491:                 store32(returnRegister, output);
+50491:             } else
+50491:                 load32(Address(output), returnRegister);
+50491: 
+50491:             store32(index, Address(output, 4));
+50491: 
+50491:             generateReturn();
+50491: 
+50491:             state.nextAlternative();
+50491: 
+50491:             // if there are any more alternatives, plant the check for input before looping.
+50491:             if (state.alternativeValid()) {
+50491:                 PatternAlternative* nextAlternative = state.alternative();
+55533:                 if (!setRepeatAlternativeLabels && !nextAlternative->onceThrough()) {
+55533:                     // We have handled non-repeating alternatives, jump to next iteration 
+55533:                     // and loop over repeating alternatives.
+55533:                     state.jumpToBacktrack(jump(), this);
+55533:                     
+55533:                     countToCheckForFirstAlternative = nextAlternative->m_minimumSize;
+55533:                     
+55533:                     // If we get here, there the last input checked failed.
+55533:                     notEnoughInputForPreviousAlternative.link(this);
+55533:                     
+55533:                     state.linkAlternativeBacktracks(this);
+55533: 
+55533:                     // Back up to start the looping alternatives.
+55533:                     if (countCheckedForCurrentAlternative)
+55533:                         sub32(Imm32(countCheckedForCurrentAlternative), index);
+55533:                     
+55533:                     firstAlternative = Label(this);
+55533:                     
+55533:                     state.checkedTotal = countToCheckForFirstAlternative;
+55533:                     if (countToCheckForFirstAlternative)
+55533:                         notEnoughInputForPreviousAlternative.append(jumpIfNoAvailableInput(countToCheckForFirstAlternative));
+55533:                     
+55533:                     countCheckedForCurrentAlternative = countToCheckForFirstAlternative;
+55533:                     
+55533:                     firstAlternativeInputChecked = Label(this);
+55533: 
+55533:                     setRepeatAlternativeLabels = true;
+55533:                 } else {
+50491:                     int countToCheckForNextAlternative = nextAlternative->m_minimumSize;
+50491:                     
+50491:                     if (countCheckedForCurrentAlternative > countToCheckForNextAlternative) { // CASE 1: current alternative was longer than the next one.
+55533:                         // If we get here, then the last input checked failed.
+50491:                         notEnoughInputForPreviousAlternative.link(this);
+50491:                         
+50491:                         // Check if sufficent input available to run the next alternative 
+50491:                         notEnoughInputForPreviousAlternative.append(jumpIfNoAvailableInput(countToCheckForNextAlternative - countCheckedForCurrentAlternative));
+50491:                         // We are now in the correct state to enter the next alternative; this add is only required
+50491:                         // to mirror and revert operation of the sub32, just below.
+50491:                         add32(Imm32(countCheckedForCurrentAlternative - countToCheckForNextAlternative), index);
+50491:                         
+55533:                         // If we get here, then the last input checked passed.
+50491:                         state.linkAlternativeBacktracks(this);
+50491:                         // No need to check if we can run the next alternative, since it is shorter -
+50491:                         // just update index.
+50491:                         sub32(Imm32(countCheckedForCurrentAlternative - countToCheckForNextAlternative), index);
+50491:                     } else if (countCheckedForCurrentAlternative < countToCheckForNextAlternative) { // CASE 2: next alternative is longer than the current one.
+55533:                         // If we get here, then the last input checked failed.
+50491:                         // If there is insufficient input to run the current alternative, and the next alternative is longer,
+50491:                         // then there is definitely not enough input to run it - don't even check. Just adjust index, as if
+50491:                         // we had checked.
+50491:                         notEnoughInputForPreviousAlternative.link(this);
+50491:                         add32(Imm32(countToCheckForNextAlternative - countCheckedForCurrentAlternative), index);
+50491:                         notEnoughInputForPreviousAlternative.append(jump());
+50491:                         
+50491:                         // The next alternative is longer than the current one; check the difference.
+50491:                         state.linkAlternativeBacktracks(this);
+50491:                         notEnoughInputForPreviousAlternative.append(jumpIfNoAvailableInput(countToCheckForNextAlternative - countCheckedForCurrentAlternative));
+50491:                     } else { // CASE 3: Both alternatives are the same length.
+50491:                         ASSERT(countCheckedForCurrentAlternative == countToCheckForNextAlternative);
+50491:                         
+50491:                         // If the next alterative is the same length as this one, then no need to check the input -
+50491:                         // if there was sufficent input to run the current alternative then there is sufficient
+50491:                         // input to run the next one; if not, there isn't.
+50491:                         state.linkAlternativeBacktracks(this);
+50491:                     }
+50491:                     state.checkedTotal -= countCheckedForCurrentAlternative;
+50491:                     countCheckedForCurrentAlternative = countToCheckForNextAlternative;
+50491:                     state.checkedTotal += countCheckedForCurrentAlternative;
+50491:                 }
+50491:             }
+55533:         }
+50491:         
+50491:         // If we get here, all Alternatives failed...
+50491: 
+50491:         state.checkedTotal -= countCheckedForCurrentAlternative;
+50491: 
+55533:         if (!setRepeatAlternativeLabels) {
+55533:             // If there are no alternatives that need repeating (all are marked 'onceThrough') then just link
+55533:             // the match failures to this point, and fall through to the return below.
+55533:             state.linkAlternativeBacktracks(this);
+55533:             notEnoughInputForPreviousAlternative.link(this);
+55533:         } else {
+50491:             // How much more input need there be to be able to retry from the first alternative?
+50491:             // examples:
+50491:             //   /yarr_jit/ or /wrec|pcre/
+50491:             //     In these examples we need check for one more input before looping.
+50491:             //   /yarr_jit|pcre/
+50491:             //     In this case we need check for 5 more input to loop (+4 to allow for the first alterative
+50491:             //     being four longer than the last alternative checked, and another +1 to effectively move
+50491:             //     the start position along by one).
+50491:             //   /yarr|rules/ or /wrec|notsomuch/
+50491:             //     In these examples, provided that there was sufficient input to have just been matching for
+50491:             //     the second alternative we can loop without checking for available input (since the second
+50491:             //     alternative is longer than the first).  In the latter example we need to decrement index
+50491:             //     (by 4) so the start position is only progressed by 1 from the last iteration.
+50491:             int incrementForNextIter = (countToCheckForFirstAlternative - countCheckedForCurrentAlternative) + 1;
+50491: 
+50491:             // First, deal with the cases where there was sufficient input to try the last alternative.
+50491:             if (incrementForNextIter > 0) // We need to check for more input anyway, fall through to the checking below.
+50491:                 state.linkAlternativeBacktracks(this);
+50491:             else if (m_pattern.m_body->m_hasFixedSize && !incrementForNextIter) // No need to update anything, link these backtracks straight to the to pof the loop!
+50491:                 state.linkAlternativeBacktracksTo(firstAlternativeInputChecked, this);
+50491:             else { // no need to check the input, but we do have some bookkeeping to do first.
+50491:                 state.linkAlternativeBacktracks(this);
+50491: 
+50491:                 // Where necessary update our preserved start position.
+50491:                 if (!m_pattern.m_body->m_hasFixedSize) {
+50491:                     move(index, regT0);
+50491:                     sub32(Imm32(countCheckedForCurrentAlternative - 1), regT0);
+50491:                     store32(regT0, Address(output));
+50491:                 }
+50491: 
+50491:                 // Update index if necessary, and loop (without checking).
+50491:                 if (incrementForNextIter)
+50491:                     add32(Imm32(incrementForNextIter), index);
+50491:                 jump().linkTo(firstAlternativeInputChecked, this);
+50491:             }
+50491: 
+50491:             notEnoughInputForPreviousAlternative.link(this);
+50491:             // Update our idea of the start position, if we're tracking this.
+50491:             if (!m_pattern.m_body->m_hasFixedSize) {
+50491:                 if (countCheckedForCurrentAlternative - 1) {
+50491:                     move(index, regT0);
+50491:                     sub32(Imm32(countCheckedForCurrentAlternative - 1), regT0);
+50491:                     store32(regT0, Address(output));
+50491:                 } else
+50491:                     store32(index, Address(output));
+50491:             }
+55533:         
+50491:             // Check if there is sufficent input to run the first alternative again.
+50491:             jumpIfAvailableInput(incrementForNextIter).linkTo(firstAlternativeInputChecked, this);
+50491:             // No - insufficent input to run the first alteranative, are there any other alternatives we
+50491:             // might need to check?  If so, the last check will have left the index incremented by
+50491:             // (countToCheckForFirstAlternative + 1), so we need test whether countToCheckForFirstAlternative
+50491:             // LESS input is available, to have the effect of just progressing the start position by 1
+50491:             // from the last iteration.  If this check passes we can just jump up to the check associated
+50491:             // with the first alternative in the loop.  This is a bit sad, since we'll end up trying the
+50491:             // first alternative again, and this check will fail (otherwise the check planted just above
+50491:             // here would have passed).  This is a bit sad, however it saves trying to do something more
+50491:             // complex here in compilation, and in the common case we should end up coallescing the checks.
+50491:             //
+50491:             // FIXME: a nice improvement here may be to stop trying to match sooner, based on the least
+50491:             // of the minimum-alternative-lengths.  E.g. if I have two alternatives of length 200 and 150,
+50491:             // and a string of length 100, we'll end up looping index from 0 to 100, checking whether there
+50491:             // is sufficient input to run either alternative (constantly failing).  If there had been only
+50491:             // one alternative, or if the shorter alternative had come first, we would have terminated
+50491:             // immediately. :-/
+50491:             if (hasShorterAlternatives)
+50491:                 jumpIfAvailableInput(-countToCheckForFirstAlternative).linkTo(firstAlternative, this);
+50491:             // index will now be a bit garbled (depending on whether 'hasShorterAlternatives' is true,
+50491:             // it has either been incremented by 1 or by (countToCheckForFirstAlternative + 1) ... 
+50491:             // but since we're about to return a failure this doesn't really matter!)
+55533:         }
+50491: 
+50491:         if (m_pattern.m_body->m_callFrameSize)
+50491:             addPtr(Imm32(m_pattern.m_body->m_callFrameSize * sizeof(void*)), stackPointerRegister);
+50491: 
+50491:         move(Imm32(-1), returnRegister);
+50491: 
+50491:         generateReturn();
+50491:     }
+50491: 
+50491:     void generateEnter()
+50491:     {
+50491: #if WTF_CPU_X86_64
+50491:         push(X86Registers::ebp);
+50491:         move(stackPointerRegister, X86Registers::ebp);
+50491:         push(X86Registers::ebx);
+50491: #elif WTF_CPU_X86
+50491:         push(X86Registers::ebp);
+50491:         move(stackPointerRegister, X86Registers::ebp);
+50491:         // TODO: do we need spill registers to fill the output pointer if there are no sub captures?
+50491:         push(X86Registers::ebx);
+50491:         push(X86Registers::edi);
+50491:         push(X86Registers::esi);
+50491:         // load output into edi (2 = saved ebp + return address).
+53468:     #if WTF_COMPILER_MSVC || WTF_COMPILER_SUNPRO
+50491:         loadPtr(Address(X86Registers::ebp, 2 * sizeof(void*)), input);
+50491:         loadPtr(Address(X86Registers::ebp, 3 * sizeof(void*)), index);
+50491:         loadPtr(Address(X86Registers::ebp, 4 * sizeof(void*)), length);
+50491:         loadPtr(Address(X86Registers::ebp, 5 * sizeof(void*)), output);
+50491:     #else
+50491:         loadPtr(Address(X86Registers::ebp, 2 * sizeof(void*)), output);
+50491:     #endif
+50491: #elif WTF_CPU_ARM
+50491:         push(ARMRegisters::r4);
+50491:         push(ARMRegisters::r5);
+50491:         push(ARMRegisters::r6);
+55533: #if WTF_CPU_ARM_TRADITIONAL
+55533:         push(ARMRegisters::r8); // scratch register
+55533: #endif
+50491:         move(ARMRegisters::r3, output);
+50491: #elif WTF_CPU_MIPS
+50491:         // Do nothing.
+50491: #endif
+50491:     }
+50491: 
+50491:     void generateReturn()
+50491:     {
+50491: #if WTF_CPU_X86_64
+50491:         pop(X86Registers::ebx);
+50491:         pop(X86Registers::ebp);
+50491: #elif WTF_CPU_X86
+50491:         pop(X86Registers::esi);
+50491:         pop(X86Registers::edi);
+50491:         pop(X86Registers::ebx);
+50491:         pop(X86Registers::ebp);
+50491: #elif WTF_CPU_ARM
+55533: #if WTF_CPU_ARM_TRADITIONAL
+55533:         pop(ARMRegisters::r8); // scratch register
+55533: #endif
+50491:         pop(ARMRegisters::r6);
+50491:         pop(ARMRegisters::r5);
+50491:         pop(ARMRegisters::r4);
+50491: #elif WTF_CPU_MIPS
+50491:         // Do nothing
+50491: #endif
+50491:         ret();
+50491:     }
+50491: 
+50491: public:
+50491:     RegexGenerator(RegexPattern& pattern)
+50491:         : m_pattern(pattern)
+50491:         , m_shouldFallBack(false)
+50491:     {
+50491:     }
+50491: 
+50491:     void generate()
+50491:     {
+50491:         generateEnter();
+50491: 
+50491:         if (!m_pattern.m_body->m_hasFixedSize)
+50491:             store32(index, Address(output));
+50491: 
+50491:         if (m_pattern.m_body->m_callFrameSize)
+50491:             subPtr(Imm32(m_pattern.m_body->m_callFrameSize * sizeof(void*)), stackPointerRegister);
+50491: 
+50491:         generateDisjunction(m_pattern.m_body);
+50491:     }
+50491: 
+50491:     void compile(ExecutableAllocator& allocator, RegexCodeBlock& jitObject)
+50491:     {
+50491:         generate();
+50491: 
+56037:         if (oom()) {
+56037:             m_shouldFallBack = true;
+56037:             return;
+56037:         }
+56037: 
+50491:         ExecutablePool *executablePool = allocator.poolForSize(size());
+50491:         if (!executablePool) {
+50491:             m_shouldFallBack = true;
+50491:             return;
+50491:         }
+50491: 
+50491:         LinkBuffer patchBuffer(this, executablePool);
+50491: 
+50491:         for (unsigned i = 0; i < m_backtrackRecords.length(); ++i)
+50491:             patchBuffer.patch(m_backtrackRecords[i].dataLabel, patchBuffer.locationOf(m_backtrackRecords[i].backtrackLocation));
+50491: 
+50491:         jitObject.set(patchBuffer.finalizeCode());
+50491:     }
+50491: 
+50491:     bool shouldFallBack()
+50491:     {
+50491:         return m_shouldFallBack;
+50491:     }
+50491: 
+50491: private:
+50491:     RegexPattern& m_pattern;
+50491:     bool m_shouldFallBack;
+50491:     js::Vector<AlternativeBacktrackRecord, 0, js::SystemAllocPolicy> m_backtrackRecords;
+50491: };
+50491: 
+55910: void jitCompileRegex(ExecutableAllocator& allocator, RegexCodeBlock& jitObject, const UString&patternString, unsigned& numSubpatterns, int &error, bool &fellBack, bool ignoreCase, bool multiline
+55910: #ifdef ANDROID
+55910:                      , bool forceFallback
+55910: #endif
+55910: )
+50491: {
+55910: #ifdef ANDROID
+55910:     if (!forceFallback) {
+55910: #endif
+50491:     fellBack = false;
+50491:     RegexPattern pattern(ignoreCase, multiline);
+50491:     if ((error = compileRegex(patternString, pattern)))
+50491:         return;
+50491:     numSubpatterns = pattern.m_numSubpatterns;
+50491: 
+50491:     if (!pattern.m_containsBackreferences) {
+50491:         RegexGenerator generator(pattern);
+50491:         generator.compile(allocator, jitObject);
+50491:         if (!generator.shouldFallBack())
+50491:             return;
+50491:     }
+55910: #ifdef ANDROID
+55910:     } // forceFallback
+55910: #endif
+50491: 
+50491:     fellBack = true;
+50491:     JSRegExpIgnoreCaseOption ignoreCaseOption = ignoreCase ? JSRegExpIgnoreCase : JSRegExpDoNotIgnoreCase;
+50491:     JSRegExpMultilineOption multilineOption = multiline ? JSRegExpMultiline : JSRegExpSingleLine;
+50491:     jitObject.setFallback(jsRegExpCompile(reinterpret_cast<const UChar*>(const_cast<UString &>(patternString).chars()), patternString.length(), ignoreCaseOption, multilineOption, &numSubpatterns, &error));
+50491: }
+50491: 
+50491: }}
+50491: 
+50491: #endif

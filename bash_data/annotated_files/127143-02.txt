@@ -1,0 +1,379 @@
+100179: /* This Source Code Form is subject to the terms of the Mozilla Public
+100179:  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+100179:  * You can obtain one at http://mozilla.org/MPL/2.0/. */
+100179: 
+100179: #include "MediaEngine.h"
+100179: #include "mozilla/Services.h"
+126735: #include "nsIMediaManager.h"
+100179: 
+100179: #include "nsHashKeys.h"
+104351: #include "nsGlobalWindow.h"
+100179: #include "nsClassHashtable.h"
+116351: #include "nsRefPtrHashtable.h"
+100179: #include "nsObserverService.h"
+100179: 
+101616: #include "nsPIDOMWindow.h"
+100179: #include "nsIDOMNavigatorUserMedia.h"
+102221: #include "mozilla/Attributes.h"
+126735: #include "mozilla/StaticPtr.h"
+118976: #include "prlog.h"
+100179: 
+100179: namespace mozilla {
+100179: 
+118976: #ifdef PR_LOGGING
+120415: extern PRLogModuleInfo* GetMediaManagerLog();
+120415: #define MM_LOG(msg) PR_LOG(GetMediaManagerLog(), PR_LOG_DEBUG, msg)
+118976: #else
+118976: #define MM_LOG(msg)
+118976: #endif
+118976: 
+108862: class GetUserMediaNotificationEvent: public nsRunnable
+108862: {
+108862:   public:
+108862:     enum GetUserMediaStatus {
+108862:       STARTING,
+108862:       STOPPING
+108862:     };
+108862:     GetUserMediaNotificationEvent(GetUserMediaStatus aStatus)
+108862:     : mStatus(aStatus) {}
+108862: 
+108862:     NS_IMETHOD
+108862:     Run()
+108862:     {
+108862:       nsCOMPtr<nsIObserverService> obs = mozilla::services::GetObserverService();
+108862:       if (!obs) {
+108862:         NS_WARNING("Could not get the Observer service for GetUserMedia recording notification.");
+108862:         return NS_ERROR_FAILURE;
+108862:       }
+108862:       if (mStatus) {
+108862:         obs->NotifyObservers(nullptr,
+108862:             "recording-device-events",
+108862:             NS_LITERAL_STRING("starting").get());
+108862:       } else {
+108862:         obs->NotifyObservers(nullptr,
+108862:             "recording-device-events",
+108862:             NS_LITERAL_STRING("shutdown").get());
+108862:       }
+108862:       return NS_OK;
+108862:     }
+108862: 
+108862:   protected:
+108862:     GetUserMediaStatus mStatus;
+108862: };
+108862: 
+119959: /**
+119959:  * This class is an implementation of MediaStreamListener. This is used
+119959:  * to Start() and Stop() the underlying MediaEngineSource when MediaStreams
+119959:  * are assigned and deassigned in content.
+119959:  */
+119959: class GetUserMediaCallbackMediaStreamListener : public MediaStreamListener
+119959: {
+119959: public:
+119959:   GetUserMediaCallbackMediaStreamListener(nsIThread *aThread,
+119959:     nsDOMMediaStream* aStream,
+119959:     MediaEngineSource* aAudioSource,
+119959:     MediaEngineSource* aVideoSource)
+119959:     : mMediaThread(aThread)
+119959:     , mAudioSource(aAudioSource)
+119959:     , mVideoSource(aVideoSource)
+127142:     , mStream(aStream)
+127142:     , mSourceStream(aStream->GetStream()->AsSourceStream())
+127142:     , mLastEndTimeAudio(0)
+127143:     , mLastEndTimeVideo(0) { MOZ_ASSERT(mSourceStream); }
+119954: 
+127035:   ~GetUserMediaCallbackMediaStreamListener()
+127035:   {
+127035:     // In theory this could be released from the MediaStreamGraph thread (RemoveListener)
+127035:     if (mStream) {
+127035:       nsCOMPtr<nsIThread> mainThread = do_GetMainThread();
+127035:       nsDOMMediaStream *stream;
+127035:       mStream.forget(&stream);
+127035:       // Releases directly if on MainThread already
+127035:       NS_ProxyRelease(mainThread, stream, false);
+127035:     }
+127035:   }
+127035: 
+127143:   SourceMediaStream *GetSourceStream()
+127143:   {
+127143:     return mStream->GetStream()->AsSourceStream();
+127143:   }
+127143: 
+119954:   void
+127143:   Invalidate(); // implement in .cpp to avoid circular dependency with MediaOperationRunnable
+100179: 
+127035:   void
+127035:   Remove()
+127035:   {
+127035:     NS_ASSERTION(NS_IsMainThread(), "Only call on main thread");
+127035:     // Caller holds strong reference to us, so no death grip required
+127035:     mStream->GetStream()->RemoveListener(this);
+127035:   }
+127035: 
+119168:   // Proxy NotifyPull() to sources
+119168:   void
+119168:   NotifyPull(MediaStreamGraph* aGraph, StreamTime aDesiredTime)
+119168:   {
+119168:     // Currently audio sources ignore NotifyPull, but they could
+119168:     // watch it especially for fake audio.
+119168:     if (mAudioSource) {
+127142:       mAudioSource->NotifyPull(aGraph, mSourceStream, kAudioTrack, aDesiredTime, mLastEndTimeAudio);
+119168:     }
+119168:     if (mVideoSource) {
+127142:       mVideoSource->NotifyPull(aGraph, mSourceStream, kVideoTrack, aDesiredTime, mLastEndTimeVideo);
+119168:     }
+119168:   }
+119168: 
+119960:   void
+119960:   NotifyFinished(MediaStreamGraph* aGraph)
+119960:   {
+119960:     Invalidate();
+127035:     // XXX right now this calls Finish, which isn't ideal but doesn't hurt
+119960:   }
+119960: 
+100179: private:
+119959:   nsCOMPtr<nsIThread> mMediaThread;
+118976:   nsRefPtr<MediaEngineSource> mAudioSource;
+118976:   nsRefPtr<MediaEngineSource> mVideoSource;
+119960:   nsRefPtr<nsDOMMediaStream> mStream;
+127142:   SourceMediaStream *mSourceStream; // mStream controls ownership
+127142:   TrackTicks mLastEndTimeAudio;
+127142:   TrackTicks mLastEndTimeVideo;
+100179: };
+100179: 
+127143: typedef enum {
+127143:   MEDIA_START,
+127143:   MEDIA_STOP
+127143: } MediaOperation;
+127143: 
+127143: // Generic class for running long media operations like Start off the main
+127143: // thread, and then (because nsDOMMediaStreams aren't threadsafe),
+127143: // ProxyReleases mStream since it's cycle collected.
+127143: class MediaOperationRunnable : public nsRunnable
+127143: {
+127143: public:
+127143:   MediaOperationRunnable(MediaOperation aType,
+127143:     nsDOMMediaStream* aStream,
+127143:     MediaEngineSource* aAudioSource,
+127143:     MediaEngineSource* aVideoSource)
+127143:     : mType(aType)
+127143:     , mAudioSource(aAudioSource)
+127143:     , mVideoSource(aVideoSource)
+127143:     , mStream(aStream)
+127143:     {}
+127143: 
+127143:   MediaOperationRunnable(MediaOperation aType,
+127143:     GetUserMediaCallbackMediaStreamListener* aListener,
+127143:     MediaEngineSource* aAudioSource,
+127143:     MediaEngineSource* aVideoSource)
+127143:     : mType(aType)
+127143:     , mAudioSource(aAudioSource)
+127143:     , mVideoSource(aVideoSource)
+127143:     , mStream(nullptr)
+127143:     , mListener(aListener)
+127143:     {}
+127143: 
+127143:   ~MediaOperationRunnable()
+127143:   {
+127143:     // nsDOMMediaStreams are cycle-collected and thus main-thread-only for
+127143:     // refcounting and releasing
+127143:     if (mStream) {
+127143:       nsCOMPtr<nsIThread> mainThread = do_GetMainThread();
+127143:       nsDOMMediaStream *stream;
+127143:       mStream.forget(&stream);
+127143:       NS_ProxyRelease(mainThread, stream, true);
+127143:     }
+127143:   }
+127143: 
+127143:   NS_IMETHOD
+127143:   Run()
+127143:   {
+127143:     SourceMediaStream *source;
+127143:     // No locking between these is required as all the callbacks for the
+127143:     // same MediaStream will occur on the same thread.
+127143:     if (mStream) {
+127143:       source = mStream->GetStream()->AsSourceStream();
+127143:     } else {
+127143:       source = mListener->GetSourceStream();
+127143:     }
+127143:     MOZ_ASSERT(source);
+127143:     if (!source)  // paranoia
+127143:       return NS_ERROR_FAILURE;
+127143: 
+127143:     switch (mType) {
+127143:       case MEDIA_START:
+127143:         {
+127143:           NS_ASSERTION(!NS_IsMainThread(), "Never call on main thread");
+127143:           nsresult rv;
+127143: 
+127143:           source->SetPullEnabled(true);
+127143: 
+127143:           if (mAudioSource) {
+127143:             rv = mAudioSource->Start(source, kAudioTrack);
+127143:             if (NS_FAILED(rv)) {
+127143:               MM_LOG(("Starting audio failed, rv=%d",rv));
+127143:             }
+127143:           }
+127143:           if (mVideoSource) {
+127143:             rv = mVideoSource->Start(source, kVideoTrack);
+127143:             if (NS_FAILED(rv)) {
+127143:               MM_LOG(("Starting video failed, rv=%d",rv));
+127143:             }
+127143:           }
+127143: 
+127143:           MM_LOG(("started all sources"));
+127143:           nsRefPtr<GetUserMediaNotificationEvent> event =
+127143:             new GetUserMediaNotificationEvent(GetUserMediaNotificationEvent::STARTING);
+127143: 
+127143: 
+127143:           NS_DispatchToMainThread(event, NS_DISPATCH_NORMAL);
+127143:         }
+127143:         break;
+127143: 
+127143:       case MEDIA_STOP:
+127143:         {
+127143:           NS_ASSERTION(!NS_IsMainThread(), "Never call on main thread");
+127143:           if (mAudioSource) {
+127143:             mAudioSource->Stop(source, kAudioTrack);
+127143:             mAudioSource->Deallocate();
+127143:           }
+127143:           if (mVideoSource) {
+127143:             mVideoSource->Stop(source, kVideoTrack);
+127143:             mVideoSource->Deallocate();
+127143:           }
+127143:           // Do this after stopping all tracks with EndTrack()
+127143:           source->Finish();
+127143: 
+127143:           nsRefPtr<GetUserMediaNotificationEvent> event =
+127143:             new GetUserMediaNotificationEvent(GetUserMediaNotificationEvent::STOPPING);
+127143: 
+127143:           NS_DispatchToMainThread(event, NS_DISPATCH_NORMAL);
+127143:         }
+127143:         break;
+127143: 
+127143:       default:
+127143:         MOZ_ASSERT(false,"invalid MediaManager operation");
+127143:         break;
+127143:     }
+127143:     return NS_OK;
+127143:   }
+127143: 
+127143: private:
+127143:   MediaOperation mType;
+127143:   nsRefPtr<MediaEngineSource> mAudioSource; // threadsafe
+127143:   nsRefPtr<MediaEngineSource> mVideoSource; // threadsafe
+127143:   nsRefPtr<nsDOMMediaStream> mStream;       // not threadsafe
+127143:   nsRefPtr<GetUserMediaCallbackMediaStreamListener> mListener; // threadsafe
+127143: };
+127143: 
+100179: typedef nsTArray<nsRefPtr<GetUserMediaCallbackMediaStreamListener> > StreamListeners;
+100179: typedef nsClassHashtable<nsUint64HashKey, StreamListeners> WindowTable;
+100179: 
+114595: class MediaDevice : public nsIMediaDevice
+114595: {
+114595: public:
+114595:   NS_DECL_ISUPPORTS
+114595:   NS_DECL_NSIMEDIADEVICE
+114595: 
+114595:   MediaDevice(MediaEngineVideoSource* aSource) {
+114595:     mSource = aSource;
+114595:     mType.Assign(NS_LITERAL_STRING("video"));
+114595:     mSource->GetName(mName);
+126252:     mSource->GetUUID(mID);
+125300:   }
+114595:   MediaDevice(MediaEngineAudioSource* aSource) {
+114595:     mSource = aSource;
+114595:     mType.Assign(NS_LITERAL_STRING("audio"));
+114595:     mSource->GetName(mName);
+126252:     mSource->GetUUID(mID);
+125300:   }
+125300:   virtual ~MediaDevice() {}
+114595: 
+114595:   MediaEngineSource* GetSource();
+114595: private:
+114595:   nsString mName;
+114595:   nsString mType;
+126252:   nsString mID;
+114595:   nsRefPtr<MediaEngineSource> mSource;
+114595: };
+114595: 
+126735: class MediaManager MOZ_FINAL : public nsIMediaManagerService,
+126735:                                public nsIObserver
+114595: {
+100179: public:
+126735:   static already_AddRefed<MediaManager> GetInstance();
+126735: 
+100179:   static MediaManager* Get() {
+100179:     if (!sSingleton) {
+100179:       sSingleton = new MediaManager();
+100179: 
+120005:       NS_NewThread(getter_AddRefs(sSingleton->mMediaThread));
+120005:       MM_LOG(("New Media thread for gum"));
+120005: 
+119975:       NS_ASSERTION(NS_IsMainThread(), "Only create MediaManager on main thread");
+100179:       nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
+100179:       obs->AddObserver(sSingleton, "xpcom-shutdown", false);
+116351:       obs->AddObserver(sSingleton, "getUserMedia:response:allow", false);
+116351:       obs->AddObserver(sSingleton, "getUserMedia:response:deny", false);
+100179:     }
+100179:     return sSingleton;
+100179:   }
+119959:   static nsIThread* GetThread() {
+120005:     return Get()->mMediaThread;
+119959:   }
+100179: 
+100179:   NS_DECL_ISUPPORTS
+100179:   NS_DECL_NSIOBSERVER
+126735:   NS_DECL_NSIMEDIAMANAGERSERVICE
+100179: 
+100179:   MediaEngine* GetBackend();
+121787:   StreamListeners *GetWindowListeners(uint64_t aWindowId) {
+120005:     NS_ASSERTION(NS_IsMainThread(), "Only access windowlist on main thread");
+120005: 
+121787:     return mActiveWindows.Get(aWindowId);
+121787:   }
+121787:   bool IsWindowStillActive(uint64_t aWindowId) {
+121787:     return !!GetWindowListeners(aWindowId);
+120005:   }
+100179: 
+114595:   nsresult GetUserMedia(bool aPrivileged, nsPIDOMWindow* aWindow,
+114595:     nsIMediaStreamOptions* aParams,
+100179:     nsIDOMGetUserMediaSuccessCallback* onSuccess,
+100179:     nsIDOMGetUserMediaErrorCallback* onError);
+114595:   nsresult GetUserMediaDevices(nsPIDOMWindow* aWindow,
+114595:     nsIGetUserMediaDevicesSuccessCallback* onSuccess,
+114595:     nsIDOMGetUserMediaErrorCallback* onError);
+108991:   void OnNavigation(uint64_t aWindowID);
+100179: 
+100179: private:
+120005:   WindowTable *GetActiveWindows() {
+120005:     NS_ASSERTION(NS_IsMainThread(), "Only access windowlist on main thread");
+120005:     return &mActiveWindows;
+125300:   }
+120005: 
+100179:   // Make private because we want only one instance of this class
+100179:   MediaManager()
+120005:   : mMediaThread(nullptr)
+120005:   , mMutex("mozilla::MediaManager")
+120005:   , mBackend(nullptr) {
+100179:     mActiveWindows.Init();
+116351:     mActiveCallbacks.Init();
+125300:   }
+100179: 
+100179:   ~MediaManager() {
+100179:     delete mBackend;
+125300:   }
+100179: 
+120005:   // ONLY access from MainThread so we don't need to lock
+120005:   WindowTable mActiveWindows;
+120005:   nsRefPtrHashtable<nsStringHashKey, nsRunnable> mActiveCallbacks;
+120005:   // Always exists
+120005:   nsCOMPtr<nsIThread> mMediaThread;
+120005: 
+119959:   Mutex mMutex;
+119959:   // protected with mMutex:
+100179:   MediaEngine* mBackend;
+100179: 
+126735:   static StaticRefPtr<MediaManager> sSingleton;
+100179: };
+100179: 
+100179: } // namespace mozilla

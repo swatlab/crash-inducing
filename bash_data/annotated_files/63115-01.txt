@@ -1,0 +1,616 @@
+15803: /* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*-
+27270:  * vim: sw=2 ts=2 et lcs=trail\:.,tab\:>~ :
+15803:  * ***** BEGIN LICENSE BLOCK *****
+15803:  * Version: MPL 1.1/GPL 2.0/LGPL 2.1
+15803:  *
+15803:  * The contents of this file are subject to the Mozilla Public License Version
+15803:  * 1.1 (the "License"); you may not use this file except in compliance with
+15803:  * the License. You may obtain a copy of the License at
+15803:  * http://www.mozilla.org/MPL/
+15803:  *
+15803:  * Software distributed under the License is distributed on an "AS IS" basis,
+15803:  * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+15803:  * for the specific language governing rights and limitations under the
+15803:  * License.
+15803:  *
+15803:  * The Original Code is mozilla.org code.
+15803:  *
+15803:  * The Initial Developer of the Original Code is
+15803:  * Mozilla Corporation. 
+15803:  * Portions created by the Initial Developer are Copyright (C) 2008
+15803:  * the Initial Developer. All Rights Reserved.
+15803:  *
+15803:  * Contributor(s):
+15803:  *   Shawn Wilsher <me@shawnwilsher.com> (Original Author)
+15803:  *
+15803:  * Alternatively, the contents of this file may be used under the terms of
+15803:  * either the GNU General Public License Version 2 or later (the "GPL"), or
+15803:  * the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+15803:  * in which case the provisions of the GPL or the LGPL are applicable instead
+15803:  * of those above. If you wish to allow use of your version of this file only
+15803:  * under the terms of either the GPL or the LGPL, and not to allow others to
+15803:  * use your version of this file under the terms of the MPL, indicate your
+15803:  * decision by deleting the provisions above and replace them with the notice
+15803:  * and other provisions required by the GPL or the LGPL. If you do not delete
+15803:  * the provisions above, a recipient may use your version of this file under
+15803:  * the terms of any one of the MPL, the GPL or the LGPL.
+15803:  *
+15803:  * ***** END LICENSE BLOCK ***** */
+15803: 
+15803: #include "nsAutoPtr.h"
+21054: #include "prtime.h"
+15803: 
+20280: #include "sqlite3.h"
+20280: 
+15803: #include "mozIStorageStatementCallback.h"
+29548: #include "mozStorageBindingParams.h"
+20442: #include "mozStorageHelper.h"
+15803: #include "mozStorageResultSet.h"
+15803: #include "mozStorageRow.h"
+21035: #include "mozStorageConnection.h"
+15803: #include "mozStorageError.h"
+26107: #include "mozStoragePrivateHelpers.h"
+29548: #include "mozStorageStatementData.h"
+27569: #include "mozStorageAsyncStatementExecution.h"
+15803: 
+27569: namespace mozilla {
+27569: namespace storage {
+27440: 
+21054: /**
+21054:  * The following constants help batch rows into result sets.
+21054:  * MAX_MILLISECONDS_BETWEEN_RESULTS was chosen because any user-based task that
+21054:  * takes less than 200 milliseconds is considered to feel instantaneous to end
+21054:  * users.  MAX_ROWS_PER_RESULT was arbitrarily chosen to reduce the number of
+21054:  * dispatches to calling thread, while also providing reasonably-sized sets of
+21054:  * data for consumers.  Both of these constants are used because we assume that
+21054:  * consumers are trying to avoid blocking their execution thread for long
+21054:  * periods of time, and dispatching many small events to the calling thread will
+21054:  * end up blocking it.
+21054:  */
+30835: #define MAX_MILLISECONDS_BETWEEN_RESULTS 75
+21054: #define MAX_ROWS_PER_RESULT 15
+21054: 
+15803: ////////////////////////////////////////////////////////////////////////////////
+27569: //// Local Classes
+15803: 
+27569: namespace {
+15803: 
+27569: typedef AsyncExecuteStatements::ExecutionState ExecutionState;
+15803: 
+15803: /**
+15803:  * Notifies a callback with a result set.
+15803:  */
+27569: class CallbackResultNotifier : public nsRunnable
+15803: {
+15803: public:
+15803:   CallbackResultNotifier(mozIStorageStatementCallback *aCallback,
+15803:                          mozIStorageResultSet *aResults,
+27569:                          AsyncExecuteStatements *aEventStatus) :
+15803:       mCallback(aCallback)
+15803:     , mResults(aResults)
+20816:     , mEventStatus(aEventStatus)
+15803:   {
+15803:   }
+15803: 
+15803:   NS_IMETHOD Run()
+15803:   {
+21054:     NS_ASSERTION(mCallback, "Trying to notify about results without a callback!");
+21054: 
+27569:     if (mEventStatus->shouldNotify())
+15803:       (void)mCallback->HandleResult(mResults);
+15803: 
+15803:     return NS_OK;
+15803:   }
+15803: 
+15803: private:
+15803:   mozIStorageStatementCallback *mCallback;
+15803:   nsCOMPtr<mozIStorageResultSet> mResults;
+27569:   nsRefPtr<AsyncExecuteStatements> mEventStatus;
+15803: };
+15803: 
+15803: /**
+15803:  * Notifies the calling thread that an error has occurred.
+15803:  */
+27569: class ErrorNotifier : public nsRunnable
+15803: {
+15803: public:
+15803:   ErrorNotifier(mozIStorageStatementCallback *aCallback,
+15803:                 mozIStorageError *aErrorObj,
+27569:                 AsyncExecuteStatements *aEventStatus) :
+15803:       mCallback(aCallback)
+15803:     , mErrorObj(aErrorObj)
+20816:     , mEventStatus(aEventStatus)
+15803:   {
+15803:   }
+15803: 
+15803:   NS_IMETHOD Run()
+15803:   {
+27569:     if (mEventStatus->shouldNotify() && mCallback)
+15803:       (void)mCallback->HandleError(mErrorObj);
+15803: 
+15803:     return NS_OK;
+15803:   }
+15803: 
+15803: private:
+15803:   mozIStorageStatementCallback *mCallback;
+15803:   nsCOMPtr<mozIStorageError> mErrorObj;
+27569:   nsRefPtr<AsyncExecuteStatements> mEventStatus;
+15803: };
+15803: 
+15803: /**
+39769:  * Notifies the calling thread that the statement has finished executing.  Keeps
+39769:  * the AsyncExecuteStatements instance alive long enough so that it does not
+39769:  * get destroyed on the async thread if there are no other references alive.
+15803:  */
+27569: class CompletionNotifier : public nsRunnable
+15803: {
+15803: public:
+15803:   /**
+20280:    * This takes ownership of the callback.  It is released on the thread this is
+20280:    * dispatched to (which should always be the calling thread).
+15803:    */
+15803:   CompletionNotifier(mozIStorageStatementCallback *aCallback,
+39769:                      ExecutionState aReason,
+39769:                      AsyncExecuteStatements *aKeepAsyncAlive)
+39769:     : mKeepAsyncAlive(aKeepAsyncAlive)
+39769:     , mCallback(aCallback)
+15803:     , mReason(aReason)
+15803:   {
+15803:   }
+15803: 
+15803:   NS_IMETHOD Run()
+15803:   {
+39769:     if (mCallback) {
+15803:       (void)mCallback->HandleCompletion(mReason);
+15803:       NS_RELEASE(mCallback);
+39769:     }
+15803: 
+15803:     return NS_OK;
+15803:   }
+15803: 
+15803: private:
+39769:   nsRefPtr<AsyncExecuteStatements> mKeepAsyncAlive;
+15803:   mozIStorageStatementCallback *mCallback;
+15803:   ExecutionState mReason;
+15803: };
+15803: 
+27569: } // anonymous namespace
+27569: 
+27569: ////////////////////////////////////////////////////////////////////////////////
+27569: //// AsyncExecuteStatements
+27569: 
+27569: /* static */
+27569: nsresult
+29548: AsyncExecuteStatements::execute(StatementDataArray &aStatements,
+27569:                                 Connection *aConnection,
+27569:                                 mozIStorageStatementCallback *aCallback,
+27569:                                 mozIStoragePendingStatement **_stmt)
+15803: {
+27569:   // Create our event to run in the background
+27569:   nsRefPtr<AsyncExecuteStatements> event =
+27569:     new AsyncExecuteStatements(aStatements, aConnection, aCallback);
+27569:   NS_ENSURE_TRUE(event, NS_ERROR_OUT_OF_MEMORY);
+15803: 
+27569:   // Dispatch it to the background
+39769:   nsIEventTarget *target = aConnection->getAsyncExecutionTarget();
+27569:   NS_ENSURE_TRUE(target, NS_ERROR_NOT_AVAILABLE);
+29547:   nsresult rv = target->Dispatch(event, NS_DISPATCH_NORMAL);
+27569:   NS_ENSURE_SUCCESS(rv, rv);
+27569: 
+39287:   // Return it as the pending statement object and track it.
+27569:   NS_ADDREF(*_stmt = event);
+27569:   return NS_OK;
+27569: }
+27569: 
+29548: AsyncExecuteStatements::AsyncExecuteStatements(StatementDataArray &aStatements,
+29547:                                                Connection *aConnection,
+27569:                                                mozIStorageStatementCallback *aCallback)
+27569: : mConnection(aConnection)
+20442: , mTransactionManager(nsnull)
+15803: , mCallback(aCallback)
+27569: , mCallingThread(::do_GetCurrentThread())
+30835: , mMaxWait(TimeDuration::FromMilliseconds(MAX_MILLISECONDS_BETWEEN_RESULTS))
+30835: , mIntervalStart(TimeStamp::Now())
+15803: , mState(PENDING)
+32216: , mCancelRequested(false)
+32216: , mMutex(aConnection->sharedAsyncExecutionMutex)
+39769: , mDBMutex(aConnection->sharedDBMutex)
+15803: {
+20442:   (void)mStatements.SwapElements(aStatements);
+20442:   NS_ASSERTION(mStatements.Length(), "We weren't given any statements!");
+15803:   NS_IF_ADDREF(mCallback);
+15803: }
+15803: 
+27569: bool
+27569: AsyncExecuteStatements::shouldNotify()
+15803: {
+20816: #ifdef DEBUG
+32216:   mMutex.AssertNotCurrentThreadOwns();
+32216: 
+20816:   PRBool onCallingThread = PR_FALSE;
+20816:   (void)mCallingThread->IsOnCurrentThread(&onCallingThread);
+20816:   NS_ASSERTION(onCallingThread, "runEvent not running on the calling thread!");
+20816: #endif
+20816: 
+32216:   // We do not need to acquire mMutex here because it can only ever be written
+32216:   // to on the calling thread, and the only thread that can call us is the
+32216:   // calling thread, so we know that our access is serialized.
+20816:   return !mCancelRequested;
+15803: }
+15803: 
+27569: bool
+29548: AsyncExecuteStatements::bindExecuteAndProcessStatement(StatementData &aData,
+29548:                                                        bool aLastStatement)
+29548: {
+32216:   mMutex.AssertNotCurrentThreadOwns();
+32216: 
+39769:   sqlite3_stmt *aStatement = nsnull;
+39769:   // This cannot fail; we are only called if it's available.
+39769:   (void)aData.getSqliteStatement(&aStatement);
+39769:   NS_ASSERTION(aStatement, "You broke the code; do not call here like that!");
+29548:   BindingParamsArray *paramsArray(aData);
+29548: 
+29548:   // Iterate through all of our parameters, bind them, and execute.
+29548:   bool continueProcessing = true;
+29548:   BindingParamsArray::iterator itr = paramsArray->begin();
+29548:   BindingParamsArray::iterator end = paramsArray->end();
+29548:   while (itr != end && continueProcessing) {
+29548:     // Bind the data to our statement.
+39769:     nsCOMPtr<IStorageBindingParamsInternal> bindingInternal = 
+39769:       do_QueryInterface(*itr);
+39769:     nsCOMPtr<mozIStorageError> error = bindingInternal->bind(aStatement);
+29548:     if (error) {
+29548:       // Set our error state.
+32216:       mState = ERROR;
+29548: 
+29548:       // And notify.
+29548:       (void)notifyError(error);
+29548:       return false;
+29548:     }
+29548: 
+29548:     // Advance our iterator, execute, and then process the statement.
+29548:     itr++;
+29548:     bool lastStatement = aLastStatement && itr == end;
+39769:     continueProcessing = executeAndProcessStatement(aStatement, lastStatement);
+29548: 
+29548:     // Always reset our statement.
+39769:     (void)::sqlite3_reset(aStatement);
+29548:   }
+29548: 
+29548:   return continueProcessing;
+29548: }
+29548: 
+29548: bool
+27569: AsyncExecuteStatements::executeAndProcessStatement(sqlite3_stmt *aStatement,
+27569:                                                    bool aLastStatement)
+15803: {
+32216:   mMutex.AssertNotCurrentThreadOwns();
+32216: 
+29547:   // Execute our statement
+29547:   bool hasResults;
+29547:   do {
+29547:     hasResults = executeStatement(aStatement);
+21054: 
+29547:     // If we had an error, bail.
+29547:     if (mState == ERROR)
+27569:       return false;
+21054: 
+21054:     // If we have been canceled, there is no point in going on...
+32216:     {
+32216:       MutexAutoLock lockedScope(mMutex);
+21054:       if (mCancelRequested) {
+32216:         mState = CANCELED;
+27569:         return false;
+21054:       }
+32216:     }
+21054: 
+29547:     // Build our result set and notify if we got anything back and have a
+29547:     // callback to notify.
+29547:     if (mCallback && hasResults &&
+29547:         NS_FAILED(buildAndNotifyResults(aStatement))) {
+29547:       // We had an error notifying, so we notify on error and stop processing.
+32216:       mState = ERROR;
+29547: 
+29547:       // Notify, and stop processing statements.
+29547:       (void)notifyError(mozIStorageError::ERROR,
+29547:                         "An error occurred while notifying about results");
+29398: 
+27569:       return false;
+21054:     }
+29547:   } while (hasResults);
+21054: 
+26107: #ifdef DEBUG
+26107:   // Check to make sure that this statement was smart about what it did.
+28140:   checkAndLogStatementPerformance(aStatement);
+26107: #endif
+26107: 
+32216:   // If we are done, we need to set our state accordingly while we still hold
+32216:   // our mutex.  We would have already returned if we were canceled or had
+32216:   // an error at this point.
+27569:   if (aLastStatement)
+32216:     mState = COMPLETED;
+21054: 
+27569:   return true;
+21054: }
+21054: 
+29547: bool
+29547: AsyncExecuteStatements::executeStatement(sqlite3_stmt *aStatement)
+29547: {
+32216:   mMutex.AssertNotCurrentThreadOwns();
+32216: 
+29547:   while (true) {
+39769:     // lock the sqlite mutex so sqlite3_errmsg cannot change
+39769:     SQLiteMutexAutoLock lockedScope(mDBMutex);
+39769: 
+44141:     int rc = stepStmt(aStatement);
+29547:     // Stop if we have no more results.
+29547:     if (rc == SQLITE_DONE)
+29547:       return false;
+29547: 
+29547:     // If we got results, we can return now.
+29547:     if (rc == SQLITE_ROW)
+29547:       return true;
+29547: 
+29547:     // Some errors are not fatal, and we can handle them and continue.
+29547:     if (rc == SQLITE_BUSY) {
+39769:       // Don't hold the lock while we call outside our module.
+39769:       SQLiteMutexAutoUnlock unlockedScope(mDBMutex);
+39769: 
+29547:       // Yield, and try again
+29547:       (void)::PR_Sleep(PR_INTERVAL_NO_WAIT);
+29547:       continue;
+29547:     }
+29547: 
+29547:     // Set an error state.
+32216:     mState = ERROR;
+29547: 
+39769:     // Construct the error message before giving up the mutex (which we cannot
+39769:     // hold during the call to notifyError).
+39769:     sqlite3 *db = mConnection->GetNativeConnection();
+39769:     nsCOMPtr<mozIStorageError> errorObj(new Error(rc, ::sqlite3_errmsg(db)));
+39769:     // We cannot hold the DB mutex while calling notifyError.
+39769:     SQLiteMutexAutoUnlock unlockedScope(mDBMutex);
+39769:     (void)notifyError(errorObj);
+29547: 
+29547:     // Finally, indicate that we should stop processing.
+29547:     return false;
+29547:   }
+29547: }
+29547: 
+27569: nsresult
+27569: AsyncExecuteStatements::buildAndNotifyResults(sqlite3_stmt *aStatement)
+21054: {
+21054:   NS_ASSERTION(mCallback, "Trying to dispatch results without a callback!");
+32216:   mMutex.AssertNotCurrentThreadOwns();
+21054: 
+21054:   // Build result object if we need it.
+21054:   if (!mResultSet)
+28141:     mResultSet = new ResultSet();
+21054:   NS_ENSURE_TRUE(mResultSet, NS_ERROR_OUT_OF_MEMORY);
+21054: 
+28142:   nsRefPtr<Row> row(new Row());
+21054:   NS_ENSURE_TRUE(row, NS_ERROR_OUT_OF_MEMORY);
+21054: 
+21054:   nsresult rv = row->initialize(aStatement);
+21054:   NS_ENSURE_SUCCESS(rv, rv);
+21054: 
+21054:   rv = mResultSet->add(row);
+21054:   NS_ENSURE_SUCCESS(rv, rv);
+21054: 
+21054:   // If we have hit our maximum number of allowed results, or if we have hit
+21054:   // the maximum amount of time we want to wait for results, notify the
+21054:   // calling thread about it.
+30835:   TimeStamp now = TimeStamp::Now();
+30835:   TimeDuration delta = now - mIntervalStart;
+30835:   if (mResultSet->rows() >= MAX_ROWS_PER_RESULT || delta > mMaxWait) {
+21054:     // Notify the caller
+27569:     rv = notifyResults();
+21054:     if (NS_FAILED(rv))
+21054:       return NS_OK; // we'll try again with the next result
+21054: 
+21054:     // Reset our start time
+21054:     mIntervalStart = now;
+21054:   }
+21054: 
+21054:   return NS_OK;
+21054: }
+21054: 
+27569: nsresult
+27569: AsyncExecuteStatements::notifyComplete()
+15803: {
+32216:   mMutex.AssertNotCurrentThreadOwns();
+15803:   NS_ASSERTION(mState != PENDING,
+15803:                "Still in a pending state when calling Complete!");
+20280: 
+25557:   // Finalize our statements before we try to commit or rollback.  If we are
+25557:   // canceling and have statements that think they have pending work, the
+25557:   // rollback will fail.
+29548:   for (PRUint32 i = 0; i < mStatements.Length(); i++)
+63115:     mStatements[i].finalize(mCallingThread);
+25557: 
+20442:   // Handle our transaction, if we have one
+20442:   if (mTransactionManager) {
+20442:     if (mState == COMPLETED) {
+20442:       nsresult rv = mTransactionManager->Commit();
+20442:       if (NS_FAILED(rv)) {
+32216:         mState = ERROR;
+27569:         (void)notifyError(mozIStorageError::ERROR,
+20816:                           "Transaction failed to commit");
+20442:       }
+20442:     }
+20442:     else {
+20442:       (void)mTransactionManager->Rollback();
+20442:     }
+20442:     delete mTransactionManager;
+20442:     mTransactionManager = nsnull;
+20442:   }
+20442: 
+39769:   // Always generate a completion notification; it is what guarantees that our
+39769:   // destruction does not happen here on the async thread.
+15803:   nsRefPtr<CompletionNotifier> completionEvent =
+39769:     new CompletionNotifier(mCallback, mState, this);
+20816:   NS_ENSURE_TRUE(completionEvent, NS_ERROR_OUT_OF_MEMORY);
+15803: 
+20280:   // We no longer own mCallback (the CompletionNotifier takes ownership).
+15803:   mCallback = nsnull;
+20816: 
+20816:   (void)mCallingThread->Dispatch(completionEvent, NS_DISPATCH_NORMAL);
+20280: 
+15803:   return NS_OK;
+15803: }
+15803: 
+27569: nsresult
+27569: AsyncExecuteStatements::notifyError(PRInt32 aErrorCode,
+27569:                                     const char *aMessage)
+20816: {
+32216:   mMutex.AssertNotCurrentThreadOwns();
+39769:   mDBMutex.assertNotCurrentThreadOwns();
+32216: 
+20816:   if (!mCallback)
+20816:     return NS_OK;
+20816: 
+28139:   nsCOMPtr<mozIStorageError> errorObj(new Error(aErrorCode, aMessage));
+20816:   NS_ENSURE_TRUE(errorObj, NS_ERROR_OUT_OF_MEMORY);
+20816: 
+29548:   return notifyError(errorObj);
+29548: }
+29548: 
+29548: nsresult
+29548: AsyncExecuteStatements::notifyError(mozIStorageError *aError)
+29548: {
+32216:   mMutex.AssertNotCurrentThreadOwns();
+39769:   mDBMutex.assertNotCurrentThreadOwns();
+32216: 
+29548:   if (!mCallback)
+29548:     return NS_OK;
+29548: 
+20816:   nsRefPtr<ErrorNotifier> notifier =
+29548:     new ErrorNotifier(mCallback, aError, this);
+20816:   NS_ENSURE_TRUE(notifier, NS_ERROR_OUT_OF_MEMORY);
+20816: 
+20816:   return mCallingThread->Dispatch(notifier, NS_DISPATCH_NORMAL);
+20816: }
+20816: 
+27569: nsresult
+27569: AsyncExecuteStatements::notifyResults()
+20816: {
+32216:   mMutex.AssertNotCurrentThreadOwns();
+27569:   NS_ASSERTION(mCallback, "notifyResults called without a callback!");
+20816: 
+20816:   nsRefPtr<CallbackResultNotifier> notifier =
+21054:     new CallbackResultNotifier(mCallback, mResultSet, this);
+20816:   NS_ENSURE_TRUE(notifier, NS_ERROR_OUT_OF_MEMORY);
+20816: 
+21054:   nsresult rv = mCallingThread->Dispatch(notifier, NS_DISPATCH_NORMAL);
+21054:   if (NS_SUCCEEDED(rv))
+21054:     mResultSet = nsnull; // we no longer own it on success
+21054:   return rv;
+27569: }
+20816: 
+15803: NS_IMPL_THREADSAFE_ISUPPORTS2(
+26142:   AsyncExecuteStatements,
+15803:   nsIRunnable,
+15803:   mozIStoragePendingStatement
+15803: )
+15803: 
+27569: ////////////////////////////////////////////////////////////////////////////////
+27569: //// mozIStoragePendingStatement
+27569: 
+27569: NS_IMETHODIMP
+30938: AsyncExecuteStatements::Cancel()
+15803: {
+27569: #ifdef DEBUG
+27569:   PRBool onCallingThread = PR_FALSE;
+27569:   (void)mCallingThread->IsOnCurrentThread(&onCallingThread);
+27569:   NS_ASSERTION(onCallingThread, "Not canceling from the calling thread!");
+27569: #endif
+15803: 
+27569:   // If we have already canceled, we have an error, but always indicate that
+27569:   // we are trying to cancel.
+27569:   NS_ENSURE_FALSE(mCancelRequested, NS_ERROR_UNEXPECTED);
+15803: 
+32216:   {
+32216:     MutexAutoLock lockedScope(mMutex);
+15803: 
+32216:     // We need to indicate that we want to try and cancel now.
+32216:     mCancelRequested = true;
+32216:   }
+27569: 
+15803:   return NS_OK;
+15803: }
+27569: 
+27569: ////////////////////////////////////////////////////////////////////////////////
+27569: //// nsIRunnable
+27569: 
+27569: NS_IMETHODIMP
+27569: AsyncExecuteStatements::Run()
+27569: {
+29547:   // Do not run if we have been canceled.
+32216:   {
+32216:     MutexAutoLock lockedScope(mMutex);
+32216:     if (mCancelRequested)
+32216:       mState = CANCELED;
+32216:   }
+32216:   if (mState == CANCELED)
+30938:     return notifyComplete();
+27569: 
+27569:   // If there is more than one statement, run it in a transaction.  We assume
+27569:   // that we have been given write statements since getting a batch of read
+27569:   // statements doesn't make a whole lot of sense.
+30834:   // Additionally, if we have only one statement and it needs a transaction, we
+30834:   // will wrap it in one.
+30834:   if (mStatements.Length() > 1 || mStatements[0].needsTransaction()) {
+27569:     // We don't error if this failed because it's not terrible if it does.
+27569:     mTransactionManager = new mozStorageTransaction(mConnection, PR_FALSE,
+27569:                                                     mozIStorageConnection::TRANSACTION_IMMEDIATE);
+27569:   }
+27569: 
+27569:   // Execute each statement, giving the callback results if it returns any.
+27569:   for (PRUint32 i = 0; i < mStatements.Length(); i++) {
+29548:     bool finished = (i == (mStatements.Length() - 1));
+29548: 
+39769:     sqlite3_stmt *stmt;
+39769:     { // lock the sqlite mutex so sqlite3_errmsg cannot change
+39769:       SQLiteMutexAutoLock lockedScope(mDBMutex);
+39769: 
+39769:       int rc = mStatements[i].getSqliteStatement(&stmt);
+39769:       if (rc != SQLITE_OK) {
+39769:         // Set our error state.
+39769:         mState = ERROR;
+39769: 
+39769:         // Build the error object; can't call notifyError with the lock held
+39769:         sqlite3 *db = mConnection->GetNativeConnection();
+39769:         nsCOMPtr<mozIStorageError> errorObj(
+39769:           new Error(rc, ::sqlite3_errmsg(db))
+39769:         );
+39769:         {
+39769:           // We cannot hold the DB mutex and call notifyError.
+39769:           SQLiteMutexAutoUnlock unlockedScope(mDBMutex);
+39769:           (void)notifyError(errorObj);
+39769:         }
+39769:         break;
+39769:       }
+39769:     }
+39769: 
+29548:     // If we have parameters to bind, bind them, execute, and process.
+29548:     if (mStatements[i].hasParametersToBeBound()) {
+29548:       if (!bindExecuteAndProcessStatement(mStatements[i], finished))
+27569:         break;
+27569:     }
+29548:     // Otherwise, just execute and process the statement.
+39769:     else if (!executeAndProcessStatement(stmt, finished)) {
+29548:       break;
+29548:     }
+29548:   }
+27569: 
+27569:   // If we still have results that we haven't notified about, take care of
+27569:   // them now.
+27569:   if (mResultSet)
+27569:     (void)notifyResults();
+27569: 
+27569:   // Notify about completion
+27569:   return notifyComplete();
+27569: }
+27569: 
+27569: } // namespace storage
+27569: } // namespace mozilla

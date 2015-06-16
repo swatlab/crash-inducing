@@ -1,0 +1,1210 @@
+113445: /* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+113445:  * vim: set ts=4 sw=4 et tw=99:
+112189:  *
+113445:  * This Source Code Form is subject to the terms of the Mozilla Public
+113445:  * License, v. 2.0. If a copy of the MPL was not distributed with this
+113445:  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+112189: 
+112189: #include "Ion.h"
+112189: #include "IonFrames.h"
+112189: #include "jsobj.h"
+112189: #include "jsscript.h"
+112189: #include "jsfun.h"
+112242: #include "IonCompartment.h"
+112331: #include "IonFrames-inl.h"
+113388: #include "IonFrameIterator-inl.h"
+112331: #include "Safepoints.h"
+112310: #include "IonSpewer.h"
+112693: #include "IonMacroAssembler.h"
+115708: #include "PcScriptCache.h"
+115708: #include "PcScriptCache-inl.h"
+113019: #include "gc/Marking.h"
+112897: #include "SnapshotReader.h"
+112972: #include "Safepoints.h"
+113047: #include "VMFunctions.h"
+112701: 
+112189: using namespace js;
+112189: using namespace js::ion;
+112189: 
+113025: IonFrameIterator::IonFrameIterator(const IonActivationIterator &activations)
+113025:     : current_(activations.top()),
+113025:       type_(IonFrame_Exit),
+113025:       returnAddressToFp_(NULL),
+113025:       frameSize_(0),
+113025:       cachedSafepointIndex_(NULL),
+113025:       activation_(activations.activation())
+113025: {
+113025: }
+113025: 
+112874: IonFrameIterator::IonFrameIterator(IonJSFrameLayout *fp)
+124795:   : current_((uint8_t *)fp),
+120961:     type_(IonFrame_OptimizedJS),
+112874:     returnAddressToFp_(fp->returnAddress()),
+112874:     frameSize_(fp->prevFrameLocalSize())
+112874: {
+112874: }
+112874: 
+112505: bool
+112505: IonFrameIterator::checkInvalidation() const
+112505: {
+112505:     IonScript *dummy;
+112505:     return checkInvalidation(&dummy);
+112505: }
+112505: 
+112505: bool
+112505: IonFrameIterator::checkInvalidation(IonScript **ionScriptOut) const
+112505: {
+119065:     AutoAssertNoGC nogc;
+124795:     uint8_t *returnAddr = returnAddressToFp();
+119065:     RawScript script = this->script();
+112505:     // N.B. the current IonScript is not the same as the frame's
+112505:     // IonScript if the frame has since been invalidated.
+112505:     IonScript *currentIonScript = script->ion;
+112927:     bool invalidated = !script->hasIonScript() ||
+112927:         !currentIonScript->containsReturnAddress(returnAddr);
+112505:     if (!invalidated)
+112505:         return false;
+112505: 
+124795:     int32_t invalidationDataOffset = ((int32_t *) returnAddr)[-1];
+124795:     uint8_t *ionScriptDataOffset = returnAddr + invalidationDataOffset;
+112693:     IonScript *ionScript = (IonScript *) Assembler::getPointer(ionScriptDataOffset);
+112700:     JS_ASSERT(ionScript->containsReturnAddress(returnAddr));
+112505:     *ionScriptOut = ionScript;
+112505:     return true;
+112189: }
+112189: 
+112310: CalleeToken
+112310: IonFrameIterator::calleeToken() const
+112310: {
+112310:     return ((IonJSFrameLayout *) current_)->calleeToken();
+112310: }
+112310: 
+112901: JSFunction *
+112901: IonFrameIterator::callee() const
+112901: {
+113048:     if (isScripted()) {
+112901:         JS_ASSERT(isFunctionFrame());
+112901:         return CalleeTokenToFunction(calleeToken());
+112901:     }
+112901: 
+113048:     JS_ASSERT(isNative());
+113196:     return exitFrame()->nativeExit()->vp()[0].toObject().toFunction();
+113048: }
+113048: 
+112948: JSFunction *
+112948: IonFrameIterator::maybeCallee() const
+112948: {
+113048:     if ((isScripted() && isFunctionFrame()) || isNative())
+112948:         return callee();
+112948:     return NULL;
+112948: }
+112948: 
+112901: bool
+113048: IonFrameIterator::isNative() const
+113048: {
+113048:     if (type_ != IonFrame_Exit)
+113048:         return false;
+113048:     return exitFrame()->footer()->ionCode() == NULL;
+113048: }
+113048: 
+113048: bool
+115018: IonFrameIterator::isOOLNativeGetter() const
+115018: {
+115018:     if (type_ != IonFrame_Exit)
+115018:         return false;
+115018:     return exitFrame()->footer()->ionCode() == ION_FRAME_OOL_NATIVE_GETTER;
+115018: }
+115018: 
+115018: bool
+115537: IonFrameIterator::isOOLPropertyOp() const
+115537: {
+115537:     if (type_ != IonFrame_Exit)
+115537:         return false;
+115537:     return exitFrame()->footer()->ionCode() == ION_FRAME_OOL_PROPERTY_OP;
+115537: }
+115537: 
+115537: bool
+113515: IonFrameIterator::isDOMExit() const
+113515: {
+113515:     if (type_ != IonFrame_Exit)
+113515:         return false;
+114121:     return exitFrame()->isDomExit();
+113515: }
+113515: 
+113515: bool
+112901: IonFrameIterator::isFunctionFrame() const
+112901: {
+112901:     return js::ion::CalleeTokenIsFunction(calleeToken());
+112901: }
+112901: 
+113109: bool
+113109: IonFrameIterator::isEntryJSFrame() const
+113109: {
+120961:     if (prevType() == IonFrame_OptimizedJS || prevType() == IonFrame_Bailed_JS)
+113109:         return false;
+113109: 
+113109:     if (prevType() == IonFrame_Entry)
+113109:         return true;
+113109: 
+113109:     IonFrameIterator iter(*this);
+113109:     ++iter;
+113109:     for (; !iter.done(); ++iter) {
+113109:         if (iter.isScripted())
+113109:             return false;
+113109:     }
+113109:     return true;
+113109: }
+113109: 
+125945: UnrootedScript
+112310: IonFrameIterator::script() const
+112310: {
+119065:     AutoAssertNoGC nogc;
+112837:     JS_ASSERT(isScripted());
+120962:     RawScript script = ScriptFromCalleeToken(calleeToken());
+112310:     JS_ASSERT(script);
+112310:     return script;
+112310: }
+112310: 
+113048: Value *
+113048: IonFrameIterator::nativeVp() const
+113048: {
+113048:     JS_ASSERT(isNative());
+113196:     return exitFrame()->nativeExit()->vp();
+113048: }
+113048: 
+113082: Value *
+113109: IonFrameIterator::actualArgs() const
+113082: {
+113109:     return jsFrame()->argv() + 1;
+113082: }
+113082: 
+124795: uint8_t *
+112223: IonFrameIterator::prevFp() const
+112223: {
+112358:     size_t currentSize = SizeOfFramePrefix(type_);
+112703:     // This quick fix must be removed as soon as bug 717297 land.  This is
+112703:     // needed because the descriptor size of JS-to-JS frame which is just after
+112703:     // a Rectifier frame should not change. (cf EnsureExitFrame function)
+113388:     if (prevType() == IonFrame_Bailed_Rectifier || prevType() == IonFrame_Bailed_JS) {
+112703:         JS_ASSERT(type_ == IonFrame_Exit);
+120961:         currentSize = SizeOfFramePrefix(IonFrame_OptimizedJS);
+112703:     }
+112240:     currentSize += current()->prevFrameLocalSize();
+112240:     return current_ + currentSize;
+112223: }
+112223: 
+112242: IonFrameIterator &
+112242: IonFrameIterator::operator++()
+112189: {
+112189:     JS_ASSERT(type_ != IonFrame_Entry);
+112189: 
+112680:     frameSize_ = prevFrameLocalSize();
+112972:     cachedSafepointIndex_ = NULL;
+112680: 
+112189:     // If the next frame is the entry frame, just exit. Don't update current_,
+112189:     // since the entry and first frames overlap.
+112240:     if (current()->prevType() == IonFrame_Entry) {
+112189:         type_ = IonFrame_Entry;
+112242:         return *this;
+112189:     }
+112189: 
+112240:     // Note: prevFp() needs the current type, so set it after computing the
+112240:     // next frame.
+124795:     uint8_t *prev = prevFp();
+112240:     type_ = current()->prevType();
+113388:     if (type_ == IonFrame_Bailed_JS)
+120961:         type_ = IonFrame_OptimizedJS;
+112505:     returnAddressToFp_ = current()->returnAddress();
+112240:     current_ = prev;
+112242:     return *this;
+112189: }
+112189: 
+113042: uintptr_t *
+113042: IonFrameIterator::spillBase() const
+113042: {
+113042:     // Get the base address to where safepoint registers are spilled.
+113042:     // Out-of-line calls do not unwind the extra padding space used to
+113042:     // aggregate bailout tables, so we use frameSize instead of frameLocals,
+113042:     // which would only account for local stack slots.
+113042:     return reinterpret_cast<uintptr_t *>(fp() - ionScript()->frameSize());
+113042: }
+113042: 
+112972: MachineState
+112972: IonFrameIterator::machineState() const
+112972: {
+112972:     SafepointReader reader(ionScript(), safepoint());
+113042:     uintptr_t *spill = spillBase();
+112972: 
+113042:     // see CodeGeneratorShared::saveLive, we are only copying GPRs for now, FPUs
+113042:     // are stored after but are not saved in the safepoint.  This means that we
+113042:     // are unable to restore any FPUs registers from an OOL VM call.  This can
+113042:     // cause some trouble for f.arguments.
+112972:     MachineState machine;
+113042:     for (GeneralRegisterIterator iter(reader.allSpills()); iter.more(); iter++)
+113042:         machine.setRegisterLocation(*iter, --spill);
+112972: 
+112972:     return machine;
+112972: }
+112972: 
+112971: static void
+124795: CloseLiveIterator(JSContext *cx, const InlineFrameIterator &frame, uint32_t localSlot)
+112971: {
+119065:     AssertCanGC();
+112971:     SnapshotIterator si = frame.snapshotIterator();
+112971: 
+113004:     // Skip stack slots until we reach the iterator object.
+124795:     uint32_t base = CountArgSlots(frame.maybeCallee()) + frame.script()->nfixed;
+124795:     uint32_t skipSlots = base + localSlot - 1;
+112971: 
+113004:     for (unsigned i = 0; i < skipSlots; i++)
+112971:         si.skip();
+112971: 
+112971:     Value v = si.read();
+114858:     RootedObject obj(cx, &v.toObject());
+112971: 
+112971:     if (cx->isExceptionPending())
+113365:         UnwindIteratorForException(cx, obj);
+113365:     else
+112971:         UnwindIteratorForUncatchableException(cx, obj);
+112971: }
+112971: 
+112971: static void
+112971: CloseLiveIterators(JSContext *cx, const InlineFrameIterator &frame)
+112971: {
+119065:     AssertCanGC();
+119065:     RootedScript script(cx, frame.script());
+112971:     jsbytecode *pc = frame.pc();
+112971: 
+113030:     if (!script->hasTrynotes())
+112971:         return;
+112971: 
+112971:     JSTryNote *tn = script->trynotes()->vector;
+112971:     JSTryNote *tnEnd = tn + script->trynotes()->length;
+112971: 
+124795:     uint32_t pcOffset = uint32_t(pc - script->main());
+112971:     for (; tn != tnEnd; ++tn) {
+113061:         if (pcOffset < tn->start)
+113004:             continue;
+113061:         if (pcOffset >= tn->start + tn->length)
+112971:             continue;
+112971: 
+112971:         if (tn->kind != JSTRY_ITER)
+112971:             continue;
+112971: 
+113085:         JS_ASSERT(JSOp(*(script->main() + tn->start + tn->length)) == JSOP_ENDITER);
+112971:         JS_ASSERT(tn->stackDepth > 0);
+112971: 
+124795:         uint32_t localSlot = tn->stackDepth;
+113004:         CloseLiveIterator(cx, frame, localSlot);
+112971:     }
+112971: }
+112971: 
+112390: void
+112189: ion::HandleException(ResumeFromException *rfe)
+112189: {
+119065:     AssertCanGC();
+112189:     JSContext *cx = GetIonContext()->cx;
+112189: 
+112390:     IonSpew(IonSpew_Invalidate, "handling exception");
+112390: 
+113539:     // Immediately remove any bailout frame guard that might be left over from
+113539:     // an error in between ConvertFrames and ThunkToInterpreter.
+113643:     js_delete(cx->runtime->ionActivation->maybeTakeBailout());
+113539: 
+112479:     IonFrameIterator iter(cx->runtime->ionTop);
+112971:     while (!iter.isEntry()) {
+112971:         if (iter.isScripted()) {
+112971:             // Search each inlined frame for live iterator objects, and close
+112971:             // them.
+112972:             InlineFrameIterator frames(&iter);
+112971:             for (;;) {
+112971:                 CloseLiveIterators(cx, frames);
+113449: 
+113449:                 // When profiling, each frame popped needs a notification that
+113449:                 // the function has exited, so invoke the probe that a function
+113449:                 // is exiting.
+119065:                 AutoAssertNoGC nogc;
+119065:                 RawScript script = frames.script();
+113449:                 Probes::exitScript(cx, script, script->function(), NULL);
+112971:                 if (!frames.more())
+112971:                     break;
+112971:                 ++frames;
+112971:             }
+112971: 
+112505:             IonScript *ionScript;
+112505:             if (iter.checkInvalidation(&ionScript))
+112964:                 ionScript->decref(cx->runtime->defaultFreeOp());
+112310:         }
+112310: 
+112242:         ++iter;
+112310:     }
+112189: 
+113027:     // Clear any Ion return override that's been set.
+113027:     // This may happen if a callVM function causes an invalidation (setting the
+113027:     // override), and then fails, bypassing the bailout handlers that would
+113027:     // otherwise clear the return override.
+113027:     if (cx->runtime->hasIonReturnOverride())
+113027:         cx->runtime->takeIonReturnOverride();
+113027: 
+112189:     rfe->stackPointer = iter.fp();
+112189: }
+112189: 
+113473: void
+113473: IonActivationIterator::settle()
+113473: {
+116392:     while (activation_ && activation_->empty()) {
+113473:         top_ = activation_->prevIonTop();
+113473:         activation_ = activation_->prev();
+113473:     }
+113473: }
+113473: 
+112242: IonActivationIterator::IonActivationIterator(JSContext *cx)
+112479:   : top_(cx->runtime->ionTop),
+112479:     activation_(cx->runtime->ionActivation)
+112242: {
+113473:     settle();
+112242: }
+112242: 
+112479: IonActivationIterator::IonActivationIterator(JSRuntime *rt)
+112479:   : top_(rt->ionTop),
+112479:     activation_(rt->ionActivation)
+112325: {
+113473:     settle();
+112325: }
+112325: 
+112242: IonActivationIterator &
+112242: IonActivationIterator::operator++()
+112242: {
+112242:     JS_ASSERT(activation_);
+112242:     top_ = activation_->prevIonTop();
+112242:     activation_ = activation_->prev();
+113473:     settle();
+112242:     return *this;
+112242: }
+112242: 
+112325: bool
+112325: IonActivationIterator::more() const
+112325: {
+112325:     return !!activation_;
+112325: }
+112325: 
+112326: static void
+112326: MarkCalleeToken(JSTracer *trc, CalleeToken token)
+112326: {
+112326:     switch (GetCalleeTokenTag(token)) {
+112326:       case CalleeToken_Function:
+112729:       {
+112729:         JSFunction *fun = CalleeTokenToFunction(token);
+112729:         MarkObjectRoot(trc, &fun, "ion-callee");
+112729:         JS_ASSERT(fun == CalleeTokenToFunction(token));
+112326:         break;
+112729:       }
+112326:       case CalleeToken_Script:
+112729:       {
+125945:         UnrootedScript script = CalleeTokenToScript(token);
+112729:         MarkScriptRoot(trc, &script, "ion-entry");
+112729:         JS_ASSERT(script == CalleeTokenToScript(token));
+112326:         break;
+112729:       }
+112326:       default:
+112326:         JS_NOT_REACHED("unknown callee token type");
+112326:     }
+112326: }
+112326: 
+113127: static inline uintptr_t
+113127: ReadAllocation(const IonFrameIterator &frame, const LAllocation *a)
+113127: {
+113127:     if (a->isGeneralReg()) {
+113127:         Register reg = a->toGeneralReg()->reg();
+113127:         return frame.machineState().read(reg);
+113127:     }
+113127:     if (a->isStackSlot()) {
+124795:         uint32_t slot = a->toStackSlot()->slot();
+113127:         return *frame.jsFrame()->slotRef(slot);
+113127:     }
+124795:     uint32_t index = a->toArgument()->index();
+124795:     uint8_t *argv = reinterpret_cast<uint8_t *>(frame.jsFrame()->argv());
+113127:     return *reinterpret_cast<uintptr_t *>(argv + index);
+113127: }
+113127: 
+112326: static void
+112326: MarkIonJSFrame(JSTracer *trc, const IonFrameIterator &frame)
+112326: {
+112326:     IonJSFrameLayout *layout = (IonJSFrameLayout *)frame.fp();
+112326: 
+112326:     MarkCalleeToken(trc, layout->calleeToken());
+112333: 
+112432:     IonScript *ionScript;
+112505:     if (frame.checkInvalidation(&ionScript)) {
+112542:         // This frame has been invalidated, meaning that its IonScript is no
+112542:         // longer reachable through the callee token (JSFunction/JSScript->ion
+112542:         // is now NULL or recompiled). Manually trace it here.
+112542:         IonScript::Trace(trc, ionScript);
+112505:     } else if (CalleeTokenIsFunction(layout->calleeToken())) {
+123827:         ionScript = CalleeTokenToFunction(layout->calleeToken())->nonLazyScript()->ion;
+112432:     } else {
+112432:         ionScript = CalleeTokenToScript(layout->calleeToken())->ion;
+112432:     }
+112432: 
+113084:     if (CalleeTokenIsFunction(layout->calleeToken())) {
+113109:         // (NBP) We do not need to mark formal arguments since they are covered
+113109:         // by the safepoint.
+113109:         size_t nargs = frame.numActualArgs();
+113084: 
+113084:         // Trace function arguments. Note + 1 for thisv.
+113084:         Value *argv = layout->argv();
+113084:         for (size_t i = 0; i < nargs + 1; i++)
+113084:             gc::MarkValueRoot(trc, &argv[i], "ion-argv");
+113084:     }
+113084: 
+112505:     const SafepointIndex *si = ionScript->getSafepointIndex(frame.returnAddressToFp());
+112333: 
+112505:     SafepointReader safepoint(ionScript, si);
+112505: 
+112333:     // Scan through slots which contain pointers (or on punboxing systems,
+112333:     // actual values).
+124795:     uint32_t slot;
+112333:     while (safepoint.getGcSlot(&slot)) {
+112333:         uintptr_t *ref = layout->slotRef(slot);
+113526:         gc::MarkGCThingRoot(trc, reinterpret_cast<void **>(ref), "ion-gc-slot");
+112333:     }
+112333: 
+112333:     while (safepoint.getValueSlot(&slot)) {
+112333:         Value *v = (Value *)layout->slotRef(slot);
+112717:         gc::MarkValueRoot(trc, v, "ion-gc-slot");
+112333:     }
+113042: 
+113042:     uintptr_t *spill = frame.spillBase();
+113042:     GeneralRegisterSet gcRegs = safepoint.gcSpills();
+113526:     GeneralRegisterSet valueRegs = safepoint.valueSpills();
+113042:     for (GeneralRegisterIterator iter(safepoint.allSpills()); iter.more(); iter++) {
+113054:         --spill;
+113042:         if (gcRegs.has(*iter))
+113526:             gc::MarkGCThingRoot(trc, reinterpret_cast<void **>(spill), "ion-gc-spill");
+113526:         else if (valueRegs.has(*iter))
+113526:             gc::MarkValueRoot(trc, reinterpret_cast<Value *>(spill), "ion-value-spill");
+113042:     }
+113127: 
+113127: #ifdef JS_NUNBOX32
+113127:     LAllocation type, payload;
+113127:     while (safepoint.getNunboxSlot(&type, &payload)) {
+113127:         jsval_layout layout;
+113127:         layout.s.tag = (JSValueTag)ReadAllocation(frame, &type);
+113127:         layout.s.payload.uintptr = ReadAllocation(frame, &payload);
+113127: 
+113127:         Value v = IMPL_TO_JSVAL(layout);
+113127:         gc::MarkValueRoot(trc, &v, "ion-torn-value");
+113127:         JS_ASSERT(v == IMPL_TO_JSVAL(layout));
+113127:     }
+113127: #endif
+112326: }
+112326: 
+114139: void
+114139: IonActivationIterator::ionStackRange(uintptr_t *&min, uintptr_t *&end)
+114139: {
+114139:     IonFrameIterator frames(top());
+114139: 
+114139:     IonExitFrameLayout *exitFrame = frames.exitFrame();
+114139:     IonExitFooterFrame *footer = exitFrame->footer();
+114139:     const VMFunction *f = footer->function();
+114139:     if (exitFrame->isWrapperExit() && f->outParam == Type_Handle)
+114139:         min = reinterpret_cast<uintptr_t *>(footer->outVp());
+114139:     else
+114139:         min = reinterpret_cast<uintptr_t *>(footer);
+114139: 
+114139:     while (!frames.done())
+114139:         ++frames;
+114139: 
+114139:     end = reinterpret_cast<uintptr_t *>(frames.prevFp());
+114139: }
+114139: 
+112326: static void
+113047: MarkIonExitFrame(JSTracer *trc, const IonFrameIterator &frame)
+113047: {
+113047:     IonExitFooterFrame *footer = frame.exitFrame()->footer();
+113047: 
+113047:     // Mark the code of the code handling the exit path.  This is needed because
+113047:     // invalidated script are no longer marked because data are erased by the
+113047:     // invalidation and relocation data are no longer reliable.  So the VM
+113047:     // wrapper or the invalidation code may be GC if no IonCode keep reference
+113047:     // on them.
+113047:     JS_ASSERT(uintptr_t(footer->ionCode()) != uintptr_t(-1));
+113049: 
+113049:     // This correspond to the case where we have build a fake exit frame in
+113049:     // CodeGenerator.cpp which handle the case of a native function call. We
+113049:     // need to mark the argument vector of the function call.
+113196:     if (frame.isNative()) {
+113196:         IonNativeExitFrameLayout *native = frame.exitFrame()->nativeExit();
+113196:         size_t len = native->argc() + 2;
+113196:         Value *vp = native->vp();
+113049:         gc::MarkValueRootRange(trc, len, vp, "ion-native-args");
+113049:         return;
+113049:     }
+113049: 
+115018:     if (frame.isOOLNativeGetter()) {
+115018:         IonOOLNativeGetterExitFrameLayout *oolgetter = frame.exitFrame()->oolNativeGetterExit();
+115963:         gc::MarkIonCodeRoot(trc, oolgetter->stubCode(), "ion-ool-getter-code");
+115018:         gc::MarkValueRoot(trc, oolgetter->vp(), "ion-ool-getter-callee");
+115963:         gc::MarkValueRoot(trc, oolgetter->thisp(), "ion-ool-getter-this");
+115018:         return;
+115018:     }
+115018:  
+115537:     if (frame.isOOLPropertyOp()) {
+115537:         IonOOLPropertyOpExitFrameLayout *oolgetter = frame.exitFrame()->oolPropertyOpExit();
+115963:         gc::MarkIonCodeRoot(trc, oolgetter->stubCode(), "ion-ool-property-op-code");
+115537:         gc::MarkValueRoot(trc, oolgetter->vp(), "ion-ool-property-op-vp");
+115537:         gc::MarkIdRoot(trc, oolgetter->id(), "ion-ool-property-op-id");
+115537:         gc::MarkObjectRoot(trc, oolgetter->obj(), "ion-ool-property-op-obj");
+115537:         return;
+115537:     }
+115537: 
+113515:     if (frame.isDOMExit()) {
+113515:         IonDOMExitFrameLayout *dom = frame.exitFrame()->DOMExit();
+113515:         gc::MarkObjectRoot(trc, dom->thisObjAddress(), "ion-dom-args");
+113554:         if (dom->isSetterFrame()) {
+113515:             gc::MarkValueRoot(trc, dom->vp(), "ion-dom-args");
+113554:         } else if (dom->isMethodFrame()) {
+113554:             IonDOMMethodExitFrameLayout *method =
+113554:                 reinterpret_cast<IonDOMMethodExitFrameLayout *>(dom);
+113554:             size_t len = method->argc() + 2;
+113554:             Value *vp = method->vp();
+113554:             gc::MarkValueRootRange(trc, len, vp, "ion-dom-args");
+113554:         }
+113515:         return;
+113515:     }
+113515: 
+113047:     MarkIonCodeRoot(trc, footer->addressOfIonCode(), "ion-exit-code");
+113047: 
+113047:     const VMFunction *f = footer->function();
+113047:     if (f == NULL || f->explicitArgs == 0)
+113047:         return;
+113047: 
+113047:     // Mark arguments of the VM wrapper.
+124795:     uint8_t *argBase = frame.exitFrame()->argBase();
+124795:     for (uint32_t explicitArg = 0; explicitArg < f->explicitArgs; explicitArg++) {
+113047:         switch (f->argRootType(explicitArg)) {
+113047:           case VMFunction::RootNone:
+113047:             break;
+113123:           case VMFunction::RootObject: {
+113123:             // Sometimes we can bake in HandleObjects to NULL.
+113123:             JSObject **pobj = reinterpret_cast<JSObject **>(argBase);
+113123:             if (*pobj)
+113123:                 gc::MarkObjectRoot(trc, pobj, "ion-vm-args");
+113047:             break;
+113123:           }
+113047:           case VMFunction::RootString:
+113047:           case VMFunction::RootPropertyName:
+113049:             gc::MarkStringRoot(trc, reinterpret_cast<JSString**>(argBase), "ion-vm-args");
+113047:             break;
+113047:           case VMFunction::RootFunction:
+113049:             gc::MarkObjectRoot(trc, reinterpret_cast<JSFunction**>(argBase), "ion-vm-args");
+113047:             break;
+113047:           case VMFunction::RootValue:
+113049:             gc::MarkValueRoot(trc, reinterpret_cast<Value*>(argBase), "ion-vm-args");
+113047:             break;
+113233:           case VMFunction::RootCell:
+113526:             gc::MarkGCThingRoot(trc, reinterpret_cast<void **>(argBase), "ion-vm-args");
+113233:             break;
+113047:         }
+113047: 
+113047:         switch (f->argProperties(explicitArg)) {
+113047:           case VMFunction::WordByValue:
+113047:           case VMFunction::WordByRef:
+113047:             argBase += sizeof(void *);
+113047:             break;
+113047:           case VMFunction::DoubleByValue:
+113047:           case VMFunction::DoubleByRef:
+113047:             argBase += 2 * sizeof(void *);
+113047:             break;
+113047:         }
+113047:     }
+113474: 
+113474:     if (f->outParam == Type_Handle)
+113474:         gc::MarkValueRoot(trc, footer->outVp(), "ion-vm-outvp");
+113047: }
+113047: 
+113047: static void
+113109: MarkIonActivation(JSTracer *trc, const IonActivationIterator &activations)
+112326: {
+113109:     for (IonFrameIterator frames(activations); !frames.done(); ++frames) {
+112326:         switch (frames.type()) {
+112326:           case IonFrame_Exit:
+113047:             MarkIonExitFrame(trc, frames);
+112326:             break;
+120961:           case IonFrame_OptimizedJS:
+112326:             MarkIonJSFrame(trc, frames);
+112326:             break;
+113388:           case IonFrame_Bailed_JS:
+113388:             JS_NOT_REACHED("invalid");
+113388:             break;
+112757:           case IonFrame_Rectifier:
+121876:           case IonFrame_Bailed_Rectifier:
+112757:             break;
+113058:           case IonFrame_Osr:
+113058:             // The callee token will be marked by the callee JS frame;
+113058:             // otherwise, it does not need to be marked, since the frame is
+113058:             // dead.
+113058:             break;
+112326:           default:
+112326:             JS_NOT_REACHED("unexpected frame type");
+112326:             break;
+112326:         }
+112326:     }
+112326: }
+112326: 
+112326: void
+112479: ion::MarkIonActivations(JSRuntime *rt, JSTracer *trc)
+112326: {
+112479:     for (IonActivationIterator activations(rt); activations.more(); ++activations)
+113109:         MarkIonActivation(trc, activations);
+112326: }
+112326: 
+112430: void
+113582: ion::AutoTempAllocatorRooter::trace(JSTracer *trc)
+113053: {
+113582:     for (CompilerRootNode *root = temp->rootList(); root != NULL; root = root->next)
+113053:         gc::MarkGCThingRoot(trc, root->address(), "ion-compiler-root");
+113053: }
+113053: 
+113053: void
+115105: ion::GetPcScript(JSContext *cx, MutableHandleScript scriptRes, jsbytecode **pcRes)
+112430: {
+113551:     JS_ASSERT(cx->fp()->beginsIonActivation());
+112725:     IonSpew(IonSpew_Snapshots, "Recover PC & Script from the last frame.");
+112680: 
+115708:     JSRuntime *rt = cx->runtime;
+115708: 
+115708:     // Recover the return address.
+115708:     IonFrameIterator it(rt->ionTop);
+115708:     uint8_t *retAddr = it.returnAddress();
+115708:     uint32_t hash = PcScriptCache::Hash(retAddr);
+115708:     JS_ASSERT(retAddr != NULL);
+115708: 
+115708:     // Lazily initialize the cache. The allocation may safely fail and will not GC.
+115708:     if (JS_UNLIKELY(rt->ionPcScriptCache == NULL)) {
+115708:         rt->ionPcScriptCache = (PcScriptCache *)js_malloc(sizeof(struct PcScriptCache));
+115708:         if (rt->ionPcScriptCache)
+115708:             rt->ionPcScriptCache->clear(rt->gcNumber);
+115708:     }
+115708: 
+115708:     // Attempt to lookup address in cache.
+115708:     if (rt->ionPcScriptCache && rt->ionPcScriptCache->get(rt, hash, retAddr, scriptRes, pcRes))
+115708:         return;
+115708: 
+115708:     // Lookup failed: undertake expensive process to recover the innermost inlined frame.
+115708:     ++it; // Skip exit frame.
+112972:     InlineFrameIterator ifi(&it);
+112430: 
+112430:     // Set the result.
+115105:     scriptRes.set(ifi.script());
+112775:     if (pcRes)
+112948:         *pcRes = ifi.pc();
+115708: 
+115708:     // Add entry to cache.
+115708:     if (rt->ionPcScriptCache)
+115708:         rt->ionPcScriptCache->add(hash, retAddr, ifi.pc(), ifi.script());
+112430: }
+112681: 
+112693: void
+112693: OsiIndex::fixUpOffset(MacroAssembler &masm)
+112693: {
+112924:     callPointDisplacement_ = masm.actualOffset(callPointDisplacement_);
+112693: }
+112693: 
+124795: uint32_t
+112924: OsiIndex::returnPointDisplacement() const
+112924: {
+112924:     // In general, pointer arithmetic on code is bad, but in this case,
+112924:     // getting the return address from a call instruction, stepping over pools
+112924:     // would be wrong.
+112924:     return callPointDisplacement_ + Assembler::patchWrite_NearCallSize();
+112924: }
+112947: 
+112947: SnapshotIterator::SnapshotIterator(IonScript *ionScript, SnapshotOffset snapshotOffset,
+112947:                                    IonJSFrameLayout *fp, const MachineState &machine)
+112947:   : SnapshotReader(ionScript->snapshots() + snapshotOffset,
+112947:                    ionScript->snapshots() + ionScript->snapshotsSize()),
+112947:     fp_(fp),
+112947:     machine_(machine),
+112947:     ionScript_(ionScript)
+112947: {
+112947:     JS_ASSERT(snapshotOffset < ionScript->snapshotsSize());
+112947: }
+112947: 
+112972: SnapshotIterator::SnapshotIterator(const IonFrameIterator &iter)
+112947:   : SnapshotReader(iter.ionScript()->snapshots() + iter.osiIndex()->snapshotOffset(),
+112947:                    iter.ionScript()->snapshots() + iter.ionScript()->snapshotsSize()),
+112947:     fp_(iter.jsFrame()),
+112972:     machine_(iter.machineState()),
+112947:     ionScript_(iter.ionScript())
+112947: {
+112947: }
+112947: 
+112948: SnapshotIterator::SnapshotIterator()
+112948:   : SnapshotReader(NULL, NULL),
+112948:     fp_(NULL),
+112948:     ionScript_(NULL)
+112948: {
+112948: }
+112948: 
+113025: bool
+113025: SnapshotIterator::hasLocation(const SnapshotReader::Location &loc)
+113025: {
+113082:     return loc.isStackSlot() || machine_.has(loc.reg());
+113025: }
+113025: 
+112947: uintptr_t
+112947: SnapshotIterator::fromLocation(const SnapshotReader::Location &loc)
+112947: {
+112947:     if (loc.isStackSlot())
+112947:         return ReadFrameSlot(fp_, loc.stackSlot());
+112972:     return machine_.read(loc.reg());
+112947: }
+112947: 
+112947: Value
+112947: SnapshotIterator::FromTypedPayload(JSValueType type, uintptr_t payload)
+112947: {
+112947:     switch (type) {
+112947:       case JSVAL_TYPE_INT32:
+112947:         return Int32Value(payload);
+112947:       case JSVAL_TYPE_BOOLEAN:
+112947:         return BooleanValue(!!payload);
+112947:       case JSVAL_TYPE_STRING:
+112947:         return StringValue(reinterpret_cast<JSString *>(payload));
+112947:       case JSVAL_TYPE_OBJECT:
+112947:         return ObjectValue(*reinterpret_cast<JSObject *>(payload));
+112947:       default:
+112947:         JS_NOT_REACHED("unexpected type - needs payload");
+112947:         return UndefinedValue();
+112947:     }
+112947: }
+112947: 
+113025: bool
+113025: SnapshotIterator::slotReadable(const Slot &slot)
+113025: {
+113025:     switch (slot.mode()) {
+113025:       case SnapshotReader::DOUBLE_REG:
+113025:         return machine_.has(slot.floatReg());
+113025: 
+113025:       case SnapshotReader::TYPED_REG:
+113025:         return machine_.has(slot.reg());
+113025: 
+113025:       case SnapshotReader::UNTYPED:
+113025: #if defined(JS_NUNBOX32)
+113025:           return hasLocation(slot.type()) && hasLocation(slot.payload());
+113025: #elif defined(JS_PUNBOX64)
+113025:           return hasLocation(slot.value());
+113025: #endif
+113025: 
+113025:       default:
+113025:         return true;
+113025:     }
+113025: }
+113025: 
+112947: Value
+112947: SnapshotIterator::slotValue(const Slot &slot)
+112947: {
+112947:     switch (slot.mode()) {
+112947:       case SnapshotReader::DOUBLE_REG:
+112972:         return DoubleValue(machine_.read(slot.floatReg()));
+112947: 
+112947:       case SnapshotReader::TYPED_REG:
+112972:         return FromTypedPayload(slot.knownType(), machine_.read(slot.reg()));
+112947: 
+112947:       case SnapshotReader::TYPED_STACK:
+112947:       {
+112947:         JSValueType type = slot.knownType();
+112947:         if (type == JSVAL_TYPE_DOUBLE)
+112947:             return DoubleValue(ReadFrameDoubleSlot(fp_, slot.stackSlot()));
+112947:         return FromTypedPayload(type, ReadFrameSlot(fp_, slot.stackSlot()));
+112947:       }
+112947: 
+112947:       case SnapshotReader::UNTYPED:
+112947:       {
+112947:           jsval_layout layout;
+112947: #if defined(JS_NUNBOX32)
+112947:           layout.s.tag = (JSValueTag)fromLocation(slot.type());
+112947:           layout.s.payload.word = fromLocation(slot.payload());
+112947: #elif defined(JS_PUNBOX64)
+112947:           layout.asBits = fromLocation(slot.value());
+112947: #endif
+112947:           return IMPL_TO_JSVAL(layout);
+112947:       }
+112947: 
+112947:       case SnapshotReader::JS_UNDEFINED:
+112947:         return UndefinedValue();
+112947: 
+112947:       case SnapshotReader::JS_NULL:
+112947:         return NullValue();
+112947: 
+112947:       case SnapshotReader::JS_INT32:
+112947:         return Int32Value(slot.int32Value());
+112947: 
+112947:       case SnapshotReader::CONSTANT:
+112947:         return ionScript_->getConstant(slot.constantIndex());
+112947: 
+112947:       default:
+112947:         JS_NOT_REACHED("huh?");
+112947:         return UndefinedValue();
+112947:     }
+112947: }
+112947: 
+112947: IonScript *
+112947: IonFrameIterator::ionScript() const
+112947: {
+120961:     JS_ASSERT(type() == IonFrame_OptimizedJS);
+112947: 
+112947:     IonScript *ionScript;
+112947:     if (checkInvalidation(&ionScript))
+112947:         return ionScript;
+112947:     return script()->ionScript();
+112947: }
+112947: 
+112947: const SafepointIndex *
+112947: IonFrameIterator::safepoint() const
+112947: {
+112972:     if (!cachedSafepointIndex_)
+112972:         cachedSafepointIndex_ = ionScript()->getSafepointIndex(returnAddressToFp());
+112972:     return cachedSafepointIndex_;
+112947: }
+112947: 
+112947: const OsiIndex *
+112947: IonFrameIterator::osiIndex() const
+112947: {
+112947:     SafepointReader reader(ionScript(), safepoint());
+112972:     return ionScript()->getOsiIndex(reader.osiReturnPointOffset());
+112947: }
+112947: 
+112972: InlineFrameIterator::InlineFrameIterator(const IonFrameIterator *iter)
+112948:   : frame_(iter),
+112948:     framesRead_(0),
+112948:     callee_(NULL),
+112948:     script_(NULL)
+112948: {
+113088:     if (iter) {
+113088:         start_ = SnapshotIterator(*iter);
+112948:         findNextFrame();
+112948:     }
+112948: }
+112948: 
+126654: InlineFrameIterator::InlineFrameIterator(const InlineFrameIterator *iter)
+126654:   : frame_(iter->frame_),
+126654:     framesRead_(0),
+126654:     callee_(NULL),
+126654:     script_(NULL)
+126654: {
+126654:     if (frame_) {
+126654:         start_ = SnapshotIterator(*frame_);
+126654:         // findNextFrame will iterate to the next frame and init. everything.
+126654:         // Therefore to settle on the same frame, we report one frame less readed.
+126654:         framesRead_ = iter->framesRead_ - 1;
+126654:         findNextFrame();
+126654:     }
+126654: }
+126654: 
+112948: void
+112948: InlineFrameIterator::findNextFrame()
+112948: {
+119065:     AutoAssertNoGC nogc;
+112971:     JS_ASSERT(more());
+112971: 
+112948:     si_ = start_;
+112948: 
+112948:     // Read the initial frame.
+112948:     callee_ = frame_->maybeCallee();
+112948:     script_ = frame_->script();
+112948:     pc_ = script_->code + si_.pcOffset();
+113196: #ifdef DEBUG
+113196:     numActualArgs_ = 0xbad;
+113196: #endif
+112948: 
+112948:     // This unfortunately is O(n*m), because we must skip over outer frames
+112948:     // before reading inner ones.
+112948:     unsigned remaining = start_.frameCount() - framesRead_ - 1;
+112948:     for (unsigned i = 0; i < remaining; i++) {
+112948:         JS_ASSERT(js_CodeSpec[*pc_].format & JOF_INVOKE);
+112948: 
+113196:         // Recover the number of actual arguments from the script.
+113196:         numActualArgs_ = GET_ARGC(pc_);
+113196: 
+112948:         // Skip over non-argument slots, as well as |this|.
+113196:         unsigned skipCount = (si_.slots() - 1) - numActualArgs_ - 1;
+112948:         for (unsigned j = 0; j < skipCount; j++)
+112948:             si_.skip();
+112948: 
+112948:         Value funval = si_.read();
+112948: 
+112948:         // Skip extra slots.
+112948:         while (si_.moreSlots())
+112948:             si_.skip();
+112948: 
+112948:         si_.nextFrame();
+112948: 
+112948:         callee_ = funval.toObject().toFunction();
+125006:         script_ = callee_->nonLazyScript();
+112948:         pc_ = script_->code + si_.pcOffset();
+112948:     }
+112948: 
+112948:     framesRead_++;
+112948: }
+112948: 
+126854: InlineFrameIterator &
+112948: InlineFrameIterator::operator++()
+112948: {
+112948:     findNextFrame();
+126854:     return *this;
+112948: }
+112948: 
+112948: bool
+112948: InlineFrameIterator::isFunctionFrame() const
+112948: {
+112948:     return !!callee_;
+112948: }
+112948: 
+112972: MachineState
+112972: MachineState::FromBailout(uintptr_t regs[Registers::Total],
+112972:                           double fpregs[FloatRegisters::Total])
+112972: {
+112972:     MachineState machine;
+112972: 
+112972:     for (unsigned i = 0; i < Registers::Total; i++)
+112972:         machine.setRegisterLocation(Register::FromCode(i), &regs[i]);
+112972:     for (unsigned i = 0; i < FloatRegisters::Total; i++)
+112972:         machine.setRegisterLocation(FloatRegister::FromCode(i), &fpregs[i]);
+112972: 
+112972:     return machine;
+112972: }
+112972: 
+113011: bool
+113025: InlineFrameIterator::isConstructing() const
+113011: {
+113011:     // Skip the current frame and look at the caller's.
+113011:     if (more()) {
+113011:         InlineFrameIterator parent(*this);
+113011:         ++parent;
+113011: 
+113327:         // Inlined Getters and Setters are never constructing.
+113327:         if (IsGetterPC(parent.pc()) || IsSetterPC(parent.pc()))
+113327:             return false;
+113327: 
+113011:         // In the case of a JS frame, look up the pc from the snapshot.
+113011:         JS_ASSERT(js_CodeSpec[*parent.pc()].format & JOF_INVOKE);
+113011: 
+113011:         return (JSOp)*parent.pc() == JSOP_NEW;
+113011:     }
+113011: 
+113025:     return frame_->isConstructing();
+113011: }
+113011: 
+113011: bool
+113025: IonFrameIterator::isConstructing() const
+113011: {
+113011:     IonFrameIterator parent(*this);
+113011: 
+113011:     // Skip the current frame and look at the caller's.
+113011:     do {
+113011:         ++parent;
+113011:     } while (!parent.done() && !parent.isScripted());
+113011: 
+113011:     if (parent.isScripted()) {
+113011:         // In the case of a JS frame, look up the pc from the snapshot.
+113011:         InlineFrameIterator inlinedParent(&parent);
+113327: 
+113327:         //Inlined Getters and Setters are never constructing.
+113327:         if (IsGetterPC(inlinedParent.pc()) || IsSetterPC(inlinedParent.pc()))
+113327:             return false;
+113327: 
+113011:         JS_ASSERT(js_CodeSpec[*inlinedParent.pc()].format & JOF_INVOKE);
+113011: 
+113011:         return (JSOp)*inlinedParent.pc() == JSOP_NEW;
+113011:     }
+113011: 
+113011:     JS_ASSERT(parent.done());
+113517: 
+116392:     // If entryfp is not set, we entered Ion via a C++ native, like Array.map,
+116392:     // using FastInvoke. FastInvoke is never used for constructor calls.
+116392:     if (!activation_->entryfp())
+116392:         return false;
+116392: 
+116392:     // If callingIntoIon, we either entered Ion from JM or entered Ion from
+116392:     // a C++ native using FastInvoke. In both of these cases we don't handle
+116392:     // constructor calls.
+113517:     if (activation_->entryfp()->callingIntoIon())
+113517:         return false;
+113517:     JS_ASSERT(activation_->entryfp()->runningInIon());
+113025:     return activation_->entryfp()->isConstructing();
+113011: }
+113011: 
+113011: JSObject *
+118567: InlineFrameIterator::scopeChain() const
+118567: {
+118567:     SnapshotIterator s(si_);
+118567: 
+118567:     // scopeChain
+118567:     Value v = s.read();
+127841:     if (v.isObject()) {
+127841:         JS_ASSERT_IF(script()->hasAnalysis(), script()->analysis()->usesScopeChain());
+118567:         return &v.toObject();
+118567:     }
+118567: 
+127841:     return callee()->environment();
+127841: }
+127841: 
+118567: JSObject *
+113011: InlineFrameIterator::thisObject() const
+113011: {
+113011:     // JS_ASSERT(isConstructing(...));
+113011:     SnapshotIterator s(si_);
+113011: 
+113011:     // scopeChain
+113011:     s.skip();
+113011: 
+113011:     // In strict modes, |this| may not be an object and thus may not be
+113011:     // readable which can either segv in read or trigger the assertion.
+113011:     Value v = s.read();
+113011:     JS_ASSERT(v.isObject());
+113011:     return &v.toObject();
+113011: }
+113025: 
+113025: unsigned
+113025: InlineFrameIterator::numActualArgs() const
+113025: {
+113196:     // The number of actual arguments of inline frames is recovered by the
+113196:     // iteration process. It is recovered from the bytecode because this
+113196:     // property still hold since the for inlined frames. This property does not
+113196:     // hold for the parent frame because it can have optimize a call to
+113196:     // js_fun_call or js_fun_apply.
+113196:     if (more())
+113196:         return numActualArgs_;
+113025: 
+113025:     return frame_->numActualArgs();
+113025: }
+113025: 
+113025: unsigned
+113025: IonFrameIterator::numActualArgs() const
+113025: {
+113196:     if (isScripted())
+113196:         return jsFrame()->numActualArgs();
+113025: 
+113196:     JS_ASSERT(isNative());
+113196:     return exitFrame()->nativeExit()->argc();
+113025: }
+113102: 
+113102: void
+113102: SnapshotIterator::warnUnreadableSlot()
+113102: {
+113102:     fprintf(stderr, "Warning! Tried to access unreadable IonMonkey slot (possible f.arguments).\n");
+113102: }
+113102: 
+113388: void
+113388: IonFrameIterator::dump() const
+113388: {
+113388:     switch (type_) {
+113388:       case IonFrame_Entry:
+113388:         fprintf(stderr, " Entry frame\n");
+113388:         fprintf(stderr, "  Frame size: %u\n", unsigned(current()->prevFrameLocalSize()));
+113388:         break;
+120961:       case IonFrame_OptimizedJS:
+113388:       {
+113388:         InlineFrameIterator frames(this);
+113388:         for (;;) {
+113388:             frames.dump();
+113388:             if (!frames.more())
+113388:                 break;
+113388:             ++frames;
+113388:         }
+113388:         break;
+113388:       }
+113388:       case IonFrame_Rectifier:
+113388:       case IonFrame_Bailed_Rectifier:
+113388:         fprintf(stderr, " Rectifier frame\n");
+113388:         fprintf(stderr, "  Frame size: %u\n", unsigned(current()->prevFrameLocalSize()));
+113388:         break;
+113388:       case IonFrame_Bailed_JS:
+113388:         fprintf(stderr, "Warning! Bailed JS frames are not observable.\n");
+113388:         break;
+113388:       case IonFrame_Exit:
+113388:         break;
+113388:       case IonFrame_Osr:
+113388:         fprintf(stderr, "Warning! OSR frame are not defined yet.\n");
+113388:         break;
+113388:     };
+113388:     fputc('\n', stderr);
+113388: }
+113388: 
+113388: struct DumpOp {
+113388:     DumpOp(unsigned int i) : i_(i) {}
+113388: 
+113388:     unsigned int i_;
+113388:     void operator()(const Value& v) {
+113388:         fprintf(stderr, "  actual (arg %d): ", i_);
+113388: #ifdef DEBUG
+113388:         js_DumpValue(v);
+113388: #else
+113765:         fprintf(stderr, "?\n");
+113388: #endif
+113388:         i_++;
+113388:     }
+113388: };
+113388: 
+113388: void
+113388: InlineFrameIterator::dump() const
+113388: {
+119065:     AutoAssertNoGC nogc;
+113388:     if (more())
+113388:         fprintf(stderr, " JS frame (inlined)\n");
+113388:     else
+113388:         fprintf(stderr, " JS frame\n");
+113388: 
+113388:     bool isFunction = false;
+113388:     if (isFunctionFrame()) {
+113388:         isFunction = true;
+113388:         fprintf(stderr, "  callee fun: ");
+113388: #ifdef DEBUG
+113388:         js_DumpObject(callee());
+113388: #else
+113765:         fprintf(stderr, "?\n");
+113388: #endif
+113388:     } else {
+113388:         fprintf(stderr, "  global frame, no callee\n");
+113388:     }
+113388: 
+113388:     fprintf(stderr, "  file %s line %u\n",
+113388:             script()->filename, (unsigned) script()->lineno);
+113388: 
+113388:     fprintf(stderr, "  script = %p, pc = %p\n", (void*) script(), pc());
+113388:     fprintf(stderr, "  current op: %s\n", js_CodeName[*pc()]);
+113388: 
+113388:     if (!more()) {
+113388:         numActualArgs();
+113388:     }
+113388: 
+113388:     SnapshotIterator si = snapshotIterator();
+113388:     fprintf(stderr, "  slots: %u\n", si.slots() - 1);
+113388:     for (unsigned i = 0; i < si.slots() - 1; i++) {
+113388:         if (isFunction) {
+113388:             if (i == 0)
+113388:                 fprintf(stderr, "  scope chain: ");
+113388:             else if (i == 1)
+113388:                 fprintf(stderr, "  this: ");
+113388:             else if (i - 2 < callee()->nargs)
+113388:                 fprintf(stderr, "  formal (arg %d): ", i - 2);
+113388:             else {
+113388:                 if (i - 2 == callee()->nargs && numActualArgs() > callee()->nargs) {
+113388:                     DumpOp d(callee()->nargs);
+123913:                     forEachCanonicalActualArg(d, d.i_, numActualArgs() - d.i_);
+113388:                 }
+113388: 
+113388:                 fprintf(stderr, "  slot %d: ", i - 2 - callee()->nargs);
+113388:             }
+113388:         } else
+113388:             fprintf(stderr, "  slot %u: ", i);
+113388: #ifdef DEBUG
+113388:         js_DumpValue(si.maybeRead());
+113388: #else
+113765:         fprintf(stderr, "?\n");
+113388: #endif
+113388:     }
+113388: 
+113388:     fputc('\n', stderr);
+113388: }

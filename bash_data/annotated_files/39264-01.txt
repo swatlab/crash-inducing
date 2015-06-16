@@ -1,0 +1,686 @@
+35734: /* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+35734:  * vim: sw=4 ts=4 et :
+35778:  */
+35778: /* ***** BEGIN LICENSE BLOCK *****
+35734:  * Version: MPL 1.1/GPL 2.0/LGPL 2.1
+35734:  *
+35734:  * The contents of this file are subject to the Mozilla Public License Version
+35734:  * 1.1 (the "License"); you may not use this file except in compliance with
+35734:  * the License. You may obtain a copy of the License at
+35734:  * http://www.mozilla.org/MPL/
+35734:  *
+35734:  * Software distributed under the License is distributed on an "AS IS" basis,
+35734:  * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+35734:  * for the specific language governing rights and limitations under the
+35734:  * License.
+35734:  *
+35734:  * The Original Code is Mozilla Plugin App.
+35734:  *
+35734:  * The Initial Developer of the Original Code is
+35734:  *   Chris Jones <jones.chris.g@gmail.com>
+35734:  * Portions created by the Initial Developer are Copyright (C) 2009
+35734:  * the Initial Developer. All Rights Reserved.
+35734:  *
+35734:  * Contributor(s):
+35734:  *
+35734:  * Alternatively, the contents of this file may be used under the terms of
+35734:  * either the GNU General Public License Version 2 or later (the "GPL"), or
+35734:  * the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+35734:  * in which case the provisions of the GPL or the LGPL are applicable instead
+35734:  * of those above. If you wish to allow use of your version of this file only
+35734:  * under the terms of either the GPL or the LGPL, and not to allow others to
+35734:  * use your version of this file under the terms of the MPL, indicate your
+35734:  * decision by deleting the provisions above and replace them with the notice
+35734:  * and other provisions required by the GPL or the LGPL. If you do not delete
+35734:  * the provisions above, a recipient may use your version of this file under
+35734:  * the terms of any one of the MPL, the GPL or the LGPL.
+35734:  *
+35734:  * ***** END LICENSE BLOCK ***** */
+35734: 
+35744: #include "mozilla/ipc/RPCChannel.h"
+38100: #include "mozilla/ipc/ProtocolUtils.h"
+35734: 
+35734: #include "nsDebug.h"
+36081: #include "nsTraceRefcnt.h"
+35734: 
+35977: #define RPC_ASSERT(_cond, ...)                                      \
+35977:     do {                                                            \
+35977:         if (!(_cond))                                               \
+35977:             DebugAbort(__FILE__, __LINE__, #_cond,## __VA_ARGS__);  \
+35977:     } while (0)
+35977: 
+35734: using mozilla::MutexAutoLock;
+35899: using mozilla::MutexAutoUnlock;
+35734: 
+35734: template<>
+35734: struct RunnableMethodTraits<mozilla::ipc::RPCChannel>
+35734: {
+35734:     static void RetainCallee(mozilla::ipc::RPCChannel* obj) { }
+35734:     static void ReleaseCallee(mozilla::ipc::RPCChannel* obj) { }
+35734: };
+35734: 
+38100: 
+38100: namespace
+38100: {
+38100: 
+38100: // Async (from the sending side's perspective)
+38100: class BlockChildMessage : public IPC::Message
+38100: {
+38100: public:
+38100:     enum { ID = BLOCK_CHILD_MESSAGE_TYPE };
+38100:     BlockChildMessage() :
+38100:         Message(MSG_ROUTING_NONE, ID, IPC::Message::PRIORITY_NORMAL)
+38100:     { }
+38100: };
+38100: 
+38100: // Async
+38100: class UnblockChildMessage : public IPC::Message
+38100: {
+38100: public:
+38100:     enum { ID = UNBLOCK_CHILD_MESSAGE_TYPE };
+38100:     UnblockChildMessage() :
+38100:         Message(MSG_ROUTING_NONE, ID, IPC::Message::PRIORITY_NORMAL)
+38100:     { }
+38100: };
+38100: 
+38100: } // namespace <anon>
+38100: 
+38100: 
+35734: namespace mozilla {
+35734: namespace ipc {
+35734: 
+39264: RPCChannel::RPCChannel(RPCListener* aListener)
+36078:   : SyncChannel(aListener),
+36078:     mPending(),
+36078:     mStack(),
+37474:     mOutOfTurnReplies(),
+36078:     mDeferred(),
+36078:     mRemoteStackDepthGuess(0),
+38681:     mBlockedOnParent(false),
+38681:     mCxxStackFrames(0)
+36078: {
+36078:     MOZ_COUNT_CTOR(RPCChannel);
+39255: 
+39255:     mDequeueOneTask = new RefCountedTask(NewRunnableMethod(
+39255:                                                  this,
+39255:                                                  &RPCChannel::OnMaybeDequeueOne));
+36078: }
+36078: 
+36078: RPCChannel::~RPCChannel()
+36078: {
+36078:     MOZ_COUNT_DTOR(RPCChannel);
+38681:     RPC_ASSERT(0 == mCxxStackFrames, "mismatched CxxStackFrame ctor/dtors");
+36078: }
+36078: 
+39255: void
+39255: RPCChannel::Clear()
+39255: {
+39255:     mDequeueOneTask->Cancel();
+39255: 
+39255:     AsyncChannel::Clear();
+39255: }
+39255: 
+38104: #ifdef OS_WIN
+38103: // static
+38103: int RPCChannel::sInnerEventLoopDepth = 0;
+38104: #endif
+38103: 
+35734: bool
+38106: RPCChannel::EventOccurred()
+38106: {
+38106:     AssertWorkerThread();
+38106:     mMutex.AssertCurrentThreadOwns();
+38106:     RPC_ASSERT(StackDepth() > 0, "not in wait loop");
+38106: 
+38106:     return (!Connected() ||
+38106:             !mPending.empty() ||
+38106:             (!mOutOfTurnReplies.empty() &&
+38106:              mOutOfTurnReplies.find(mStack.top().seqno())
+38106:              != mOutOfTurnReplies.end()));
+38106: }
+38106: 
+38106: bool
+38681: RPCChannel::Send(Message* msg)
+38681: {
+38681:     CxxStackFrame f(*this);
+38681:     return AsyncChannel::Send(msg);
+38681: }
+38681: 
+38681: bool
+38681: RPCChannel::Send(Message* msg, Message* reply)
+38681: {
+38681:     CxxStackFrame f(*this);
+38681:     return SyncChannel::Send(msg, reply);
+38681: }
+38681: 
+38681: bool
+35734: RPCChannel::Call(Message* msg, Message* reply)
+35734: {
+35971:     AssertWorkerThread();
+36140:     mMutex.AssertNotCurrentThreadOwns();
+35977:     RPC_ASSERT(!ProcessingSyncMessage(),
+35859:                "violation of sync handler invariant");
+35977:     RPC_ASSERT(msg->is_rpc(), "can only Call() RPC messages here");
+35744: 
+38681:     CxxStackFrame f(*this);
+38681: 
+35974:     MutexAutoLock lock(mMutex);
+35974: 
+36015:     if (!Connected()) {
+36015:         ReportConnectionError("RPCChannel");
+35940:         return false;
+36015:     }
+35940: 
+37473:     msg->set_seqno(NextSeqno());
+37473:     msg->set_rpc_remote_stack_depth_guess(mRemoteStackDepthGuess);
+37473:     msg->set_rpc_local_stack_depth(1 + StackDepth());
+35902:     mStack.push(*msg);
+35858: 
+35977:     mIOLoop->PostTask(
+35977:         FROM_HERE,
+35977:         NewRunnableMethod(this, &RPCChannel::OnSend, msg));
+35778: 
+35734:     while (1) {
+39257:         // if a handler invoked by *Dispatch*() spun a nested event
+39257:         // loop, and the connection was broken during that loop, we
+39257:         // might have already processed the OnError event. if so,
+39257:         // trying another loop iteration will be futile because
+39257:         // channel state will have been cleared
+39257:         if (!Connected()) {
+39257:             ReportConnectionError("RPCChannel");
+39257:             return false;
+39257:         }
+39257: 
+36171:         // now might be the time to process a message deferred because
+36171:         // of race resolution
+36171:         MaybeProcessDeferredIncall();
+36171: 
+35902:         // here we're waiting for something to happen. see long
+35902:         // comment about the queue in RPCChannel.h
+38106:         while (!EventOccurred()) {
+38106:             bool maybeTimedOut = !RPCChannel::WaitForNotify();
+38106: 
+38106:             if (EventOccurred())
+38106:                 break;
+38106: 
+38110:             if (maybeTimedOut && !ShouldContinueFromTimeout())
+38106:                 return false;
+35902:         }
+35734: 
+36015:         if (!Connected()) {
+36015:             ReportConnectionError("RPCChannel");
+35940:             return false;
+36015:         }
+35940: 
+37474:         Message recvd;
+38103:         MessageMap::iterator it;
+37474:         if (!mOutOfTurnReplies.empty() &&
+38103:             ((it = mOutOfTurnReplies.find(mStack.top().seqno())) !=
+38103:             mOutOfTurnReplies.end())) {
+38103:             recvd = it->second;
+38103:             mOutOfTurnReplies.erase(it);
+37474:         }
+37474:         else {
+37474:             recvd = mPending.front();
+35734:             mPending.pop();
+37474:         }
+35734: 
+35902:         if (!recvd.is_sync() && !recvd.is_rpc()) {
+35902:             MutexAutoUnlock unlock(mMutex);
+35902:             AsyncChannel::OnDispatchMessage(recvd);
+35902:             continue;
+35902:         }
+35902: 
+35899:         if (recvd.is_sync()) {
+35977:             RPC_ASSERT(mPending.empty(),
+35977:                        "other side should have been blocked");
+35899:             MutexAutoUnlock unlock(mMutex);
+35899:             SyncChannel::OnDispatchMessage(recvd);
+35899:             continue;
+35899:         }
+35899: 
+37473:         RPC_ASSERT(recvd.is_rpc(), "wtf???");
+35899: 
+35858:         if (recvd.is_reply()) {
+35975:             RPC_ASSERT(0 < mStack.size(), "invalid RPC stack");
+35778: 
+35902:             const Message& outcall = mStack.top();
+35834: 
+38647:             // in the parent, seqno's increase from 0, and in the
+38647:             // child, they decrease from 0
+38647:             if ((!mChild && recvd.seqno() < outcall.seqno()) ||
+38647:                 (mChild && recvd.seqno() > outcall.seqno())) {
+38103:                 mOutOfTurnReplies[recvd.seqno()] = recvd;
+37474:                 continue;
+37474:             }
+37474: 
+35778:             // FIXME/cjones: handle error
+35977:             RPC_ASSERT(
+37473:                 recvd.is_reply_error() ||
+37473:                 (recvd.type() == (outcall.type()+1) &&
+37473:                  recvd.seqno() == outcall.seqno()),
+35975:                 "somebody's misbehavin'", "rpc", true);
+35778: 
+35858:             // we received a reply to our most recent outstanding
+35858:             // call.  pop this frame and return the reply
+35902:             mStack.pop();
+35834: 
+35834:             bool isError = recvd.is_reply_error();
+35834:             if (!isError) {
+35734:                 *reply = recvd;
+35834:             }
+35734: 
+37474:             if (0 == StackDepth()) {
+35977:                 // we may have received new messages while waiting for
+35977:                 // our reply.  because we were awaiting a reply,
+35977:                 // StackDepth > 0, and the IO thread didn't enqueue
+35977:                 // OnMaybeDequeueOne() events for us.  so to avoid
+35977:                 // "losing" the new messages, we do that now.
+35977:                 EnqueuePendingMessages();
+35902: 
+37474:                 
+37474:                 RPC_ASSERT(
+37474:                     mOutOfTurnReplies.empty(),
+37474:                     "still have pending replies with no pending out-calls",
+37474:                     "rpc", true);
+37474:             }
+37474: 
+35977:             // finished with this RPC stack frame
+35834:             return !isError;
+35734:         }
+35902: 
+35977:         // in-call.  process in a new stack frame.
+35902: 
+35858:         // "snapshot" the current stack depth while we own the Mutex
+35858:         size_t stackDepth = StackDepth();
+35902:         {
+35899:             MutexAutoUnlock unlock(mMutex);
+35734:             // someone called in to us from the other side.  handle the call
+35977:             Incall(recvd, stackDepth);
+35778:             // FIXME/cjones: error handling
+35734:         }
+35734:     }
+35734: 
+35734:     return true;
+35734: }
+35734: 
+35778: void
+35977: RPCChannel::MaybeProcessDeferredIncall()
+35902: {
+35971:     AssertWorkerThread();
+35977:     mMutex.AssertCurrentThreadOwns();
+35977: 
+35977:     if (mDeferred.empty())
+35977:         return;
+35977: 
+35977:     size_t stackDepth = StackDepth();
+35977: 
+35977:     // the other side can only *under*-estimate our actual stack depth
+35977:     RPC_ASSERT(mDeferred.top().rpc_remote_stack_depth_guess() <= stackDepth,
+35977:                "fatal logic error");
+35977: 
+35977:     if (mDeferred.top().rpc_remote_stack_depth_guess() < stackDepth)
+35977:         return;
+35977: 
+35977:     // time to process this message
+35977:     Message call = mDeferred.top();
+35977:     mDeferred.pop();
+35977: 
+35977:     // fix up fudge factor we added to account for race
+35977:     RPC_ASSERT(0 < mRemoteStackDepthGuess, "fatal logic error");
+35977:     --mRemoteStackDepthGuess;
+35977: 
+35977:     MutexAutoUnlock unlock(mMutex);
+35977:     fprintf(stderr, "  (processing deferred in-call)\n");
+35977:     Incall(call, stackDepth);
+35977: }
+35977: 
+35977: void
+35977: RPCChannel::EnqueuePendingMessages()
+35977: {
+36171:     AssertWorkerThread();
+36171:     mMutex.AssertCurrentThreadOwns();
+36171: 
+38277:     for (size_t i = 0; i < mDeferred.size(); ++i)
+36171:         mWorkerLoop->PostTask(
+36171:             FROM_HERE,
+39255:             new DequeueTask(mDequeueOneTask));
+36171: 
+35977:     // XXX performance tuning knob: could process all or k pending
+35977:     // messages here, rather than enqueuing for later processing
+35977: 
+35977:     for (size_t i = 0; i < mPending.size(); ++i)
+35977:         mWorkerLoop->PostTask(
+35977:             FROM_HERE,
+39255:             new DequeueTask(mDequeueOneTask));
+35902: }
+35902: 
+35902: void
+35941: RPCChannel::OnMaybeDequeueOne()
+35941: {
+35977:     // XXX performance tuning knob: could process all or k pending
+35977:     // messages here
+35977: 
+35971:     AssertWorkerThread();
+35977:     mMutex.AssertNotCurrentThreadOwns();
+35977: 
+35941:     Message recvd;
+35941:     {
+35941:         MutexAutoLock lock(mMutex);
+35941: 
+39261:         if (!Connected()) {
+39261:             ReportConnectionError("RPCChannel");
+39261:             return;
+39261:         }
+39261: 
+36171:         if (!mDeferred.empty())
+36171:             return MaybeProcessDeferredIncall();
+36171: 
+35941:         if (mPending.empty())
+35941:             return;
+35941: 
+35941:         recvd = mPending.front();
+35941:         mPending.pop();
+35941:     }
+35977: 
+38681:     CxxStackFrame f(*this);
+38681: 
+35977:     if (recvd.is_rpc())
+35977:         return Incall(recvd, 0);
+35977:     else if (recvd.is_sync())
+35977:         return SyncChannel::OnDispatchMessage(recvd);
+35977:     else
+35977:         return AsyncChannel::OnDispatchMessage(recvd);
+35941: }
+35941: 
+35941: void
+35977: RPCChannel::Incall(const Message& call, size_t stackDepth)
+35858: {
+35971:     AssertWorkerThread();
+35858:     mMutex.AssertNotCurrentThreadOwns();
+35977:     RPC_ASSERT(call.is_rpc() && !call.is_reply(), "wrong message type");
+35858: 
+35974:     // Race detection: see the long comment near
+35974:     // mRemoteStackDepthGuess in RPCChannel.h.  "Remote" stack depth
+35974:     // means our side, and "local" means other side.
+35974:     if (call.rpc_remote_stack_depth_guess() != stackDepth) {
+38103:         //NS_WARNING("RPC in-calls have raced!");
+38103: #ifndef OS_WIN
+35977:         RPC_ASSERT(call.rpc_remote_stack_depth_guess() < stackDepth,
+35977:                    "fatal logic error");
+35977:         RPC_ASSERT(1 == (stackDepth - call.rpc_remote_stack_depth_guess()),
+35977:                    "got more than 1 RPC message out of sync???");
+35977:         RPC_ASSERT(1 == (call.rpc_local_stack_depth() - mRemoteStackDepthGuess),
+35977:                    "RPC unexpected not symmetric");
+38103: #else
+38103:         // See WindowsEventLoop, windows can race heavily when modal ui
+38103:         // loops are displayed by plugins.
+38103: #endif
+35974:         // the "winner", if there is one, gets to defer processing of
+35974:         // the other side's in-call
+35974:         bool defer;
+35974:         const char* winner;
+39264:         switch (Listener()->MediateRPCRace(mChild ? call : mStack.top(),
+39264:                                            mChild ? mStack.top() : call)) {
+35974:         case RRPChildWins:
+35974:             winner = "child";
+35974:             defer = mChild;
+35974:             break;
+35974:         case RRPParentWins:
+35974:             winner = "parent";
+35974:             defer = !mChild;
+35974:             break;
+35974:         case RRPError:
+35974:             NS_RUNTIMEABORT("NYI: 'Error' RPC race policy");
+35974:             return;
+35974:         default:
+35974:             NS_RUNTIMEABORT("not reached");
+35974:             return;
+35974:         }
+35974: 
+35977:         fprintf(stderr, "  (%s won, so we're%sdeferring)\n",
+35974:                 winner, defer ? " " : " not ");
+35974: 
+35974:         if (defer) {
+35977:             // we now know the other side's stack has one more frame
+35977:             // than we thought
+35977:             ++mRemoteStackDepthGuess; // decremented in MaybeProcessDeferred()
+35977:             mDeferred.push(call);
+35974:             return;
+35974:         }
+35974: 
+35977:         // we "lost" and need to process the other side's in-call.
+35977:         // don't need to fix up the mRemoteStackDepthGuess here,
+35977:         // because we're just about to increment it in DispatchCall(),
+35977:         // which will make it correct again
+35974:     }
+35858: 
+35977:     DispatchIncall(call);
+35977: }
+35977: 
+35977: void
+35977: RPCChannel::DispatchIncall(const Message& call)
+35977: {
+35977:     AssertWorkerThread();
+35977:     mMutex.AssertNotCurrentThreadOwns();
+35977:     RPC_ASSERT(call.is_rpc() && !call.is_reply(),
+35977:                "wrong message type");
+35977: 
+35834:     Message* reply = nsnull;
+35858: 
+35974:     ++mRemoteStackDepthGuess;
+39264:     Result rv = Listener()->OnCallReceived(call, reply);
+35974:     --mRemoteStackDepthGuess;
+35858: 
+36015:     if (!MaybeHandleError(rv, "RPCChannel")) {
+35834:         delete reply;
+35834:         reply = new Message();
+35834:         reply->set_rpc();
+35834:         reply->set_reply();
+35834:         reply->set_reply_error();
+35734:     }
+35912: 
+37473:     reply->set_seqno(call.seqno());
+37473: 
+38124:     {
+38124:         MutexAutoLock lock(mMutex);
+38124:         if (ChannelConnected == mChannelState)
+35977:             mIOLoop->PostTask(
+35977:                 FROM_HERE,
+35977:                 NewRunnableMethod(this, &RPCChannel::OnSend, reply));
+35977:     }
+38124: }
+35912: 
+38100: bool
+38100: RPCChannel::BlockChild()
+38100: {
+38100:     AssertWorkerThread();
+38100: 
+38100:     if (mChild)
+38100:         NS_RUNTIMEABORT("child tried to block parent");
+38100:     SendSpecialMessage(new BlockChildMessage());
+38100:     return true;
+38100: }
+38100: 
+38100: bool
+38100: RPCChannel::UnblockChild()
+38100: {
+38100:     AssertWorkerThread();
+38100: 
+38100:     if (mChild)
+38100:         NS_RUNTIMEABORT("child tried to unblock parent");
+38100:     SendSpecialMessage(new UnblockChildMessage());
+38100:     return true;
+38100: }
+38100: 
+38100: bool
+38100: RPCChannel::OnSpecialMessage(uint16 id, const Message& msg)
+38100: {
+38100:     AssertWorkerThread();
+38100: 
+38100:     switch (id) {
+38100:     case BLOCK_CHILD_MESSAGE_TYPE:
+38100:         BlockOnParent();
+38100:         return true;
+38100: 
+38100:     case UNBLOCK_CHILD_MESSAGE_TYPE:
+38100:         UnblockFromParent();
+38100:         return true;
+38100: 
+38100:     default:
+38100:         return SyncChannel::OnSpecialMessage(id, msg);
+38100:     }
+38100: }
+38100: 
+38100: void
+38100: RPCChannel::BlockOnParent()
+38100: {
+38100:     AssertWorkerThread();
+38100: 
+38100:     if (!mChild)
+38100:         NS_RUNTIMEABORT("child tried to block parent");
+38100: 
+38100:     MutexAutoLock lock(mMutex);
+38100: 
+38100:     if (mBlockedOnParent || AwaitingSyncReply() || 0 < StackDepth())
+38100:         NS_RUNTIMEABORT("attempt to block child when it's already blocked");
+38100: 
+38100:     mBlockedOnParent = true;
+38102:     do {
+38100:         // XXX this dispatch loop shares some similarities with the
+38100:         // one in Call(), but the logic is simpler and different
+38100:         // enough IMHO to warrant its own dispatch loop
+38100:         while (Connected() && mPending.empty() && mBlockedOnParent) {
+38100:             WaitForNotify();
+38100:         }
+38100: 
+38100:         if (!Connected()) {
+38100:             mBlockedOnParent = false;
+38100:             ReportConnectionError("RPCChannel");
+38100:             break;
+38100:         }
+38100: 
+38100:         if (!mPending.empty()) {
+38100:             Message recvd = mPending.front();
+38100:             mPending.pop();
+38100: 
+38100:             MutexAutoUnlock unlock(mMutex);
+38100:             if (recvd.is_rpc()) {
+38100:                 // stack depth must be 0 here
+38100:                 Incall(recvd, 0);
+38100:             }
+38100:             else if (recvd.is_sync()) {
+38100:                 SyncChannel::OnDispatchMessage(recvd);
+38100:             }
+38100:             else {
+38100:                 AsyncChannel::OnDispatchMessage(recvd);
+38100:             }
+38100:         }
+38102:     } while (mBlockedOnParent);
+38100: 
+38100:     EnqueuePendingMessages();
+38100: }
+38100: 
+38100: void
+38100: RPCChannel::UnblockFromParent()
+38100: {
+38100:     AssertWorkerThread();
+38100: 
+38100:     if (!mChild)
+38100:         NS_RUNTIMEABORT("child tried to block parent");
+38100:     MutexAutoLock lock(mMutex);
+38100:     mBlockedOnParent = false;
+38100: }
+35977: 
+35977: void
+35977: RPCChannel::DebugAbort(const char* file, int line, const char* cond,
+35977:                        const char* why,
+35977:                        const char* type, bool reply)
+35977: {
+35977:     fprintf(stderr,
+35992:             "###!!! [RPCChannel][%s][%s:%d] "
+35977:             "Assertion (%s) failed.  %s (triggered by %s%s)\n",
+35977:             mChild ? "Child" : "Parent",
+35977:             file, line, cond,
+35977:             why,
+35977:             type, reply ? "reply" : "");
+35977:     // technically we need the mutex for this, but we're dying anyway
+35977:     fprintf(stderr, "  local RPC stack size: %lu\n",
+35977:             mStack.size());
+35977:     fprintf(stderr, "  remote RPC stack guess: %lu\n",
+35977:             mRemoteStackDepthGuess);
+35977:     fprintf(stderr, "  deferred stack size: %lu\n",
+35977:             mDeferred.size());
+37474:     fprintf(stderr, "  out-of-turn RPC replies stack size: %lu\n",
+37474:             mOutOfTurnReplies.size());
+35977:     fprintf(stderr, "  Pending queue size: %lu, front to back:\n",
+35977:             mPending.size());
+35977:     while (!mPending.empty()) {
+35977:         fprintf(stderr, "    [ %s%s ]\n",
+35977:                 mPending.front().is_rpc() ? "rpc" :
+35977:                 (mPending.front().is_sync() ? "sync" : "async"),
+35977:                 mPending.front().is_reply() ? "reply" : "");
+35977:         mPending.pop();
+35977:     }
+35977: 
+35977:     NS_RUNTIMEABORT(why);
+35734: }
+35734: 
+35734: //
+35734: // The methods below run in the context of the IO thread, and can proxy
+35734: // back to the methods above
+35734: //
+35734: 
+35734: void
+35734: RPCChannel::OnMessageReceived(const Message& msg)
+35778: {
+35971:     AssertIOThread();
+35899:     MutexAutoLock lock(mMutex);
+35899: 
+39261:     if (MaybeInterceptSpecialIOMessage(msg))
+39261:         return;
+39261: 
+35941:     // regardless of the RPC stack, if we're awaiting a sync reply, we
+35941:     // know that it needs to be immediately handled to unblock us.
+35977:     if (AwaitingSyncReply() && msg.is_sync()) {
+35977:         // wake up worker thread waiting at SyncChannel::Send
+35941:         mRecvd = msg;
+35977:         NotifyWorkerThread();
+35941:         return;
+35941:     }
+35941: 
+35941:     mPending.push(msg);
+35941: 
+39255:     if (0 == StackDepth() && !mBlockedOnParent) {
+35977:         // the worker thread might be idle, make sure it wakes up
+39255:         mWorkerLoop->PostTask(FROM_HERE, new DequeueTask(mDequeueOneTask));
+39255:     }
+38106:     else if (!AwaitingSyncReply())
+35977:         NotifyWorkerThread();
+35734: }
+35734: 
+35734: 
+35940: void
+35940: RPCChannel::OnChannelError()
+35940: {
+35971:     AssertIOThread();
+36140: 
+38317:     {
+38316:         MutexAutoLock lock(mMutex);
+38316: 
+38316:         // NB: this can race with the `Goodbye' event being processed by
+38316:         // the worker thread
+38316:         if (ChannelClosing != mChannelState)
+38316:             mChannelState = ChannelError;
+36140: 
+36140:         // skip SyncChannel::OnError(); we subsume its duties
+38316:         if (AwaitingSyncReply() || 0 < StackDepth())
+35977:             NotifyWorkerThread();
+38317:     }
+38316: 
+38316:     AsyncChannel::OnChannelError();
+35940: }
+35940: 
+35734: } // namespace ipc
+35734: } // namespace mozilla
+35977: 

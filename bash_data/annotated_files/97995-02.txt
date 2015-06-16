@@ -1,0 +1,300 @@
+93271: /* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+93271: /* This Source Code Form is subject to the terms of the Mozilla Public
+93271:  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+93271:  * You can obtain one at http://mozilla.org/MPL/2.0/. */
+46991: 
+46991: #include "nsComponentManagerUtils.h"
+46991: #include "nsITimer.h"
+50551: #include "RasterImage.h"
+50548: #include "DiscardTracker.h"
+71637: #include "mozilla/Preferences.h"
+46991: 
+50547: namespace mozilla {
+87852: namespace image {
+50547: 
+93271: static const char* sDiscardTimeoutPref = "image.mem.min_discard_timeout_ms";
+93271: 
+93271: /* static */ LinkedList<DiscardTracker::Node> DiscardTracker::sDiscardableImages;
+93271: /* static */ nsCOMPtr<nsITimer> DiscardTracker::sTimer;
+93271: /* static */ bool DiscardTracker::sInitialized = false;
+93271: /* static */ bool DiscardTracker::sTimerOn = false;
+97995: /* static */ PRInt32 DiscardTracker::sDiscardRunnablePending = 0;
+93271: /* static */ PRInt64 DiscardTracker::sCurrentDecodedImageBytes = 0;
+93271: /* static */ PRUint32 DiscardTracker::sMinDiscardTimeoutMs = 10000;
+93271: /* static */ PRUint32 DiscardTracker::sMaxDecodedImageKB = 42 * 1024;
+97995: /* static */ PRLock * DiscardTracker::sAllocationLock = NULL;
+46991: 
+46991: /*
+93271:  * When we notice we're using too much memory for decoded images, we enqueue a
+93271:  * DiscardRunnable, which runs this code.
+46991:  */
+93271: NS_IMETHODIMP
+93271: DiscardTracker::DiscardRunnable::Run()
+93271: {
+97995:   PR_ATOMIC_SET(&sDiscardRunnablePending, 0);
+97995: 
+93271:   DiscardTracker::DiscardNow();
+93271:   return NS_OK;
+93271: }
+93271: 
+93271: int
+93271: DiscardTimeoutChangedCallback(const char* aPref, void *aClosure)
+93271: {
+93271:   DiscardTracker::ReloadTimeout();
+93271:   return 0;
+93271: }
+93271: 
+91943: nsresult
+93271: DiscardTracker::Reset(Node *node)
+91935: {
+93271:   // We shouldn't call Reset() with a null |img| pointer, on images which can't
+93271:   // be discarded, or on animated images (which should be marked as
+93271:   // non-discardable, anyway).
+97995:   MOZ_ASSERT(NS_IsMainThread());
+97995:   MOZ_ASSERT(sInitialized);
+93271:   MOZ_ASSERT(node->img);
+93271:   MOZ_ASSERT(node->img->CanDiscard());
+93271:   MOZ_ASSERT(!node->img->mAnim);
+93271: 
+93271:   // Insert the node at the front of the list and note when it was inserted.
+93271:   bool wasInList = node->isInList();
+93271:   if (wasInList) {
+93271:     node->remove();
+93271:   }
+93271:   node->timestamp = TimeStamp::Now();
+93271:   sDiscardableImages.insertFront(node);
+46991: 
+93271:   // If the node wasn't already in the list of discardable images, then we may
+93271:   // need to discard some images to stay under the sMaxDecodedImageKB limit.
+93271:   // Call MaybeDiscardSoon to do this check.
+93271:   if (!wasInList) {
+93271:     MaybeDiscardSoon();
+93271:   }
+46991: 
+93271:   // Make sure the timer is running.
+97995:   nsresult rv = EnableTimer();
+46991:   NS_ENSURE_SUCCESS(rv,rv);
+46991: 
+46991:   return NS_OK;
+46991: }
+46991: 
+93271: void
+93271: DiscardTracker::Remove(Node *node)
+93271: {
+97995:   MOZ_ASSERT(NS_IsMainThread());
+97995: 
+93271:   if (node->isInList())
+93271:     node->remove();
+93271: 
+93271:   if (sDiscardableImages.isEmpty())
+93271:     DisableTimer();
+93271: }
+93271: 
+93271: /**
+93271:  * Shut down the tracker, deallocating the timer.
+91943:  */
+91935: void
+93271: DiscardTracker::Shutdown()
+91935: {
+97995:   MOZ_ASSERT(NS_IsMainThread());
+97995: 
+93271:   if (sTimer) {
+93271:     sTimer->Cancel();
+93271:     sTimer = NULL;
+91935:   }
+46991: }
+46991: 
+72870: /*
+72870:  * Discard all the images we're tracking.
+72870:  */
+72870: void
+72870: DiscardTracker::DiscardAll()
+72870: {
+97995:   MOZ_ASSERT(NS_IsMainThread());
+97995: 
+72870:   if (!sInitialized)
+72870:     return;
+72870: 
+93271:   // Be careful: Calling Discard() on an image might cause it to be removed
+93271:   // from the list!
+93271:   Node *n;
+93271:   while ((n = sDiscardableImages.popFirst())) {
+93271:     n->img->Discard();
+72870:   }
+72870: 
+93271:   // The list is empty, so there's no need to leave the timer on.
+93271:   DisableTimer();
+91943: }
+91943: 
+93271: void
+93271: DiscardTracker::InformAllocation(PRInt64 bytes)
+91935: {
+93271:   // This function is called back e.g. from RasterImage::Discard(); be careful!
+93271: 
+97995:   MOZ_ASSERT(sInitialized);
+97995: 
+97995:   PR_Lock(sAllocationLock);
+93271:   sCurrentDecodedImageBytes += bytes;
+93271:   MOZ_ASSERT(sCurrentDecodedImageBytes >= 0);
+97995:   PR_Unlock(sAllocationLock);
+93271: 
+93271:   // If we're using too much memory for decoded images, MaybeDiscardSoon will
+93271:   // enqueue a callback to discard some images.
+93271:   MaybeDiscardSoon();
+86525: }
+86525: 
+46991: /**
+46991:  * Initialize the tracker.
+46991:  */
+46991: nsresult
+50547: DiscardTracker::Initialize()
+46991: {
+97995:   MOZ_ASSERT(NS_IsMainThread());
+97995: 
+86525:   // Watch the timeout pref for changes.
+86525:   Preferences::RegisterCallback(DiscardTimeoutChangedCallback,
+93271:                                 sDiscardTimeoutPref);
+86525: 
+93271:   Preferences::AddUintVarCache(&sMaxDecodedImageKB,
+93271:                               "image.mem.max_decoded_image_kb",
+93271:                               50 * 1024);
+93271: 
+93271:   // Create the timer.
+93271:   sTimer = do_CreateInstance("@mozilla.org/timer;1");
+93271: 
+97995:   // Create a lock for safegarding the 64-bit sCurrentDecodedImageBytes
+97995:   sAllocationLock = PR_NewLock();
+97995: 
+93577:   // Mark us as initialized
+93577:   sInitialized = true;
+93577: 
+93271:   // Read the timeout pref and start the timer.
+91943:   ReloadTimeout();
+91935: 
+46991:   return NS_OK;
+46991: }
+46991: 
+46991: /**
+86525:  * Read the discard timeout from about:config.
+47317:  */
+47317: void
+50547: DiscardTracker::ReloadTimeout()
+47317: {
+93271:   // Read the timeout pref.
+93271:   PRInt32 discardTimeout;
+93271:   nsresult rv = Preferences::GetInt(sDiscardTimeoutPref, &discardTimeout);
+91943: 
+93271:   // If we got something bogus, return.
+47317:   if (!NS_SUCCEEDED(rv) || discardTimeout <= 0)
+47317:     return;
+47317: 
+93271:   // If the value didn't change, return.
+47317:   if ((PRUint32) discardTimeout == sMinDiscardTimeoutMs)
+47317:     return;
+47317: 
+93271:   // Update the value.
+47317:   sMinDiscardTimeoutMs = (PRUint32) discardTimeout;
+47317: 
+93271:   // Restart the timer so the new timeout takes effect.
+93271:   DisableTimer();
+93271:   EnableTimer();
+47317: }
+47317: 
+47317: /**
+46991:  * Enables the timer. No-op if the timer is already running.
+46991:  */
+46991: nsresult
+93271: DiscardTracker::EnableTimer()
+46991: {
+93577:   // Nothing to do if the timer's already on or we haven't yet been
+93577:   // initialized.  !sTimer probably means we've shut down, so just ignore that,
+93577:   // too.
+93577:   if (sTimerOn || !sInitialized || !sTimer)
+46991:     return NS_OK;
+93577: 
+80486:   sTimerOn = true;
+46991: 
+93272:   // Activate the timer.  Have it call us back in (sMinDiscardTimeoutMs / 2)
+93272:   // ms, so that an image is discarded between sMinDiscardTimeoutMs and
+93272:   // (3/2 * sMinDiscardTimeoutMs) ms after it's unlocked.
+46991:   return sTimer->InitWithFuncCallback(TimerCallback,
+46991:                                       nsnull,
+93272:                                       sMinDiscardTimeoutMs / 2,
+46991:                                       nsITimer::TYPE_REPEATING_SLACK);
+46991: }
+46991: 
+46991: /*
+46991:  * Disables the timer. No-op if the timer isn't running.
+46991:  */
+46991: void
+93271: DiscardTracker::DisableTimer()
+46991: {
+46991:   // Nothing to do if the timer's already off.
+93577:   if (!sTimerOn || !sTimer)
+46991:     return;
+80486:   sTimerOn = false;
+46991: 
+46991:   // Deactivate
+46991:   sTimer->Cancel();
+46991: }
+46991: 
+46991: /**
+93271:  * Routine activated when the timer fires. This discards everything that's
+93271:  * older than sMinDiscardTimeoutMs, and tries to discard enough images so that
+93271:  * we go under sMaxDecodedImageKB.
+46991:  */
+46991: void
+50547: DiscardTracker::TimerCallback(nsITimer *aTimer, void *aClosure)
+46991: {
+93271:   DiscardNow();
+46991: }
+46991: 
+93271: void
+93271: DiscardTracker::DiscardNow()
+93271: {
+93271:   // Assuming the list is ordered with oldest discard tracker nodes at the back
+93271:   // and newest ones at the front, iterate from back to front discarding nodes
+93271:   // until we encounter one which is new enough to keep and until we go under
+93271:   // our sMaxDecodedImageKB limit.
+46991: 
+93271:   TimeStamp now = TimeStamp::Now();
+93271:   Node* node;
+93271:   while ((node = sDiscardableImages.getLast())) {
+93271:     if ((now - node->timestamp).ToMilliseconds() > sMinDiscardTimeoutMs ||
+93271:         sCurrentDecodedImageBytes > sMaxDecodedImageKB * 1024) {
+93271: 
+93271:       // Discarding the image should cause sCurrentDecodedImageBytes to
+93271:       // decrease via a call to InformAllocation().
+93271:       node->img->Discard();
+93271: 
+93271:       // Careful: Discarding may have caused the node to have been removed
+93271:       // from the list.
+93271:       Remove(node);
+93271:     }
+93271:     else {
+93271:       break;
+93271:     }
+93271:   }
+93271: 
+93271:   // If the list is empty, disable the timer.
+93271:   if (sDiscardableImages.isEmpty())
+93271:     DisableTimer();
+93271: }
+93271: 
+93271: void
+93271: DiscardTracker::MaybeDiscardSoon()
+93271: {
+93271:   // Are we carrying around too much decoded image data?  If so, enqueue an
+93271:   // event to try to get us down under our limit.
+93271:   if (sCurrentDecodedImageBytes > sMaxDecodedImageKB * 1024 &&
+97995:       !sDiscardableImages.isEmpty()) {
+97995:     // Check if the value of sDiscardRunnablePending used to be false
+97995:     if (!PR_ATOMIC_SET(&sDiscardRunnablePending, 1)) {
+93271:       nsRefPtr<DiscardRunnable> runnable = new DiscardRunnable();
+97995:       NS_DispatchToMainThread(runnable);
+97995:     }
+93271:   }
+46991: }
+50547: 
+87852: } // namespace image
+50547: } // namespace mozilla

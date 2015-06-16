@@ -101,6 +101,8 @@ if(__name__ == '__main__'):
     combined_dict = combineColumns(df_all)
     release_list = loadReleaseDate('firefox_release.csv')
     rev_release_mapping = mapCommitToRelease('../results/firefox/metric_table.csv', release_list)
+    """ IN THE FOLLOWING TWO LINES PLEASE INDICATE THE RIGHT DIRECTORY OF CODE COMPLEXITY AND SNA DATA'S FOLDER """
+    """ THESE DATA ARE AVAILABLE AT: https://github.com/swatlab/highly-impactful """
     complexity_dict = loadCodeMetrics('../../../crash_triaging/entropy_result/SNA_analysis/firefox/', 'code')
     sna_dict = loadCodeMetrics('../../../crash_triaging/entropy_result/SNA_analysis/firefox/', 'sna')
     df_complexity = computeMetricMedian(combined_dict, rev_release_mapping, complexity_dict, 'code')

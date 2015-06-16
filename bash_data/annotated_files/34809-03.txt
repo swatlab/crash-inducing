@@ -1,0 +1,928 @@
+    1: /* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*-
+    1:  *
+    1:  * ***** BEGIN LICENSE BLOCK *****
+    1:  * Version: MPL 1.1/GPL 2.0/LGPL 2.1
+    1:  *
+    1:  * The contents of this file are subject to the Mozilla Public License Version
+    1:  * 1.1 (the "License"); you may not use this file except in compliance with
+    1:  * the License. You may obtain a copy of the License at
+    1:  * http://www.mozilla.org/MPL/
+    1:  *
+    1:  * Software distributed under the License is distributed on an "AS IS" basis,
+    1:  * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+    1:  * for the specific language governing rights and limitations under the
+    1:  * License.
+    1:  *
+    1:  * The Original Code is mozilla.org code.
+    1:  *
+30479:  * The Initial Developer of the Original Code is Mozilla Corporation.
+30479:  * Portions created by the Initial Developer are Copyright (C) 2009
+    1:  * the Initial Developer. All Rights Reserved.
+    1:  *
+    1:  * Contributor(s):
+30479:  *   Joe Drew <joe@drew.ca> (original author)
+    1:  *
+    1:  * Alternatively, the contents of this file may be used under the terms of
+    1:  * either of the GNU General Public License Version 2 or later (the "GPL"),
+    1:  * or the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+    1:  * in which case the provisions of the GPL or the LGPL are applicable instead
+    1:  * of those above. If you wish to allow use of your version of this file only
+    1:  * under the terms of either the GPL or the LGPL, and not to allow others to
+    1:  * use your version of this file under the terms of the MPL, indicate your
+    1:  * decision by deleting the provisions above and replace them with the notice
+    1:  * and other provisions required by the GPL or the LGPL. If you do not delete
+    1:  * the provisions above, a recipient may use your version of this file under
+    1:  * the terms of any one of the MPL, the GPL or the LGPL.
+    1:  *
+    1:  * ***** END LICENSE BLOCK ***** */
+    1: 
+30479: #include "imgFrame.h"
+30479: 
+ 7123: #include <limits.h>
+30479: 
+ 7671: #include "prmem.h"
+30479: #include "prenv.h"
+    1: 
+30479: #include "gfxPlatform.h"
+    1: 
+30479: static PRBool gDisableOptimize = PR_FALSE;
+30479: 
+30479: /*XXX get CAIRO_HAS_DDRAW_SURFACE */
+30479: #include "cairo.h"
+30479: 
+30479: #ifdef CAIRO_HAS_DDRAW_SURFACE
+30479: #include "gfxDDrawSurface.h"
+30479: #endif
+30479: 
+30479: #if defined(XP_WIN) || defined(WINCE)
+30479: #include "gfxWindowsPlatform.h"
+30479: #endif
+30479: 
+30479: #if defined(XP_WIN) && !defined(WINCE)
+30479: 
+30479: /* Whether to use the windows surface; only for desktop win32 */
+30479: #define USE_WIN_SURFACE 1
+30479: 
+30479: static PRUint32 gTotalDDBs = 0;
+30479: static PRUint32 gTotalDDBSize = 0;
+30479: // only use up a maximum of 64MB in DDBs
+30479: #define kMaxDDBSize (64*1024*1024)
+30479: // and don't let anything in that's bigger than 4MB
+30479: #define kMaxSingleDDBSize (4*1024*1024)
+30479: 
+30479: #endif
+30479: 
+30479: // Returns true if an image of aWidth x aHeight is allowed and legal.
+30479: static PRBool AllowedImageSize(PRInt32 aWidth, PRInt32 aHeight)
+30479: {
+30479:   NS_ASSERTION(aWidth > 0, "invalid image width");
+30479:   NS_ASSERTION(aHeight > 0, "invalid image height");
+30479: 
+30479:   // reject over-wide or over-tall images
+30479:   const PRInt32 k64KLimit = 0x0000FFFF;
+30479:   if (NS_UNLIKELY(aWidth > k64KLimit || aHeight > k64KLimit )) {
+30479:     NS_WARNING("image too big");
+30479:     return PR_FALSE;
+30479:   }
+30479: 
+30479:   // protect against division by zero - this really shouldn't happen
+30479:   // if our consumers were well behaved, but they aren't (bug 368427)
+30479:   if (NS_UNLIKELY(aHeight == 0)) {
+30479:     return PR_FALSE;
+30479:   }
+30479: 
+30479:   // check to make sure we don't overflow a 32-bit
+30479:   PRInt32 tmp = aWidth * aHeight;
+30479:   if (NS_UNLIKELY(tmp / aHeight != aWidth)) {
+30479:     NS_WARNING("width or height too large");
+30479:     return PR_FALSE;
+30479:   }
+30479:   tmp = tmp * 4;
+30479:   if (NS_UNLIKELY(tmp / 4 != aWidth * aHeight)) {
+30479:     NS_WARNING("width or height too large");
+30479:     return PR_FALSE;
+30479:   }
+30479: #if defined(XP_MACOSX)
+30479:   // CoreGraphics is limited to images < 32K in *height*, so clamp all surfaces on the Mac to that height
+30479:   if (NS_UNLIKELY(aHeight > SHRT_MAX)) {
+30479:     NS_WARNING("image too big");
+30479:     return PR_FALSE;
+30479:   }
+30479: #endif
+30479:   return PR_TRUE;
+30479: }
+30479: 
+30479: // Returns whether we should, at this time, use image surfaces instead of
+30479: // optimized platform-specific surfaces.
+30479: static PRBool ShouldUseImageSurfaces()
+30479: {
+30479: #if defined(WINCE)
+30479:   // There is no test on windows mobile to check for Gui resources.
+30479:   // Allocate, until we run out of memory.
+30479:   gfxWindowsPlatform::RenderMode rmode = gfxWindowsPlatform::GetPlatform()->GetRenderMode();
+30479:   return rmode != gfxWindowsPlatform::RENDER_DDRAW &&
+30479:       rmode != gfxWindowsPlatform::RENDER_DDRAW_GL;
+30479: 
+30479: #elif defined(USE_WIN_SURFACE)
+30479:   static const DWORD kGDIObjectsHighWaterMark = 7000;
+30479: 
+30479:   // at 7000 GDI objects, stop allocating normal images to make sure
+30479:   // we never hit the 10k hard limit.
+30479:   // GetCurrentProcess() just returns (HANDLE)-1, it's inlined afaik
+30479:   DWORD count = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+30479:   if (count == 0 ||
+30479:       count > kGDIObjectsHighWaterMark)
+30479:   {
+30479:     // either something's broken (count == 0),
+30479:     // or we hit our high water mark; disable
+30479:     // image allocations for a bit.
+30479:     return PR_TRUE;
+30479:   }
+30479: #endif
+30479: 
+30479:   return PR_FALSE;
+30479: }
+30479: 
+30479: imgFrame::imgFrame() :
+30479:   mDecoded(0, 0, 0, 0),
+30479:   mPalettedImageData(nsnull),
+30479:   mSinglePixelColor(0),
+    1:   mTimeout(100),
+ 7108:   mDisposalMethod(0), /* imgIContainer::kDisposeNotSpecified */
+ 7671:   mBlendMethod(1), /* imgIContainer::kBlendOver */
+30479:   mSinglePixel(PR_FALSE),
+30479:   mNeverUseDeviceSurface(PR_FALSE),
+34809:   mFormatChanged(PR_FALSE),
+34809:   mCompositingFailed(PR_FALSE)
+30479: #ifdef USE_WIN_SURFACE
+30479:   , mIsDDBSurface(PR_FALSE)
+30479: #endif
+    1: {
+30479:   static PRBool hasCheckedOptimize = PR_FALSE;
+30479:   if (!hasCheckedOptimize) {
+30479:     if (PR_GetEnv("MOZ_DISABLE_IMAGE_OPTIMIZE")) {
+30479:       gDisableOptimize = PR_TRUE;
+30479:     }
+30479:     hasCheckedOptimize = PR_TRUE;
+30479:   }
+    1: }
+    1: 
+30479: imgFrame::~imgFrame()
+    1: {
+30479:   PR_FREEIF(mPalettedImageData);
+30479: #ifdef USE_WIN_SURFACE
+30479:   if (mIsDDBSurface) {
+30479:       gTotalDDBs--;
+30479:       gTotalDDBSize -= mSize.width * mSize.height * 4;
+30479:   }
+30479: #endif
+    1: }
+    1: 
+30479: nsresult imgFrame::Init(PRInt32 aX, PRInt32 aY, PRInt32 aWidth, PRInt32 aHeight, 
+30479:                         gfxASurface::gfxImageFormat aFormat, PRInt8 aPaletteDepth /* = 0 */)
+    1: {
+30479:   // assert for properties that should be verified by decoders, warn for properties related to bad content
+30479:   if (!AllowedImageSize(aWidth, aHeight))
+    1:     return NS_ERROR_FAILURE;
+    1: 
+30479:   // Check to see if we are running OOM
+30479:   nsCOMPtr<nsIMemory> mem;
+30479:   NS_GetMemoryManager(getter_AddRefs(mem));
+30479:   if (!mem)
+30479:     return NS_ERROR_UNEXPECTED;
+ 7123: 
+30479:   PRBool lowMemory;
+30479:   mem->IsLowMemory(&lowMemory);
+30479:   if (lowMemory)
+30479:     return NS_ERROR_OUT_OF_MEMORY;
+ 7123: 
+    1:   mOffset.MoveTo(aX, aY);
+    1:   mSize.SizeTo(aWidth, aHeight);
+    1: 
+    1:   mFormat = aFormat;
+30479:   mPaletteDepth = aPaletteDepth;
+    1: 
+30479:   if (aPaletteDepth != 0) {
+30479:     // We're creating for a paletted image.
+30479:     if (aPaletteDepth > 8) {
+30479:       NS_ERROR("This Depth is not supported\n");
+ 7671:       return NS_ERROR_FAILURE;
+    1:     }
+    1: 
+30479:     mPalettedImageData = (PRUint8*)PR_MALLOC(PaletteDataLength() + GetImageDataLength());
+30479:     NS_ENSURE_TRUE(mPalettedImageData, NS_ERROR_OUT_OF_MEMORY);
+30479:   } else {
+30479:     // For Windows, we must create the device surface first (if we're
+30479:     // going to) so that the image surface can wrap it.  Can't be done
+30479:     // the other way around.
+30479: #ifdef USE_WIN_SURFACE
+30479:     if (!mNeverUseDeviceSurface && !ShouldUseImageSurfaces()) {
+30479:       mWinSurface = new gfxWindowsSurface(gfxIntSize(mSize.width, mSize.height), mFormat);
+30479:       if (mWinSurface && mWinSurface->CairoStatus() == 0) {
+30479:         // no error
+30479:         mImageSurface = mWinSurface->GetImageSurface();
+30479:       } else {
+30479:         mWinSurface = nsnull;
+30479:       }
+30479:     }
+30479: #endif
+30479: 
+30479:     // For other platforms we create the image surface first and then
+30479:     // possibly wrap it in a device surface.  This branch is also used
+30479:     // on Windows if we're not using device surfaces or if we couldn't
+30479:     // create one.
+30479:     if (!mImageSurface)
+30479:       mImageSurface = new gfxImageSurface(gfxIntSize(mSize.width, mSize.height), mFormat);
+30479: 
+30479:     if (!mImageSurface || mImageSurface->CairoStatus()) {
+30479:       mImageSurface = nsnull;
+30479:       // guess
+30479:       return NS_ERROR_OUT_OF_MEMORY;
+ 7671:     }
+ 7671: 
+30479: #ifdef XP_MACOSX
+30479:     if (!mNeverUseDeviceSurface && !ShouldUseImageSurfaces()) {
+30479:       mQuartzSurface = new gfxQuartzImageSurface(mImageSurface);
+ 7671:     }
+30479: #endif
+ 7671:   }
+    1: 
+    1:   return NS_OK;
+    1: }
+    1: 
+30479: nsresult imgFrame::Optimize()
+    1: {
+30479:   if (gDisableOptimize)
+30479:     return NS_OK;
+    1: 
+30479:   if (mPalettedImageData || mOptSurface || mSinglePixel)
+30479:     return NS_OK;
+30479: 
+30479:   /* Figure out if the entire image is a constant color */
+30479: 
+30479:   // this should always be true
+30479:   if (mImageSurface->Stride() == mSize.width * 4) {
+30479:     PRUint32 *imgData = (PRUint32*) mImageSurface->Data();
+30479:     PRUint32 firstPixel = * (PRUint32*) imgData;
+30479:     PRUint32 pixelCount = mSize.width * mSize.height + 1;
+30479: 
+30479:     while (--pixelCount && *imgData++ == firstPixel)
+30479:       ;
+30479: 
+30479:     if (pixelCount == 0) {
+30479:       // all pixels were the same
+30479:       if (mFormat == gfxASurface::ImageFormatARGB32 ||
+30479:           mFormat == gfxASurface::ImageFormatRGB24)
+30479:       {
+30479:         mSinglePixelColor = gfxRGBA
+30479:           (firstPixel,
+30479:            (mFormat == gfxImageSurface::ImageFormatRGB24 ?
+30479:             gfxRGBA::PACKED_XRGB :
+30479:             gfxRGBA::PACKED_ARGB_PREMULTIPLIED));
+30479: 
+30479:         mSinglePixel = PR_TRUE;
+30479: 
+30479:         // blow away the older surfaces (if they exist), to release their memory
+30479:         mImageSurface = nsnull;
+30479:         mOptSurface = nsnull;
+30479: #ifdef USE_WIN_SURFACE
+30479:         mWinSurface = nsnull;
+30479: #endif
+30479: #ifdef XP_MACOSX
+30479:         mQuartzSurface = nsnull;
+30479: #endif
+    1:         return NS_OK;
+    1:       }
+    1:     }
+    1: 
+30479:     // if it's not RGB24/ARGB32, don't optimize, but we never hit this at the moment
+    1:   }
+    1: 
+30479:   // if we're being forced to use image surfaces due to
+30479:   // resource constraints, don't try to optimize beyond same-pixel.
+30479:   if (mNeverUseDeviceSurface || ShouldUseImageSurfaces())
+30479:     return NS_OK;
+30479: 
+30479:   mOptSurface = nsnull;
+30479: 
+30479: #ifdef USE_WIN_SURFACE
+30479:   // we need to special-case windows here, because windows has
+30479:   // a distinction between DIB and DDB and we want to use DDBs as much
+30479:   // as we can.
+30479:   if (mWinSurface) {
+30479:     // Don't do DDBs for large images; see bug 359147
+30479:     // Note that we bother with DDBs at all because they are much faster
+30479:     // on some systems; on others there isn't much of a speed difference
+30479:     // between DIBs and DDBs.
+30479:     //
+30479:     // Originally this just limited to 1024x1024; but that still
+30479:     // had us hitting overall total memory usage limits (which was
+30479:     // around 220MB on my intel shared memory system with 2GB RAM
+30479:     // and 16-128mb in use by the video card, so I can't make
+30479:     // heads or tails out of this limit).
+30479:     //
+30479:     // So instead, we clamp the max size to 64MB (this limit shuld
+30479:     // be made dynamic based on.. something.. as soon a we figure
+30479:     // out that something) and also limit each individual image to
+30479:     // be less than 4MB to keep very large images out of DDBs.
+30479: 
+30479:     // assume (almost -- we don't quadword-align) worst-case size
+30479:     PRUint32 ddbSize = mSize.width * mSize.height * 4;
+30479:     if (ddbSize <= kMaxSingleDDBSize &&
+30479:         ddbSize + gTotalDDBSize <= kMaxDDBSize)
+    1:     {
+30479:       nsRefPtr<gfxWindowsSurface> wsurf = mWinSurface->OptimizeToDDB(nsnull, gfxIntSize(mSize.width, mSize.height), mFormat);
+30479:       if (wsurf) {
+30479:         gTotalDDBs++;
+30479:         gTotalDDBSize += ddbSize;
+30479:         mIsDDBSurface = PR_TRUE;
+30479:         mOptSurface = wsurf;
+30479:       }
+30479:     }
+30479:     if (!mOptSurface && !mFormatChanged) {
+30479:       // just use the DIB if the format has not changed
+30479:       mOptSurface = mWinSurface;
+30479:     }
+30479:   }
+30479: #endif
+    1: 
+30479: #ifdef XP_MACOSX
+30479:   if (mQuartzSurface) {
+30479:     mQuartzSurface->Flush();
+30479:     mOptSurface = mQuartzSurface;
+    1:   }
+30479: #endif
+    1: 
+30479:   if (mOptSurface == nsnull)
+30479:     mOptSurface = gfxPlatform::GetPlatform()->OptimizeImage(mImageSurface, mFormat);
+    1: 
+30479:   if (mOptSurface) {
+30479:     mImageSurface = nsnull;
+30479: #ifdef USE_WIN_SURFACE
+30479:     mWinSurface = nsnull;
+30479: #endif
+30479: #ifdef XP_MACOSX
+30479:     mQuartzSurface = nsnull;
+30479: #endif
+30479:   }
+    1: 
+    1:   return NS_OK;
+    1: }
+    1: 
+30479: static PRBool                                                                                                       
+30479: IsSafeImageTransformComponent(gfxFloat aValue)
+    1: {
+30479:   return aValue >= -32768 && aValue <= 32767;
+    1: }
+    1: 
+30479: void imgFrame::Draw(gfxContext *aContext, gfxPattern::GraphicsFilter aFilter,
+30479:                     const gfxMatrix &aUserSpaceToImageSpace, const gfxRect& aFill,
+30479:                     const nsIntMargin &aPadding, const nsIntRect &aSubimage)
+    1: {
+30479:   NS_ASSERTION(!aFill.IsEmpty(), "zero dest size --- fix caller");
+30479:   NS_ASSERTION(!aSubimage.IsEmpty(), "zero source size --- fix caller");
+30479:   NS_ASSERTION(!mPalettedImageData, "Directly drawing a paletted image!");
+    1: 
+30479:   PRBool doPadding = aPadding != nsIntMargin(0,0,0,0);
+30479:   PRBool doPartialDecode = !ImageComplete();
+30479:   gfxContext::GraphicsOperator op = aContext->CurrentOperator();
+30479: 
+30479:   if (mSinglePixel && !doPadding && ImageComplete()) {
+30479:     // Single-color fast path
+30479:     // if a == 0, it's a noop
+30479:     if (mSinglePixelColor.a == 0.0)
+30479:       return;
+30479: 
+30479:     if (op == gfxContext::OPERATOR_OVER && mSinglePixelColor.a == 1.0)
+30479:       aContext->SetOperator(gfxContext::OPERATOR_SOURCE);
+30479: 
+30479:     aContext->SetDeviceColor(mSinglePixelColor);
+30479:     aContext->NewPath();
+30479:     aContext->Rectangle(aFill);
+30479:     aContext->Fill();
+30479:     aContext->SetOperator(op);
+30479:     aContext->SetDeviceColor(gfxRGBA(0,0,0,0));
+30479:     return;
+    1:   }
+    1: 
+30479:   gfxMatrix userSpaceToImageSpace = aUserSpaceToImageSpace;
+30479:   gfxRect sourceRect = userSpaceToImageSpace.Transform(aFill);
+30479:   gfxRect imageRect(0, 0, mSize.width + aPadding.LeftRight(), mSize.height + aPadding.TopBottom());
+30479:   gfxRect subimage(aSubimage.x, aSubimage.y, aSubimage.width, aSubimage.height);
+30479:   gfxRect fill = aFill;
+30479:   nsRefPtr<gfxASurface> surface;
+30479:   gfxImageSurface::gfxImageFormat format;
+    1: 
+30479:   NS_ASSERTION(!sourceRect.Intersect(subimage).IsEmpty(),
+30479:                "We must be allowed to sample *some* source pixels!");
+    1: 
+30479:   PRBool doTile = !imageRect.Contains(sourceRect);
+30479:   if (doPadding || doPartialDecode) {
+30479:     gfxRect available = gfxRect(mDecoded.x, mDecoded.y, mDecoded.width, mDecoded.height) +
+30479:       gfxPoint(aPadding.left, aPadding.top);
+30479: 
+30479:     if (!doTile && !mSinglePixel) {
+30479:       // Not tiling, and we have a surface, so we can account for
+30479:       // padding and/or a partial decode just by twiddling parameters.
+30479:       // First, update our user-space fill rect.
+30479:       sourceRect = sourceRect.Intersect(available);
+30479:       gfxMatrix imageSpaceToUserSpace = userSpaceToImageSpace;
+30479:       imageSpaceToUserSpace.Invert();
+30479:       fill = imageSpaceToUserSpace.Transform(sourceRect);
+30479: 
+30479:       surface = ThebesSurface();
+30479:       format = mFormat;
+30479:       subimage = subimage.Intersect(available) - gfxPoint(aPadding.left, aPadding.top);
+30479:       userSpaceToImageSpace.Multiply(gfxMatrix().Translate(-gfxPoint(aPadding.left, aPadding.top)));
+30479:       sourceRect = sourceRect - gfxPoint(aPadding.left, aPadding.top);
+30479:       imageRect = gfxRect(0, 0, mSize.width, mSize.height);
+30479:     } else {
+30479:       // Create a temporary surface
+30479:       gfxIntSize size(PRInt32(imageRect.Width()), PRInt32(imageRect.Height()));
+30479:       // Give this surface an alpha channel because there are
+30479:       // transparent pixels in the padding or undecoded area
+30479:       format = gfxASurface::ImageFormatARGB32;
+30479:       surface = gfxPlatform::GetPlatform()->CreateOffscreenSurface(size, format);
+30479:       if (!surface || surface->CairoStatus() != 0)
+30479:         return;
+30479: 
+30479:       // Fill 'available' with whatever we've got
+30479:       gfxContext tmpCtx(surface);
+30479:       tmpCtx.SetOperator(gfxContext::OPERATOR_SOURCE);
+30479:       if (mSinglePixel) {
+30479:         tmpCtx.SetDeviceColor(mSinglePixelColor);
+30479:       } else {
+30479:         tmpCtx.SetSource(ThebesSurface(), gfxPoint(aPadding.left, aPadding.top));
+30479:       }
+30479:       tmpCtx.Rectangle(available);
+30479:       tmpCtx.Fill();
+30479:     }
+30479:   } else {
+30479:     NS_ASSERTION(!mSinglePixel, "This should already have been handled");
+30479:     surface = ThebesSurface();
+30479:     format = mFormat;
+30479:   }
+30479:   // At this point, we've taken care of mSinglePixel images, images with
+30479:   // aPadding, and partially-decoded images.
+30479: 
+30479:   // Compute device-space-to-image-space transform. We need to sanity-
+30479:   // check it to work around a pixman bug :-(
+30479:   // XXX should we only do this for certain surface types?
+30479:   gfxFloat deviceX, deviceY;
+30479:   nsRefPtr<gfxASurface> currentTarget =
+30479:     aContext->CurrentSurface(&deviceX, &deviceY);
+30479:   gfxMatrix currentMatrix = aContext->CurrentMatrix();
+30479:   gfxMatrix deviceToUser = currentMatrix;
+30479:   deviceToUser.Invert();
+30479:   deviceToUser.Translate(-gfxPoint(-deviceX, -deviceY));
+30479:   gfxMatrix deviceToImage = deviceToUser;
+30479:   deviceToImage.Multiply(userSpaceToImageSpace);
+    1: 
+30479:   PRBool pushedGroup = PR_FALSE;
+30479:   if (currentTarget->GetType() != gfxASurface::SurfaceTypeQuartz) {
+30479:     // BEGIN working around cairo/pixman bug (bug 364968)
+30479:     // Quartz's limits for matrix are much larger than pixman
+30479:       
+30479:     // Our device-space-to-image-space transform may not be acceptable to pixman.
+30479:     if (!IsSafeImageTransformComponent(deviceToImage.xx) ||
+30479:         !IsSafeImageTransformComponent(deviceToImage.xy) ||
+30479:         !IsSafeImageTransformComponent(deviceToImage.yx) ||
+30479:         !IsSafeImageTransformComponent(deviceToImage.yy)) {
+30479:       NS_WARNING("Scaling up too much, bailing out");
+30479:       return;
+    1:     }
+    1: 
+30479:     if (!IsSafeImageTransformComponent(deviceToImage.x0) ||
+30479:         !IsSafeImageTransformComponent(deviceToImage.y0)) {
+30479:       // We'll push a group, which will hopefully reduce our transform's
+30479:       // translation so it's in bounds
+30479:       aContext->Save();
+30479: 
+30479:       // Clip the rounded-out-to-device-pixels bounds of the
+30479:       // transformed fill area. This is the area for the group we
+30479:       // want to push.
+30479:       aContext->IdentityMatrix();
+30479:       gfxRect bounds = currentMatrix.TransformBounds(fill);
+30479:       bounds.RoundOut();
+30479:       aContext->Clip(bounds);
+30479:       aContext->SetMatrix(currentMatrix);
+30479: 
+30479:       aContext->PushGroup(gfxASurface::CONTENT_COLOR_ALPHA);
+30479:       aContext->SetOperator(gfxContext::OPERATOR_OVER);
+30479:       pushedGroup = PR_TRUE;
+30479:     }
+30479:     // END working around cairo/pixman bug (bug 364968)
+30479:   }
+30479: 
+30479:   nsRefPtr<gfxPattern> pattern = new gfxPattern(surface);
+30479:   pattern->SetMatrix(userSpaceToImageSpace);
+30479: 
+30479:   // OK now, the hard part left is to account for the subimage sampling
+30479:   // restriction. If all the transforms involved are just integer
+30479:   // translations, then we assume no resampling will occur so there's
+30479:   // nothing to do.
+30479:   // XXX if only we had source-clipping in cairo!
+30479:   if (!currentMatrix.HasNonIntegerTranslation() &&
+30479:       !userSpaceToImageSpace.HasNonIntegerTranslation()) {
+30479:     if (doTile) {
+30479:       pattern->SetExtend(gfxPattern::EXTEND_REPEAT);
+30479:     }
+30479:   } else {
+30479:     if (doTile || !subimage.Contains(imageRect)) {
+30479:       // EXTEND_PAD won't help us here; we have to create a temporary
+30479:       // surface to hold the subimage of pixels we're allowed to
+30479:       // sample
+30479: 
+30479:       gfxRect userSpaceClipExtents = aContext->GetClipExtents();
+30479:       // This isn't optimal --- if aContext has a rotation then GetClipExtents
+30479:       // will have to do a bounding-box computation, and TransformBounds might
+30479:       // too, so we could get a better result if we computed image space clip
+30479:       // extents in one go --- but it doesn't really matter and this is easier
+30479:       // to understand.
+30479:       gfxRect imageSpaceClipExtents = userSpaceToImageSpace.TransformBounds(userSpaceClipExtents);
+30479:       // Inflate by one pixel because bilinear filtering will sample at most
+30479:       // one pixel beyond the computed image pixel coordinate.
+30479:       imageSpaceClipExtents.Outset(1.0);
+30479: 
+30479:       gfxRect needed = imageSpaceClipExtents.Intersect(sourceRect).Intersect(subimage);
+30479:       needed.RoundOut();
+30479: 
+30479:       // if 'needed' is empty, nothing will be drawn since aFill
+30479:       // must be entirely outside the clip region, so it doesn't
+30479:       // matter what we do here, but we should avoid trying to
+30479:       // create a zero-size surface.
+30479:       if (!needed.IsEmpty()) {
+30479:         gfxIntSize size(PRInt32(needed.Width()), PRInt32(needed.Height()));
+30479:         nsRefPtr<gfxASurface> temp =
+30479:           gfxPlatform::GetPlatform()->CreateOffscreenSurface(size, format);
+30479:         if (temp && temp->CairoStatus() == 0) {
+30479:           gfxContext tmpCtx(temp);
+30479:           tmpCtx.SetOperator(gfxContext::OPERATOR_SOURCE);
+30479:           nsRefPtr<gfxPattern> tmpPattern = new gfxPattern(surface);
+30479:           if (tmpPattern) {
+30479:             tmpPattern->SetExtend(gfxPattern::EXTEND_REPEAT);
+30479:             tmpPattern->SetMatrix(gfxMatrix().Translate(needed.pos));
+30479:             tmpCtx.SetPattern(tmpPattern);
+30479:             tmpCtx.Paint();
+30479:             tmpPattern = new gfxPattern(temp);
+30479:             if (tmpPattern) {
+30479:               pattern.swap(tmpPattern);
+30479:               pattern->SetMatrix(
+30479:                   gfxMatrix(userSpaceToImageSpace).Multiply(gfxMatrix().Translate(-needed.pos)));
+30479:             }
+30479:           }
+30479:         }
+30479:       }
+30479:     }
+30479: 
+30479:     // In theory we can handle this using cairo's EXTEND_PAD,
+30479:     // but implementation limitations mean we have to consult
+30479:     // the surface type.
+30479:     switch (currentTarget->GetType()) {
+30479:       case gfxASurface::SurfaceTypeXlib:
+30479:       case gfxASurface::SurfaceTypeXcb:
+    1:       {
+30479:         // See bug 324698.  This is a workaround for EXTEND_PAD not being
+30479:         // implemented correctly on linux in the X server.
+30479:         //
+30479:         // Set the filter to CAIRO_FILTER_FAST --- otherwise,
+30479:         // pixman's sampling will sample transparency for the outside edges and we'll
+30479:         // get blurry edges.  CAIRO_EXTEND_PAD would also work here, if
+30479:         // available
+30479:         //
+30479:         // But don't do this for simple downscales because it's horrible.
+30479:         // Downscaling means that device-space coordinates are
+30479:         // scaled *up* to find the image pixel coordinates.
+30479:         //
+30479:         // deviceToImage is slightly stale because up above we may
+30479:         // have adjusted the pattern's matrix ... but the adjustment
+30479:         // is only a translation so the scale factors in deviceToImage
+30479:         // are still valid.
+30479:         PRBool isDownscale =
+30479:           deviceToImage.xx >= 1.0 && deviceToImage.yy >= 1.0 &&
+30479:           deviceToImage.xy == 0.0 && deviceToImage.yx == 0.0;
+30479:         if (!isDownscale) {
+30479:           pattern->SetFilter(gfxPattern::FILTER_FAST);
+30479:         }
+30479:         break;
+30479:       }
+    1: 
+30479:       case gfxASurface::SurfaceTypeQuartz:
+30479:       case gfxASurface::SurfaceTypeQuartzImage:
+30479:         // Don't set EXTEND_PAD, Mac seems to be OK. Really?
+30479:         pattern->SetFilter(aFilter);
+30479:         break;
+ 7671: 
+30479:       default:
+30479:         // turn on EXTEND_PAD.
+30479:         // This is what we really want for all surface types, if the
+30479:         // implementation was universally good.
+30479:         pattern->SetExtend(gfxPattern::EXTEND_PAD);
+30479:         pattern->SetFilter(aFilter);
+30479:         break;
+30479:     }
+30479:   }
+30479: 
+30479:   if ((op == gfxContext::OPERATOR_OVER || pushedGroup) &&
+30479:       format == gfxASurface::ImageFormatRGB24) {
+30479:     aContext->SetOperator(gfxContext::OPERATOR_SOURCE);
+30479:   }
+30479: 
+30479:   // Phew! Now we can actually draw this image
+30479:   aContext->NewPath();
+30479: #ifdef MOZ_GFX_OPTIMIZE_MOBILE
+30479:   pattern->SetFilter(gfxPattern::FILTER_FAST); 
+30479: #endif
+30479:   aContext->SetPattern(pattern);
+30479:   aContext->Rectangle(fill);
+30479:   aContext->Fill();
+30479: 
+30479:   aContext->SetOperator(op);
+30479:   if (pushedGroup) {
+30479:     aContext->PopGroupToSource();
+30479:     aContext->Paint();
+30479:     aContext->Restore();
+30479:   }
+30479: }
+30479: 
+30479: nsresult imgFrame::Extract(const nsIntRect& aRegion, imgFrame** aResult)
+30479: {
+30479:   nsAutoPtr<imgFrame> subImage(new imgFrame());
+30479:   if (!subImage)
+30479:     return NS_ERROR_OUT_OF_MEMORY;
+30479: 
+30479:   // The scaling problems described in bug 468496 are especially
+30479:   // likely to be visible for the sub-image, as at present the only
+30479:   // user is the border-image code and border-images tend to get
+30479:   // stretched a lot.  At the same time, the performance concerns
+30479:   // that prevent us from just using Cairo's fallback scaler when
+30479:   // accelerated graphics won't cut it are less relevant to such
+30479:   // images, since they also tend to be small.  Thus, we forcibly
+30479:   // disable the use of anything other than a client-side image
+30479:   // surface for the sub-image; this ensures that the correct
+30479:   // (albeit slower) Cairo fallback scaler will be used.
+30479:   subImage->mNeverUseDeviceSurface = PR_TRUE;
+30479: 
+30479:   nsresult rv = subImage->Init(0, 0, aRegion.width, aRegion.height, 
+30479:                                mFormat, mPaletteDepth);
+30479:   NS_ENSURE_SUCCESS(rv, rv);
+30479: 
+30479:   // scope to destroy ctx
+30479:   {
+30479:     gfxContext ctx(subImage->ThebesSurface());
+30479:     ctx.SetOperator(gfxContext::OPERATOR_SOURCE);
+30479:     if (mSinglePixel) {
+30479:       ctx.SetDeviceColor(mSinglePixelColor);
+30479:     } else {
+30479:       // SetSource() places point (0,0) of its first argument at
+30479:       // the coordinages given by its second argument.  We want
+30479:       // (x,y) of the image to be (0,0) of source space, so we
+30479:       // put (0,0) of the image at (-x,-y).
+30479:       ctx.SetSource(this->ThebesSurface(), gfxPoint(-aRegion.x, -aRegion.y));
+30479:     }
+30479:     ctx.Rectangle(gfxRect(0, 0, aRegion.width, aRegion.height));
+30479:     ctx.Fill();
+30479:   }
+30479: 
+30479:   nsIntRect filled(0, 0, aRegion.width, aRegion.height);
+30479: 
+30479:   rv = subImage->ImageUpdated(filled);
+30479:   NS_ENSURE_SUCCESS(rv, rv);
+30479: 
+30479:   subImage->Optimize();
+30479: 
+30479:   *aResult = subImage.forget();
+ 7671: 
+ 7671:   return NS_OK;
+ 7671: }
+ 7671: 
+30479: nsresult imgFrame::ImageUpdated(const nsIntRect &aUpdateRect)
+ 7671: {
+30479:   // Check to see if we are running OOM
+30479:   nsCOMPtr<nsIMemory> mem;
+30479:   NS_GetMemoryManager(getter_AddRefs(mem));
+30479:   if (!mem)
+30479:     return NS_ERROR_UNEXPECTED;
+ 7671: 
+30479:   PRBool lowMemory;
+30479:   mem->IsLowMemory(&lowMemory);
+30479:   if (lowMemory)
+30479:     return NS_ERROR_OUT_OF_MEMORY;
+ 7671: 
+30479:   mDecoded.UnionRect(mDecoded, aUpdateRect);
+30479: 
+30479:   // clamp to bounds, in case someone sends a bogus updateRect (I'm looking at
+30479:   // you, gif decoder)
+30479:   nsIntRect boundsRect(0, 0, mSize.width, mSize.height);
+30479:   mDecoded.IntersectRect(mDecoded, boundsRect);
+30479: 
+30479: #ifdef XP_MACOSX
+30479:   if (mQuartzSurface)
+30479:     mQuartzSurface->Flush();
+30479: #endif
+30479:   return NS_OK;
+30479: }
+30479: 
+30479: PRInt32 imgFrame::GetX() const
+30479: {
+30479:   return mOffset.x;
+30479: }
+30479: 
+30479: PRInt32 imgFrame::GetY() const
+30479: {
+30479:   return mOffset.y;
+30479: }
+30479: 
+30479: PRInt32 imgFrame::GetWidth() const
+30479: {
+30479:   return mSize.width;
+30479: }
+30479: 
+30479: PRInt32 imgFrame::GetHeight() const
+30479: {
+30479:   return mSize.height;
+30479: }
+30479: 
+30479: nsIntRect imgFrame::GetRect() const
+30479: {
+30479:   return nsIntRect(mOffset, mSize);
+30479: }
+30479: 
+30479: gfxASurface::gfxImageFormat imgFrame::GetFormat() const
+30479: {
+30479:   return mFormat;
+30479: }
+30479: 
+30479: PRBool imgFrame::GetNeedsBackground() const
+30479: {
+30479:   // We need a background painted if we have alpha or we're incomplete.
+30479:   return (mFormat == gfxASurface::ImageFormatARGB32 || !ImageComplete());
+30479: }
+30479: 
+30479: PRUint32 imgFrame::GetImageBytesPerRow() const
+30479: {
+30479:   if (mImageSurface)
+30479:     return mImageSurface->Stride();
+30479:   else
+30479:     return mSize.width;
+30479: }
+30479: 
+30479: PRUint32 imgFrame::GetImageDataLength() const
+30479: {
+30479:   if (mImageSurface)
+30479:     return mImageSurface->Stride() * mSize.height;
+30479:   else
+30479:     return mSize.width * mSize.height;
+30479: }
+30479: 
+30479: void imgFrame::GetImageData(PRUint8 **aData, PRUint32 *length) const
+30479: {
+30479:   if (mImageSurface)
+30479:     *aData = mImageSurface->Data();
+30479:   else if (mPalettedImageData)
+30479:     *aData = mPalettedImageData + PaletteDataLength();
+30479:   else
+30479:     *aData = nsnull;
+30479: 
+30479:   *length = GetImageDataLength();
+30479: }
+30479: 
+30479: PRBool imgFrame::GetIsPaletted() const
+30479: {
+30479:   return mPalettedImageData != nsnull;
+30479: }
+30479: 
+30479: PRBool imgFrame::GetHasAlpha() const
+30479: {
+30544:   return mFormat == gfxASurface::ImageFormatARGB32;
+30479: }
+30479: 
+30479: void imgFrame::GetPaletteData(PRUint32 **aPalette, PRUint32 *length) const
+30479: {
+30479:   if (!mPalettedImageData) {
+30479:     *aPalette = nsnull;
+30479:     *length = 0;
+30479:   } else {
+30479:     *aPalette = (PRUint32 *) mPalettedImageData;
+ 7671:     *length = PaletteDataLength();
+30479:   }
+30479: }
+30479: 
+30479: nsresult imgFrame::LockImageData()
+30479: {
+30479:   if (mPalettedImageData)
+30479:     return NS_OK;
+30479: 
+30479:   if ((mOptSurface || mSinglePixel) && !mImageSurface) {
+30479:     // Recover the pixels
+30479:     mImageSurface = new gfxImageSurface(gfxIntSize(mSize.width, mSize.height),
+30479:                                         gfxImageSurface::ImageFormatARGB32);
+30479:     if (!mImageSurface || mImageSurface->CairoStatus())
+30479:       return NS_ERROR_OUT_OF_MEMORY;
+30479: 
+30479:     gfxContext context(mImageSurface);
+30479:     context.SetOperator(gfxContext::OPERATOR_SOURCE);
+30479:     if (mSinglePixel)
+30479:       context.SetDeviceColor(mSinglePixelColor);
+30479:     else
+30479:       context.SetSource(mOptSurface);
+30479:     context.Paint();
+30479: 
+30479:     mOptSurface = nsnull;
+30479: #ifdef USE_WIN_SURFACE
+30479:     mWinSurface = nsnull;
+30479: #endif
+30479: #ifdef XP_MACOSX
+30479:     mQuartzSurface = nsnull;
+30479: #endif
+30479:   }
+    1: 
+    1:   return NS_OK;
+    1: }
+    1: 
+30479: nsresult imgFrame::UnlockImageData()
+    1: {
+30479:   if (mPalettedImageData)
+30479:     return NS_OK;
+    1: 
+30479: #ifdef XP_MACOSX
+30479:   if (mQuartzSurface)
+30479:     mQuartzSurface->Flush();
+30479: #endif
+ 7671:   return NS_OK;
+    1: }
+    1: 
+30479: PRInt32 imgFrame::GetTimeout() const
+    1: {
+    1:   // Ensure a minimal time between updates so we don't throttle the UI thread.
+    1:   // consider 0 == unspecified and make it fast but not too fast.  See bug
+    1:   // 125137, bug 139677, and bug 207059.  The behavior of recent IE and Opera
+    1:   // versions seems to be:
+    1:   // IE 6/Win:
+    1:   //   10 - 50ms go 100ms
+    1:   //   >50ms go correct speed
+    1:   // Opera 7 final/Win:
+    1:   //   10ms goes 100ms
+    1:   //   >10ms go correct speed
+    1:   // It seems that there are broken tools out there that set a 0ms or 10ms
+    1:   // timeout when they really want a "default" one.  So munge values in that
+    1:   // range.
+    1:   if (mTimeout >= 0 && mTimeout <= 10)
+30479:     return 100;
+    1:   else
+30479:     return mTimeout;
+    1: }
+    1: 
+30479: void imgFrame::SetTimeout(PRInt32 aTimeout)
+    1: {
+    1:   mTimeout = aTimeout;
+    1: }
+    1: 
+30479: PRInt32 imgFrame::GetFrameDisposalMethod() const
+    1: {
+30479:   return mDisposalMethod;
+    1: }
+    1: 
+30479: void imgFrame::SetFrameDisposalMethod(PRInt32 aFrameDisposalMethod)
+ 7108: {
+30479:   mDisposalMethod = aFrameDisposalMethod;
+ 7108: }
+ 7108: 
+30479: PRInt32 imgFrame::GetBlendMethod() const
+    1: {
+30479:   return mBlendMethod;
+30479: }
+    1: 
+30479: void imgFrame::SetBlendMethod(PRInt32 aBlendMethod)
+30479: {
+30479:   mBlendMethod = (PRInt8)aBlendMethod;
+30479: }
+    1: 
+30479: PRBool imgFrame::ImageComplete() const
+30479: {
+30479:   return mDecoded == nsIntRect(0, 0, mSize.width, mSize.height);
+30479: }
+    1: 
+30479: // A hint from the image decoders that this image has no alpha, even
+30479: // though we created is ARGB32.  This changes our format to RGB24,
+30479: // which in turn will cause us to Optimize() to RGB24.  Has no effect
+30479: // after Optimize() is called, though in all cases it will be just a
+30479: // performance win -- the pixels are still correct and have the A byte
+30479: // set to 0xff.
+30479: void imgFrame::SetHasNoAlpha()
+30479: {
+30479:   if (mFormat == gfxASurface::ImageFormatARGB32) {
+30479:       mFormat = gfxASurface::ImageFormatRGB24;
+30479:       mFormatChanged = PR_TRUE;
+    1:   }
+30479: }
+34809: 
+34809: PRBool imgFrame::GetCompositingFailed() const
+34809: {
+34809:   return mCompositingFailed;
+34809: }
+34809: 
+34809: void imgFrame::SetCompositingFailed(PRBool val)
+34809: {
+34809:   mCompositingFailed = val;
+34809: }
