@@ -22,6 +22,8 @@
 - **file_metrics** folder contains scripts and data to link crash-inducing/crash-free commits to their corresponding files. These data could be used for changd type analysis. 
 	- **separate_into_parts.py** separates a bug table into small parts in order to enhance the analysis speed.
 - **diff_analysis** folder contains scripts and data to analyse changed types of commits.
+	**analytic_code** folder only contains a sample of the analysed source code. For the full data, please download from:
+	http://swat.polymtl.ca/anle/data/Crash-inducing-commits/analytic_code/
 
 #How to use the script
 - To identify crash-inducing commits:
