@@ -23,7 +23,7 @@
 	- **separate_into_parts.py** separates a bug table into small parts in order to enhance the analysis speed.
 - **diff_analysis** folder: contains scripts and data to analyse changed types of commits.
 	- **analytic_code** folder only contains a sample of the analysed source code. For the full data, please download from:
-	http://swat.polymtl.ca/anle/data/Crash-inducing-commits/analytic_code/
+	http://swat.polymtl.ca/anle/data/Crash-inducing-commits/
 
 #How to use the script
 - To identify crash-inducing commits:
