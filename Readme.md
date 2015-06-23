@@ -1,4 +1,4 @@
-#An Empirical Study of Crash-inducing Commits on Mozilla Firefox
+#An Empirical Study of Crash-inducing Commits in Mozilla Firefox
 
 #Requirements
 - Python 2.7 or newer
