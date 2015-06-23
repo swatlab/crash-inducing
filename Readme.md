@@ -24,6 +24,8 @@
 - **diff_analysis** folder: contains scripts and data to analyse changed types of commits.
 	- **analytic_code** folder only contains a sample of the analysed source code. For the full data, please download from:
 	http://swat.polymtl.ca/anle/data/Crash-inducing-commits/
+	- **diff_analysis.py** recursively identifies changed types in files.
+	- **rename_source.py** renames studied file names to the right format.
 
 #How to use the script
 - To identify crash-inducing commits:
