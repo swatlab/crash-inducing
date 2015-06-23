@@ -33,10 +33,10 @@
 	cat $"fix_numbers.txt" | while read rev_num; do hg log --template "{rev}\t{file_dels}\t{file_mods}\t{file_adds}\n" -r $rev_num; done > changed_files.csv
 	```
 	3. Run **file_analysis.py** to map rash-related bug fixes to their files.
-	4. Then use *rev_file.csv* and run the following bash script to output annotate files of each file in the crash-related fixes. Put the folder **annotated_files** in the folder **bash_data**.
+	4. Then use *rev_file.csv* and run the following bash script to output annotated files of each file in the crash-related fixes. Put the folder **annotated_files** in the folder **bash_data**.
 	```bash
 	export IFS=","
-	cat "rev_file.csv" | while read rev file ref; do echo $ref $file; hg annotate $file -r $rev -w -b -B > annotate/$ref.txt; done
+	cat "rev_file.csv" | while read rev file ref; do echo $ref $file; hg annotate $file -r $rev -w -b -B > annotated_files/$ref.txt; done
 	```
 	5. Run **extract_commits.py** to generate locations of crash-realted bugs.
 	6. Then run **crash_inducing_fix.py** to identify crash-inducing commits.
