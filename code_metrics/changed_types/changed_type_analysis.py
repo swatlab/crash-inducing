@@ -42,7 +42,7 @@ def selectColumns(df):
     df = combineColumnsAs(df, ['param', 'parameter_list', 'argument', 'argument_list'], 'parameter')
     df = combineColumnsAs(df, ['while', 'do', 'if', 'else', 'break', 'goto', 'for', 'foreach', \
         'continue', 'then', 'switch', 'case', 'return', 'condition', 'incr', 'default'], 'flow_control_stmt')
-    df = combineColumnsAs(df, ['super', 'public', 'private', 'protected', 'extern', 'template'], 'oop')
+    df = combineColumnsAs(df, ['super', 'public', 'private', 'protected', 'extern'], 'access')
     df = combineColumnsAs(df, ['enum', 'struct', 'struct_decl', 'typedef', 'union', 'union_decl'], 'data_type')
     df = combineColumnsAs(df, ['asm', 'decl', 'decl_stmt', 'using', 'namespace', 'range', 'specifier'], 'declaration')
     #df = combineColumnsAs(df, ['block', 'expr', 'expr_stmt', 'escape', 'index', 'sizeof'], 'code')
@@ -59,16 +59,18 @@ def selectColumns(df):
     df.drop(['function_decl'], axis=1, inplace=True)
     if 'cpp:directive' in df:
         df['preprocessor'] = df[['preprocessor', ]].sum(axis=1)
-        df.drop(['cpp:directive'], axis=1, inplace=True)    
+        df.drop(['cpp:directive'], axis=1, inplace=True)
+    #   Rename columns
+    df.rename(columns={'template': 'cpp_feature'}, inplace=True) 
     #   Put the selected columns into a new dataframe
     #print df
-    df_selected = df[['file', 'call', 'comment', 'refactoring', 'init', 'type', 'preprocessor', 'parameter', \
-        'flow_control_stmt', 'oop', 'data_type', 'declaration', 'constructor', 'destructor', 'class', 'function']]    
+    df_selected = df[['file', 'call', 'comment', 'refactoring', 'init', 'type', 'preprocessor', 'parameter', 'flow_control_stmt',\
+        'access', 'cpp_feature', 'data_type', 'declaration', 'constructor', 'destructor', 'class', 'function']]    
     return df_selected
 
 if(__name__ == '__main__'):
     #   Crashed files' changed types
-    df = combineData('crashed')
+    df = combineData('crashed')    
     df_selected = selectColumns(df)
     df_selected.to_csv('crashed_file_types.csv', index=False)
     #   Crash-free files' changed types
