@@ -59,7 +59,8 @@
 #Reference
 <p id="refone">[1] Le An and Foutse Khomh. An Empirical Study of Highly-impactful Bugs in Mozilla Projects. In
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<i>Proceedings of the 2015 IEEE International Conference on Software Quality, Reliability and 
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Security (QRS).</p>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Security (QRS).
+</p>
 
 #For any questions
 Please send email to le.an@polymtl.ca
