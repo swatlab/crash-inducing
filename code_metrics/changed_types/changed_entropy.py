@@ -15,7 +15,7 @@ def changedEntropy(rev_type):
             if int(ct) > 0:
                 ct_list.append(int(ct))
         unique_ct = len(ct_list)
-        ct_cnt = 15
+        ct_cnt = len(line) - 1
         entropy = 0
         if ct_cnt == 1:
             entropy = 1

@@ -40,7 +40,8 @@ def mapTypesToRev(file_rev_dict, file_to_types, rev_to_types):
     df = df.reindex_axis(['file'] + list(df.columns[:-1]), axis=1)
     df.set_index(['index_col'], inplace = True)
     df = df[:].astype(int)
-    df.sort(['file']).to_csv(rev_to_types, index=False)
+    df.rename(columns={'file': 'revision'}, inplace=True) 
+    df.sort(['revision']).to_csv(rev_to_types, index=False)
     return
 
 if(__name__ == '__main__'):
