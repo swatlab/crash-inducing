@@ -7,9 +7,6 @@ wilcoxon_test <- function(df.crash_inducing, df.crash_free, metric) {
 	print('Median value:')
 	print(sprintf('    Crash-inducing fixes: %f', median(vector.crash_inducing)))
 	print(sprintf('    Crash-free fixes: %f', median(vector.crash_free)))
-	print('Mean value:')
-	print(sprintf('    Crash-inducing fixes: %f', mean(vector.crash_inducing)))
-	print(sprintf('    Crash-free fixes: %f', mean(vector.crash_free)))
 	wilcox.test(vector.crash_inducing, vector.crash_free, alternative = "two.sided", correct=FALSE)
 }
 
