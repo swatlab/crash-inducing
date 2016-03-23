@@ -8,17 +8,6 @@ def mozillaCommitterProportion(df):
     print len(mozilla_committer) / len(df)
     return
  
-#   Incomplete commits' percentage  
-def incompleteProportion(df):
-    supplementary_fixes = df[df['attempt_type'] == 'incomplete']
-    print len(supplementary_fixes) / len(df)
-    return
-
-#   Supplementary commits' percentage
-def supplementaryProportion(df):
-    supplementary_fixes = df[df['attempt_type'] == 'supplementary']
-    print len(supplementary_fixes) / len(df)
-    return
     
 #   Commits' percentage to fix a bug
 def bugFixProportion(df):
@@ -27,32 +16,29 @@ def bugFixProportion(df):
     return
 
 if(__name__ == '__main__'):
+    high_impact = True
     #   Load metrics
-    df_commits = pd.read_csv('../results/metric_table.csv')
-    df_crash_inducing = df_commits[df_commits['crash_inducing'] == 'YES']
-    df_crash_free = df_commits[df_commits['crash_inducing'] == 'NO']
-    
+    if high_impact:
+        df_commits = pd.read_csv('../results/metric_table.csv')
+        df_highimpact = pd.read_csv('../results/crashed_commit_impact.csv')
+        df_combined = pd.merge(df_commits, df_highimpact, on='revision')
+        df_target = df_combined[df_combined['high_impact'] == 'YES']
+        df_other = df_combined[df_combined['high_impact'] == 'NO']
+    else:
+        df_commits = pd.read_csv('../results/metric_table.csv')
+        df_target = df_commits[df_commits['crash_inducing'] == 'YES']
+        df_other = df_commits[df_commits['crash_inducing'] == 'NO']
     #   Split data for crash-inducing / crash-free commits 
-    df_crash_inducing = df_commits[df_commits['crash_inducing'] == 'YES']
-    df_crash_free = df_commits[df_commits['crash_inducing'] == 'NO']
+    df_target = df_commits[df_commits['crash_inducing'] == 'YES']
+    df_other = df_commits[df_commits['crash_inducing'] == 'NO']
     #   Compare the proportion of mozilla developers' commits 
     print "Mozilla developers' proportion on crash-inducing commits"
-    mozillaCommitterProportion(df_crash_inducing)
+    mozillaCommitterProportion(df_target)
     print "Mozilla developers' proportion on crash-free commits"
-    mozillaCommitterProportion(df_crash_free)
-    #   Compare the proportion of incomplete bug fixes
-    print 'The proportion of incomplete fixes on crash-inducing commits'
-    incompleteProportion(df_crash_inducing)
-    print "The proportion of incomplete fixes on crash-free commits"
-    incompleteProportion(df_crash_free)
-    #   Compare the proportion of supplementary bug fixes
-    print 'The proportion of supplementary fixes on crash-inducing commits'
-    supplementaryProportion(df_crash_inducing)
-    print "The proportion of supplementary fixes on crash-free commits"
-    supplementaryProportion(df_crash_free)
+    mozillaCommitterProportion(df_other)
     #   Compare the proportion of bug fixes
     print 'The proportion of bug fixes on crash-inducing commits'
-    bugFixProportion(df_crash_inducing)
+    bugFixProportion(df_target)
     print "The proportion of bug fixes on crash-free commits"
-    bugFixProportion(df_crash_free)
+    bugFixProportion(df_other)
     

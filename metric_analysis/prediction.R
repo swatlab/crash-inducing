@@ -2,7 +2,8 @@ library(cvTools)
 library(ROSE)
 
 # Set random seed
-set.seed(99)
+# PLEASE SET A SEED NUMBER HERE
+set.seed(0)
 
 # Initialise variables
 model = 'randomForest'
@@ -112,4 +113,8 @@ print(sprintf('crash-inducing f-measure: %.1f%%', median(fm.vec) * 100))
 print(sprintf('crash-free pre: %.1f%%', median(npre.vec) * 100))
 print(sprintf('crash-free rec: %.1f%%', median(nrec.vec) * 100))
 print(sprintf('crash-free f-measure: %.1f%%', median(nfm.vec) * 100))
+
+# output false positives and false negatives in the prediction
+#write.table(false.positives, 'prediction_errors/false_positives.csv', row.names = FALSE, col.names=TRUE, sep = ',')
+#write.table(false.negatives, 'prediction_errors/false_negatives.csv', row.names = FALSE, col.names=TRUE, sep = ',')
 
