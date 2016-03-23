@@ -182,8 +182,8 @@ def outputResults(crash_inducing_rev_dict, total_crash_inducing_rev):
     with open('results/crash_inducing_commits.txt', 'w+') as f:
         for rev in sorted(crash_inducing_rev_list):
             f.write(str(rev) + '\n')
-    with open('results/bug_to_crash_inducing_commit.json', 'wb') as f:
-        json.dump(crash_inducing_rev_dict, f)
+    with open('results/bug_to_crash-inducing-commits.json', 'wb') as f:
+        json.dump(crash_inducing_rev_dict, f, indent=4)
     return
 
 if(__name__ == '__main__'):
@@ -193,7 +193,7 @@ if(__name__ == '__main__'):
     rev_date_dict = revisionDate('bash_data/commit_log.txt')
     bug_crashed_date_dict = bugCrashedDate('raw_data/bug_crashed_date.csv')
     bug_location_dict = bugLocation('results/bug_location.csv')
-    (candidate_rev_dict, candidate_file_dict) = readAnnotatedFiles('bash_data/annotated_files/')
+    (candidate_rev_dict, candidate_file_dict) = readAnnotatedFiles('/Users/petitdino/Desktop/annotated_files/')
     bug_candidate_dict = mapCandidateToBug(candidate_rev_dict, bug_rev_dict)
     (crash_inducing_rev_dict, total_crash_inducing_rev) = crashInducingCandidates(bug_candidate_dict, 
                                                                                     rev_date_dict, 
