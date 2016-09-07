@@ -62,7 +62,7 @@
 	https://developer.mozilla.org/en-US/docs/Mozilla/Developer_guide/Source_Code/Mercurial
 
 ###Reference###
-1. Le An and Foutse Khomh. An Empirical Study of Highly-impactful Bugs in Mozilla Projects. In _Proceedings of the 2015 IEEE International Conference on Software Quality, Reliability and Security (QRS)_.
+1. Le An and Foutse Khomh. An Empirical Study of Highly-impactful Bugs in Mozilla Projects. In _Proceedings of the 2015 IEEE International Conference on Software Quality, Reliability and Security (QRS 2015)_.
 2. Le An and Foutse Khomh. An Empirical Study of Crash-inducing Commits in Mozilla Firefox. In _Proceedings of the 11th International Conference on Predictive Models and Data Analytics in Software Engineering (PROMISE 2015)_.
 
 ###For any questions###
