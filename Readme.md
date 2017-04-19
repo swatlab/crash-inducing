@@ -30,7 +30,7 @@
 	- **diff_analysis.py** recursively identifies changed types in files.
 	- **rename_source.py** renames studied file names to the right format.
 - **bug_stats** folder: contains scripts to compare crash-related bug reports with other bug reports.
-- **presentation_slides** folder: constains presentation slides for PROMISE 2015.
+- **presentation_slides** folder: contains presentation slides for PROMISE 2015.
 
 ####How to use the script###
 - To identify crash-inducing commits:
