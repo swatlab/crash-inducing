@@ -1,11 +1,11 @@
-#An Empirical Study of Crash-inducing Commits in Mozilla Firefox#
+# An Empirical Study of Crash-inducing Commits in Mozilla Firefox#
 
-###Requirements###
+### Requirements###
 - Python 2.7 or newer
 - R 3.1 or newer
 - MySQL
 
-###File description###
+### File description###
 - **revision_analysis.py**: parses commit logs to identify bug fixes of the studied crash-realted bugs. It will generate *fix_numbers.txt* in the folder **results**.
 - **file_analysis.py**: links each of the crash-related bug fixes to its corresponding fixing files. It outputs *rev_file.csv* to the folder **results**.
 - **extract_comments.py**: extracts files or methods from the crashed stack trace of each bug. It outputs *bug_location.csv* to the folder **results**.
@@ -32,7 +32,7 @@
 - **bug_stats** folder: contains scripts to compare crash-related bug reports with other bug reports.
 - **presentation_slides** folder: contains presentation slides for PROMISE 2015.
 
-####How to use the script###
+#### How to use the script###
 - To identify crash-inducing commits:
 	1. Run **revision_analysis.py** to identify crash-realted bug fixes.
 	2. Then use *results/fix_numbers.txt* and run the following bash script to extract changed files of each crash-related bug fixes. Put the result *changed_files.csv* in the folder **bash_data**.
@@ -53,7 +53,7 @@
 	- In **prediction.R**, please set the prediction algorithm: GLM, bayes, C50, or randomForest (in line 8), and set whether need a VIF analysis (in line 9).
 	- Before using the scripts in **code_metrics**, you should refer to https://github.com/swatlab/highly-impactful to generate code complexity and SNA data (the generated data on Firefox are also available in this repository).
    
-###Data source###
+### Data source###
 - Mozilla Bugzilla local database is available in:
     http://swat.polymtl.ca/anle/data/Mozilla_bugs/
 - Socorro local crash reports are available in:
@@ -61,9 +61,9 @@
 - Firefox' Mercurial repository:
 	https://developer.mozilla.org/en-US/docs/Mozilla/Developer_guide/Source_Code/Mercurial
 
-###Reference###
+### Reference###
 1. Le An and Foutse Khomh. An Empirical Study of Highly-impactful Bugs in Mozilla Projects. In _Proceedings of the 2015 IEEE International Conference on Software Quality, Reliability and Security (QRS 2015)_.
 2. Le An and Foutse Khomh. An Empirical Study of Crash-inducing Commits in Mozilla Firefox. In _Proceedings of the 11th International Conference on Predictive Models and Data Analytics in Software Engineering (PROMISE 2015)_.
 
-###For any questions###
+### For any questions###
 Please send email to le.an@polymtl.ca
